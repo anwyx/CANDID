@@ -124,7 +124,12 @@ class CANDIDBaselineEnv(BaseEnv):
     GOAL_MARKER_FREE_GAP = 0.030
     MAX_POSITION_SAMPLES = 2000
     MAX_LAYOUT_ATTEMPTS = 30  # Retry an entire layout if greedy placement gets stuck.
+    # Physics settling
+    MAX_SETTLE_STEPS = 180
+    STABLE_STEPS = 15
 
+    LINEAR_VEL_THRESHOLD = 0.005
+    ANGULAR_VEL_THRESHOLD = 0.05
     # Fixed simulated RGB-D camera. Use approximately the same extrinsic
     # pose/intrinsics on the real robot, or calibrate before deployment.
     # Aim cameras closer to the newly shifted manipulation workspace.
@@ -483,6 +488,24 @@ class CANDIDBaselineEnv(BaseEnv):
         obj.set_linear_velocity(zeros)
         obj.set_angular_velocity(zeros)
 
+    def _objects_are_stable(self):
+        objects = [self.cube] + self.clutter_cubes
+
+        for obj in objects:
+            linear_vel = obj.get_linear_velocity()
+            angular_vel = obj.get_angular_velocity()
+
+            linear_speed = torch.linalg.norm(linear_vel, dim=-1)
+            angular_speed = torch.linalg.norm(angular_vel, dim=-1)
+
+            if torch.any(linear_speed >= self.LINEAR_VEL_THRESHOLD):
+                return False
+
+            if torch.any(angular_speed >= self.ANGULAR_VEL_THRESHOLD):
+                return False
+
+        return True
+
     def _get_obs_extra(self, info: dict):
         """Return ONLY extra information available on a real robot.
 
@@ -511,6 +534,54 @@ class CANDIDBaselineEnv(BaseEnv):
             [obj.pose.raw_pose for obj in self.clutter_cubes], dim=1
         )
 
+    def reset(self, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+
+        if options is not None and "reset_to_env_states" in options:
+            return obs, info
+
+        if self.num_envs != 1:
+            raise ValueError(
+                "Physics settling currently supports num_envs=1 only"
+            )
+
+        stable_count = 0
+        settle_steps = 0
+
+        for step in range(self.MAX_SETTLE_STEPS):
+            self._step_action(None)
+            settle_steps += 1
+
+            if self._objects_are_stable():
+                stable_count += 1
+            else:
+                stable_count = 0
+
+            if stable_count >= self.STABLE_STEPS:
+                break
+
+        if stable_count < self.STABLE_STEPS:
+            raise RuntimeError(
+                "Scene did not become stable within "
+                f"{self.MAX_SETTLE_STEPS} steps"
+            )
+
+        for layout in self._last_layouts.values():
+            layout["initial_stability"] = {
+                "idle_stable": True,
+                "settle_steps": settle_steps,
+            }
+
+        self._elapsed_steps[:] = 0
+
+        new_info = self.get_info()
+        new_info["reconfigure"] = info.get("reconfigure", False)
+        new_obs = self.get_obs(new_info)
+
+        self._last_obs = new_obs
+
+        return new_obs, new_info
+    
     def evaluate(self):
         """Check the pick-and-place goal, independently of disturbance.
 
