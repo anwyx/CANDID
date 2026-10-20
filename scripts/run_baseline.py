@@ -1,8 +1,20 @@
-"""Run and record the deterministic CANDID baseline Pick-and-Place.
+"""Run and record seeded, bounded-randomized CANDID Pick-and-Place.
+
+Expected project tree:
+
+    CANDID/
+    ├── envs/
+    │   ├── __init__.py
+    │   └── candid_baseline_env.py
+    ├── planners/
+    │   ├── __init__.py
+    │   └── execute_baseline.py
+    └── scripts/
+        └── run_baseline.py
 
 Typical runs (from the CANDID project root):
 
-    # Quick test: one fixed baseline scene, no large RGB-D dataset
+    # Quick test: one seeded randomized scene, no large RGB-D dataset
     python scripts/run_baseline.py --episodes 1 --obs-mode none
 
     # Collect RGB-D + proprioception + executed joint actions
@@ -15,7 +27,8 @@ Typical runs (from the CANDID project root):
     python scripts/run_baseline.py --episodes 1 --vis --save-video
 
 Important conventions:
-* The scene is deterministic; more episodes do not mean more unique scenes.
+* The randomization BOUNDS are fixed; seed+k creates a new layout each episode.
+* --fixed-scene reproduces the previous static layout for regression tests.
 * MPlib uses control_mode='pd_joint_pos' for this baseline.
 * Both the real robot's joint states and RGB-D camera can produce the
   observations stored for future DP imitation learning.
@@ -44,7 +57,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import envs.candid_baseline_env  # noqa: F401; registers CANDIDBaseline-v0 in gym
+from envs import candid_baseline_env  # noqa: F401; register CANDIDBaseline-v0
 from planners.execute_baseline import BaselinePlanConfig, PlanResult, solve
 
 from mani_skill.utils.wrappers.record import RecordEpisode
@@ -177,7 +190,14 @@ def parse_args():
         description="Execute ManiSkill3 xArm6 CANDID baseline with MPlib"
     )
     parser.add_argument("--episodes", type=int, default=1, help="Number of attempts")
-    parser.add_argument("--seed", type=int, default=0, help="First reset seed")
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="First scene seed; each episode uses seed + episode_index",
+    )
+    parser.add_argument(
+        "--fixed-scene", action="store_true",
+        help="Disable layout randomization and replay the old deterministic baseline",
+    )
     parser.add_argument(
         "--sim-backend", choices=("cpu", "gpu", "auto"), default="cpu",
         help="Use CPU for the simple single-scene MPlib baseline",
@@ -237,6 +257,7 @@ def build_env(args):
         reward_mode="dense",
         sim_backend=args.sim_backend,
         max_episode_steps=args.max_episode_steps,
+        randomize_layout=not args.fixed_scene,
     )
     monitor = DisturbanceMonitor(env)
     if args.no_record:
@@ -255,7 +276,7 @@ def build_env(args):
         clean_on_close=True,
         record_env_state=False,  # Avoid exposing simulator GT state as policy data
         source_type="motionplanning",
-        source_desc="CANDID fixed-scene xArm6 MPlib baseline (task-only)",
+        source_desc="CANDID bounded-pose-randomization xArm6 MPlib baseline (task-only)",
         video_fps=30,
     )
     return recorder, monitor, recorder
@@ -315,6 +336,8 @@ def main():
                     "time": datetime.now().isoformat(timespec="seconds"),
                     "seed": seed,
                     "environment": "CANDIDBaseline-v0",
+                    "randomize_layout": not args.fixed_scene,
+                    "scene_layout": monitor.env.unwrapped.get_scene_layout_for_logging(),
                     "control_mode": "pd_joint_pos",
                     "obs_mode": args.obs_mode,
                     "lateral_offset_m": args.lateral_offset,
@@ -342,10 +365,14 @@ def main():
     print(f"Task successes: {successes} ({successes / args.episodes:.1%})")
     print(f"Saved trajectories: {saved} (HDF5 recording {'disabled' if args.no_record else 'enabled'})")
     print(f"Episode metrics: {metadata_path.resolve()}")
-    print(
-        "Note: fixed baseline scene + fixed route; repetitions are NOT independent "
-        "randomized environments or diverse policy demonstrations."
-    )
+    if args.fixed_scene:
+        print("Note: --fixed-scene uses the original deterministic layout.")
+    else:
+        print(
+            "Note: reset seeds randomize poses within fixed bounds. "
+            "The planner route template is still fixed, so this does NOT "
+            "generate multiple distinct trajectory strategies per scene."
+        )
 
 
 if __name__ == "__main__":

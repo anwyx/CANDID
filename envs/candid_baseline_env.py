@@ -1,40 +1,37 @@
-"""CANDID baseline tabletop environment (ManiSkill 3).
+"""CANDID baseline tabletop environment with bounded domain randomization.
 
 Task
 ----
-The xArm6 with a Robotiq gripper picks up ONE red cube and places it in
-ONE fixed goal region. Other tabletop objects are movable distractors.
-Accidental contacts with distractors are allowed; moving them is NOT an
-independent subtask and their displacement is NOT part of the task reward.
+A fixed xArm6 + Robotiq gripper picks a red cube and places it in a marked
+forward goal region. Four independently movable cubes provide clutter. The
+robot is allowed to contact them, but does not deliberately rearrange them.
 
-Why this file exists
---------------------
-All CANDID contributors should use this file as the shared geometric and
-simulation convention before adding object assets or domain randomization.
-The default reset is deliberately deterministic: no random object poses,
-no random robot joint positions, and no random camera poses.
+What "baseline" means here
+--------------------------
+The robot, action interface, cameras, object geometry, and XY SAMPLING REGIONS
+are fixed team-wide. Individual scene layouts are NOT fixed: at each reset,
+the target, the goal, and the four distractors receive fresh positions; the
+target and distractors also receive a random in-plane yaw.
 
-Coordinate convention (metres, ManiSkill world frame)
------------------------------------------------------
-* The tabletop surface is z = 0 (TableSceneBuilder convention).
-* The robot is on the -X side; +X points toward the placement goal.
-* +/-Y are the two lateral directions; +Z points upward.
-* Object pose positions are object CENTRES, not bottom-surface positions.
+* reset(seed=same_number) -> same geometry layout (subject to simulator version).
+* reset(seed=different_number) -> potentially different geometry layout.
+* randomize_layout=False -> old deterministic baseline, for regression tests.
+
+All regions are in metres in the ManiSkill WORLD FRAME. The table surface is
+z=0. The robot is on -X; positive X points towards the goal. Positions are
+object CENTRES, not the bottom of a collision shape.
 
 Sim-to-real observation rule
 ----------------------------
-The agent-visible extra observations below use only the robot's own forward
-kinematics and the known task goal. RGB-D sensor data comes from the simulated
-camera and can later be replaced with a calibrated physical RGB-D camera.
-DO NOT add simulator ground-truth target or distractor poses to _get_obs_extra.
-Such poses can be used in an external logger for training labels/evaluation.
+Only robot proprioception, the known goal, and simulated camera data are
+returned to future learners. The simulator's exact distractor/target poses
+may be read via the logging API for supervised labels and debugging, never
+as privileged DP or predictor features.
 
-Notes
------
-This is a baseline ENVIRONMENT, not a motion planner or a data collector.
-It has not been tested end-to-end in a local ManiSkill installation.
+Note: this first randomized baseline varies POSITION and YAW, not shape,
+number of distractors, object mass/friction, or camera calibration. Add those
+through separate environment extensions after this baseline is validated.
 """
-
 from typing import Any
 
 import numpy as np
@@ -54,11 +51,10 @@ from mani_skill.utils.structs.pose import Pose
 
 @register_env("CANDIDBaseline-v0", max_episode_steps=250)
 class CANDIDBaselineEnv(BaseEnv):
-    """Deterministic reference scene for low-disturbance pick-and-place.
+    """Reference task with fixed randomization boundaries and seeded resets.
 
-    Subclasses can change object geometry or override _initialize_episode
-    to randomize positions. Keep the shared coordinate frame, robot pose,
-    action/control convention, and goal definition fixed across datasets.
+    Scene layouts vary within team-agreed regions. Keep the coordinate frame,
+    robot base, task-success metric, camera and action conventions unchanged.
     """
 
     SUPPORTED_ROBOTS = ["xarm6_robotiq"]
@@ -71,28 +67,36 @@ class CANDIDBaselineEnv(BaseEnv):
     ROBOT_BASE_POS = (-0.522, 0.0, 0.0)
     ROBOT_INIT_QPOS_NOISE = 0.0
 
-    # Picked target (the RED cube). 0.02 m half-side -> 0.04 m side.
-    CUBE_HALF_SIZE = 0.020
-    TARGET_CUBE_XY = (-0.12, 0.00)
+    # ----------------------------------------------------------------
+    # 1. TARGET: red cube to pick, geometry fixed, reset pose randomized.
+    # ----------------------------------------------------------------
+    CUBE_HALF_SIZE = 0.020               # side length = 0.04 m
+    TARGET_CUBE_XY = (-0.12, 0.00)      # original fixed-scene centre
     TARGET_CUBE_YAW = 0.0
 
-    # Goal is a fixed region ON the tabletop, rather than a floating goal.
-    # Goal marker is decorative: it has no collision geometry.
-    # Keep the place site in front (+X), but within comfortable reach.
-    # This places the goal 22 cm ahead of the pickup cube.
-    GOAL_XY = (0.10, 0.00)
+    # XY CENTRE sampling region. The robot base never moves.
+    # These narrow bounds reduce unexpected IK failures in the first version.
+    TARGET_X_RANGE = (-0.145, -0.095)
+    TARGET_Y_RANGE = (-0.035, 0.035)
+
+    # ----------------------------------------------------------------
+    # 2. GOAL: marked region on the tabletop, randomized within a small box.
+    # ----------------------------------------------------------------
+    GOAL_XY = (0.10, 0.00)              # original fixed-scene centre
+    GOAL_X_RANGE = (0.080, 0.120)
+    GOAL_Y_RANGE = (-0.040, 0.040)
     GOAL_MARKER_RADIUS = 0.060
     GOAL_XY_TOLERANCE = 0.045
     GOAL_HEIGHT_TOLERANCE = 0.025
     ROBOT_STATIC_THRESHOLD = 0.2
 
-    # Movable clutter: four small cubes for the reference scene only.
-    # In later tasks these can be changed to primitives, custom shapes,
-    # or YCB assets, while respecting the same world-coordinate region.
+    # ----------------------------------------------------------------
+    # 3. DISTRACTORS: 4 cube ACTORS; reset samples centre XY and yaw.
+    # ----------------------------------------------------------------
     DISTRACTOR_HALF_SIZE = 0.020
-    # Two objects near the pickup side, two beside the transfer corridor.
-    # The goal itself is kept clear for the place-and-release motion.
-    # These centres are deliberately fixed until domain randomization.
+
+    # The original checked fixed layout remains available through
+    # randomize_layout=False, for debugging and backwards compatibility.
     DISTRACTOR_XY = (
         (-0.155,  0.078),
         (-0.035,  0.071),
@@ -106,16 +110,16 @@ class CANDIDBaselineEnv(BaseEnv):
         (0.20, 0.50, 1.00, 1.0),  # blue
     )
 
-    # Shared region for subsequent RANDOMIZATION (not used at baseline reset).
-    # Interpret bounds as object CENTRE x/y; size-dependent clearances still
-    # must be checked before accepting sampled positions.
+    # Shared randomization bounds for the CENTRES of all four distractors.
+    # The sampler below checks clearance to EVERY other sampled object.
     DISTRACTOR_X_RANGE = (-0.22, 0.03)
     DISTRACTOR_Y_RANGE = (-0.16, 0.16)
+
+    # Conservative footprint check: a square of half-size h is enclosed
+    # in a circle of radius sqrt(2)*h, valid for ANY in-plane yaw.
     MIN_SURFACE_GAP = 0.010
-    # Keep at least 3 cm of free surface clearance around the drawn goal
-    # marker (in addition to the distractor bounding-circle radius).
-    # Future randomizers should enforce this clearance for every object.
     GOAL_MARKER_FREE_GAP = 0.030
+    MAX_POSITION_SAMPLES = 2000
 
     # Fixed simulated RGB-D camera. Use approximately the same extrinsic
     # pose/intrinsics on the real robot, or calibrate before deployment.
@@ -130,55 +134,157 @@ class CANDIDBaselineEnv(BaseEnv):
     HUMAN_CAM_EYE = (0.52, 0.65, 0.58)
     HUMAN_CAM_LOOK_AT = (-0.06, 0.00, 0.12)
 
-    def __init__(self, *args, robot_uids="xarm6_robotiq", **kwargs):
-        """Save shared constants and let ManiSkill construct the simulator.
+    def __init__(
+        self, *args, robot_uids="xarm6_robotiq", robot_init_qpos_noise=0.0,
+        randomize_layout=True, **kwargs
+    ):
+        """Configure the fixed robot and opt-in deterministic regression mode.
 
-        We intentionally support only the xArm6 Robotiq here: switching
-        robots would change reachability, gripper collision geometry,
-        motion semantics, and the meaning of a common training scene.
+        Parameters
+        ----------
+        randomize_layout:
+            True (default): sample target/goal/distractor poses on EACH reset.
+            False: use the exact former fixed baseline scene at every reset.
+        robot_init_qpos_noise:
+            Defaults to zero. Keep zero across the team so the initial robot
+            pose stays fixed; pose randomization is limited to task objects.
         """
         if robot_uids != "xarm6_robotiq":
             raise ValueError("CANDIDBaseline-v0 uses only xarm6_robotiq")
-
-        self.robot_init_qpos_noise = self.ROBOT_INIT_QPOS_NOISE
+        if float(robot_init_qpos_noise) != 0.0:
+            raise ValueError(
+                "The CANDID baseline fixes robot joint initialization; "
+                "robot_init_qpos_noise must be 0.0"
+            )
+        self.robot_init_qpos_noise = 0.0
+        self.randomize_layout = bool(randomize_layout)
         self.cube_half_size = self.CUBE_HALF_SIZE
         self.goal_thresh = self.GOAL_XY_TOLERANCE
         self.goal_radius = self.GOAL_MARKER_RADIUS
-        self._validate_baseline_layout()
+        self._validate_randomization_configuration()
+        self._last_layouts = {}  # env_id -> pose metadata for logging/debugging
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
-    def _validate_baseline_layout(self):
-        """Catch accidental geometry errors before simulation starts.
+    def _validate_randomization_configuration(self):
+        """Validate constant bounds and the original fixed fallback layout.
 
-        For the reference cubes, we conservatively approximate each
-        footprint by a circle enclosing its square footprint. Later YCB
-        or elongated shapes must use their own footprint/collision checks.
-        This tests initial overlaps only, NOT robot grasp feasibility.
+        Full collision/IK validation still takes place during rollout.
+        The sampling routine conservatively prevents STARTING intersections
+        between movable objects and leaves the goal marker neighbourhood free.
         """
-        target_xy = np.asarray(self.TARGET_CUBE_XY, dtype=float)
-        goal_xy = np.asarray(self.GOAL_XY, dtype=float)
-        centers = [np.asarray(p, dtype=float) for p in self.DISTRACTOR_XY]
-        r_target = np.sqrt(2) * self.CUBE_HALF_SIZE
-        r_other = np.sqrt(2) * self.DISTRACTOR_HALF_SIZE
-        gap = self.MIN_SURFACE_GAP
+        if len(self.DISTRACTOR_XY) != len(self.DISTRACTOR_COLORS):
+            raise ValueError("Number of fixed distractors/colors must match")
+        for name, bounds in [
+            ("target X", self.TARGET_X_RANGE),
+            ("target Y", self.TARGET_Y_RANGE),
+            ("goal X", self.GOAL_X_RANGE),
+            ("goal Y", self.GOAL_Y_RANGE),
+            ("distractor X", self.DISTRACTOR_X_RANGE),
+            ("distractor Y", self.DISTRACTOR_Y_RANGE),
+        ]:
+            if len(bounds) != 2 or not bounds[0] < bounds[1]:
+                raise ValueError(f"Invalid sampling interval for {name}: {bounds}")
+        if self.MIN_SURFACE_GAP < 0 or self.GOAL_MARKER_FREE_GAP < 0:
+            raise ValueError("Clearance margins must not be negative")
+        fixed = self._fixed_layout()
+        placed = []
+        for xy in fixed["distractors_xy"]:
+            if not self._clear_distractor(xy, fixed["target_xy"],
+                                           fixed["goal_xy"], placed):
+                raise ValueError("Fixed baseline distractors overlap")
+            placed.append(xy)
 
-        assert len(centers) == len(self.DISTRACTOR_COLORS)
-        for i, point in enumerate(centers):
-            x, y = point
-            if not (self.DISTRACTOR_X_RANGE[0] <= x <= self.DISTRACTOR_X_RANGE[1]):
-                raise ValueError(f"Distractor {i} outside shared X range")
-            if not (self.DISTRACTOR_Y_RANGE[0] <= y <= self.DISTRACTOR_Y_RANGE[1]):
-                raise ValueError(f"Distractor {i} outside shared Y range")
-            if np.linalg.norm(point - target_xy) <= r_other + r_target + gap:
-                raise ValueError(f"Distractor {i} overlaps the initial target")
-            if (
-                np.linalg.norm(point - goal_xy)
-                <= r_other + self.GOAL_MARKER_RADIUS + self.GOAL_MARKER_FREE_GAP
+    @staticmethod
+    def _sample_xy(rng, x_range, y_range):
+        """Sample one XY position from the fixed rectangular region."""
+        return (float(rng.uniform(*x_range)), float(rng.uniform(*y_range)))
+
+    @staticmethod
+    def _footprint_radius(half_size):
+        """Bounding-circle radius of a square horizontal footprint."""
+        return np.sqrt(2.0) * float(half_size)
+
+    def _clear_distractor(self, xy, target_xy, goal_xy, placed_xy):
+        """Reject intersecting objects and clutter intruding into the goal.
+
+        This uses conservative 2D bounding circles; it is safe for rotated
+        cube footprints. Its purpose is initial separation, not collision
+        avoidance once the robot starts moving.
+        """
+        x, y = xy
+        if not (self.DISTRACTOR_X_RANGE[0] <= x <= self.DISTRACTOR_X_RANGE[1]):
+            return False
+        if not (self.DISTRACTOR_Y_RANGE[0] <= y <= self.DISTRACTOR_Y_RANGE[1]):
+            return False
+        r_d = self._footprint_radius(self.DISTRACTOR_HALF_SIZE)
+        r_t = self._footprint_radius(self.CUBE_HALF_SIZE)
+        if np.linalg.norm(np.asarray(xy) - np.asarray(target_xy)) < (
+            r_d + r_t + self.MIN_SURFACE_GAP
+        ):
+            return False
+        if np.linalg.norm(np.asarray(xy) - np.asarray(goal_xy)) < (
+            r_d + self.GOAL_MARKER_RADIUS + self.GOAL_MARKER_FREE_GAP
+        ):
+            return False
+        for previous in placed_xy:
+            if np.linalg.norm(np.asarray(xy) - np.asarray(previous)) < (
+                2.0 * r_d + self.MIN_SURFACE_GAP
             ):
-                raise ValueError(f"Distractor {i} violates the goal clear area")
-            for j in range(i):
-                if np.linalg.norm(point - centers[j]) <= 2 * r_other + gap:
-                    raise ValueError(f"Distractors {j} and {i} overlap")
+                return False
+        return True
+
+    def _fixed_layout(self):
+        """Return the already tested baseline poses for a regression run."""
+        return dict(
+            target_xy=tuple(self.TARGET_CUBE_XY),
+            target_yaw=float(self.TARGET_CUBE_YAW),
+            goal_xy=tuple(self.GOAL_XY),
+            distractors_xy=[tuple(xy) for xy in self.DISTRACTOR_XY],
+            distractors_yaw=[0.0] * len(self.DISTRACTOR_XY),
+        )
+
+    def _sample_layout(self, rng):
+        """Generate ONE reproducible non-overlapping randomized scene.
+
+        Important: use ManiSkill's seeded _batched_episode_rng[env_id], not
+        Python's unseeded global random module. `reset(seed=n)` therefore
+        regenerates the same pose layout across repeated runs.
+        """
+        target_xy = self._sample_xy(rng, self.TARGET_X_RANGE, self.TARGET_Y_RANGE)
+        goal_xy = self._sample_xy(rng, self.GOAL_X_RANGE, self.GOAL_Y_RANGE)
+        target_yaw = float(rng.uniform(-np.pi, np.pi))
+        placed_xy = []
+        placed_yaw = []
+        for object_index in range(len(self.DISTRACTOR_XY)):
+            for _ in range(self.MAX_POSITION_SAMPLES):
+                candidate = self._sample_xy(
+                    rng, self.DISTRACTOR_X_RANGE, self.DISTRACTOR_Y_RANGE
+                )
+                if self._clear_distractor(candidate, target_xy, goal_xy, placed_xy):
+                    placed_xy.append(candidate)
+                    placed_yaw.append(float(rng.uniform(-np.pi, np.pi)))
+                    break
+            else:
+                raise RuntimeError(
+                    f"Could not position distractor {object_index} without "
+                    "overlap. Increase workspace bounds or sampling budget."
+                )
+        return dict(
+            target_xy=target_xy,
+            target_yaw=target_yaw,
+            goal_xy=goal_xy,
+            distractors_xy=placed_xy,
+            distractors_yaw=placed_yaw,
+        )
+
+    @staticmethod
+    def _yaw_quaternion(yaws, device):
+        """Batched planar orientation in SAPIEN/ManiSkill (w,x,y,z) order."""
+        yaws = torch.as_tensor(yaws, dtype=torch.float32, device=device)
+        q = torch.zeros((len(yaws), 4), dtype=torch.float32, device=device)
+        q[:, 0] = torch.cos(yaws / 2.0)
+        q[:, 3] = torch.sin(yaws / 2.0)
+        return q
 
     @property
     def _default_sensor_configs(self):
@@ -218,7 +324,7 @@ class CANDIDBaselineEnv(BaseEnv):
         super()._load_agent(options, sapien.Pose(p=self.ROBOT_BASE_POS))
 
     def _load_scene(self, options: dict):
-        """Create the table, one target cube, four movable distractors, and goal.
+        """Build fixed ACTORS once; vary their poses at each episode reset.
 
         Everything other than the non-colliding goal marker is a normal
         physics actor. We do NOT disable collision between the gripper,
@@ -271,47 +377,83 @@ class CANDIDBaselineEnv(BaseEnv):
         # same marked goal region can be placed on a real tabletop.
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
-        """Deterministically reset every object for reproducible rollouts.
+        """Sample NEW poses on reset, but keep the SAME shared XY regions.
 
-        Do not randomize anything here yet. Future subclasses can sample
-        layouts, but each candidate trajectory for a fixed scene_id must
-        start from exactly the same initial scene.
+        Geometry is never randomized outside the class-level coordinate
+        bounds. The same reset seed produces the same scene; different
+        seeds provide new pose layouts. No hidden physical parameters are
+        randomized. Each actor's identity stays fixed for consistent logs.
         """
         with torch.device(self.device):
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
 
-            # TableSceneBuilder already chooses the xArm6 'rest' joint
-            # configuration and the same base pose; restate it here to
-            # make our shared convention explicit.
+            # The TableSceneBuilder resets the arm's joints to xArm6 'rest'.
+            # Keep the robot BASE at its team-fixed coordinate on every reset.
             self.agent.robot.set_pose(sapien.Pose(p=self.ROBOT_BASE_POS))
 
-            # 1. Place the red target cube at the centre of the work area.
-            target_p = torch.zeros((b, 3))
-            target_p[:, 0] = self.TARGET_CUBE_XY[0]
-            target_p[:, 1] = self.TARGET_CUBE_XY[1]
-            target_p[:, 2] = self.cube_half_size
-            target_q = self._identity_quaternions(b)
+            # Generate ONE layout for EACH selected simulation environment.
+            # For GPU/CPU reproducibility the RNG is indexed per env, as
+            # recommended in ManiSkill's randomization documentation.
+            env_ids = env_idx.detach().cpu().tolist()
+            layouts = []
+            for scene_idx in env_ids:
+                if self.randomize_layout:
+                    rng = self._batched_episode_rng[int(scene_idx)]
+                    layout = self._sample_layout(rng)
+                else:
+                    layout = self._fixed_layout()
+                self._last_layouts[int(scene_idx)] = layout
+                layouts.append(layout)
+
+            # 1. Picked red cube: random XY and in-plane yaw; centre at z=h.
+            target_p = torch.tensor(
+                [[*layout["target_xy"], self.cube_half_size] for layout in layouts],
+                dtype=torch.float32, device=self.device,
+            )
+            target_q = self._yaw_quaternion(
+                [layout["target_yaw"] for layout in layouts], self.device
+            )
             self.cube.set_pose(Pose.create_from_pq(target_p, target_q))
             self._reset_object_velocity(self.cube, b)
 
-            # 2. Place four distractors around the target-to-goal region.
-            for obj, xy in zip(self.clutter_cubes, self.DISTRACTOR_XY):
-                p = torch.zeros((b, 3))
-                p[:, 0] = xy[0]
-                p[:, 1] = xy[1]
-                p[:, 2] = self.DISTRACTOR_HALF_SIZE
-                obj.set_pose(Pose.create_from_pq(p, self._identity_quaternions(b)))
+            # 2. Distractors: new XY/yaw each reset, sampled with clearance.
+            for object_i, obj in enumerate(self.clutter_cubes):
+                p = torch.tensor(
+                    [
+                        [*layout["distractors_xy"][object_i], self.DISTRACTOR_HALF_SIZE]
+                        for layout in layouts
+                    ],
+                    dtype=torch.float32, device=self.device,
+                )
+                q = self._yaw_quaternion(
+                    [layout["distractors_yaw"][object_i] for layout in layouts],
+                    self.device,
+                )
+                obj.set_pose(Pose.create_from_pq(p, q))
                 self._reset_object_velocity(obj, b)
 
-            # 3. Put the non-colliding target marker at a fixed table XY.
-            goal_p = torch.zeros((b, 3))
-            goal_p[:, 0] = self.GOAL_XY[0]
-            goal_p[:, 1] = self.GOAL_XY[1]
-            goal_p[:, 2] = 1e-3
-            # Follow the marker orientation convention in the given file.
-            goal_q = torch.tensor(euler2quat(0, np.pi / 2, 0), dtype=torch.float32)
-            self.goal_site.set_pose(Pose.create_from_pq(goal_p, goal_q))
+            # 3. Goal marker: random XY within a fixed forward landing zone.
+            goal_p = torch.tensor(
+                [[*layout["goal_xy"], 1e-3] for layout in layouts],
+                dtype=torch.float32, device=self.device,
+            )
+            marker_q = torch.tensor(
+                euler2quat(0, np.pi / 2, 0),
+                dtype=torch.float32, device=self.device,
+            ).expand(b, -1)
+            self.goal_site.set_pose(Pose.create_from_pq(goal_p, marker_q))
+
+    def get_scene_layout_for_logging(self):
+        """Return sampled layout metadata (NOT a policy observation).
+
+        For the current CPU/MPlib runner num_envs=1. Return dict for one
+        environment, or a mapping of id -> layout for parallel simulation.
+        This is useful to pair an HDF5 episode with the exact sampled scene.
+        """
+        if len(self._last_layouts) == 1:
+            return next(iter(self._last_layouts.values())).copy()
+        return {k: v.copy() for k, v in self._last_layouts.items()}
 
     @staticmethod
     def _reset_object_velocity(obj, batch_size: int):
@@ -324,13 +466,6 @@ class CANDIDBaselineEnv(BaseEnv):
         zeros = torch.zeros((batch_size, 3))
         obj.set_linear_velocity(zeros)
         obj.set_angular_velocity(zeros)
-
-    @staticmethod
-    def _identity_quaternions(batch_size: int):
-        """Return batched (w, x, y, z) quaternions for level cube poses."""
-        q = torch.zeros((batch_size, 4))
-        q[:, 0] = 1.0
-        return q
 
     def _get_obs_extra(self, info: dict):
         """Return ONLY extra information available on a real robot.
