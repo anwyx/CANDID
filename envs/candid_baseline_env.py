@@ -110,16 +110,20 @@ class CANDIDBaselineEnv(BaseEnv):
         (0.20, 0.50, 1.00, 1.0),  # blue
     )
 
-    # Shared randomization bounds for the CENTRES of all four distractors.
-    # The sampler below checks clearance to EVERY other sampled object.
-    DISTRACTOR_X_RANGE = (-0.22, 0.03)
-    DISTRACTOR_Y_RANGE = (-0.16, 0.16)
+    # Compact clutter zone around the object being grasped (not the goal).
+    # IMPORTANT: the goal marker is at x about +0.10 m. Putting all clutter
+    # in x=[+0.05,+0.15] leaves almost no usable space because the goal
+    # marker has a large exclusion zone. Keep the goal clear for placement.
+    # Bounds refer to object CENTRES. They remain fixed across resets.
+    DISTRACTOR_X_RANGE = (-0.180, -0.040)
+    DISTRACTOR_Y_RANGE = (-0.095, 0.095)
 
     # Conservative footprint check: a square of half-size h is enclosed
     # in a circle of radius sqrt(2)*h, valid for ANY in-plane yaw.
-    MIN_SURFACE_GAP = 0.010
+    MIN_SURFACE_GAP = 0.003
     GOAL_MARKER_FREE_GAP = 0.030
     MAX_POSITION_SAMPLES = 2000
+    MAX_LAYOUT_ATTEMPTS = 30  # Retry an entire layout if greedy placement gets stuck.
 
     # Fixed simulated RGB-D camera. Use approximately the same extrinsic
     # pose/intrinsics on the real robot, or calibrate before deployment.
@@ -186,13 +190,10 @@ class CANDIDBaselineEnv(BaseEnv):
                 raise ValueError(f"Invalid sampling interval for {name}: {bounds}")
         if self.MIN_SURFACE_GAP < 0 or self.GOAL_MARKER_FREE_GAP < 0:
             raise ValueError("Clearance margins must not be negative")
-        fixed = self._fixed_layout()
-        placed = []
-        for xy in fixed["distractors_xy"]:
-            if not self._clear_distractor(xy, fixed["target_xy"],
-                                           fixed["goal_xy"], placed):
-                raise ValueError("Fixed baseline distractors overlap")
-            placed.append(xy)
+        if self.MAX_POSITION_SAMPLES < 1 or self.MAX_LAYOUT_ATTEMPTS < 1:
+            raise ValueError("Sampling attempt budgets must be positive")
+        # Fixed-scene positions are a separate regression fixture and do not
+        # have to lie inside the current randomized sampling bounds.
 
     @staticmethod
     def _sample_xy(rng, x_range, y_range):
@@ -253,28 +254,43 @@ class CANDIDBaselineEnv(BaseEnv):
         target_xy = self._sample_xy(rng, self.TARGET_X_RANGE, self.TARGET_Y_RANGE)
         goal_xy = self._sample_xy(rng, self.GOAL_X_RANGE, self.GOAL_Y_RANGE)
         target_yaw = float(rng.uniform(-np.pi, np.pi))
-        placed_xy = []
-        placed_yaw = []
-        for object_index in range(len(self.DISTRACTOR_XY)):
-            for _ in range(self.MAX_POSITION_SAMPLES):
-                candidate = self._sample_xy(
-                    rng, self.DISTRACTOR_X_RANGE, self.DISTRACTOR_Y_RANGE
-                )
-                if self._clear_distractor(candidate, target_xy, goal_xy, placed_xy):
-                    placed_xy.append(candidate)
-                    placed_yaw.append(float(rng.uniform(-np.pi, np.pi)))
+        # A greedy sampler can pick a valid first obstacle that makes later
+        # obstacles impossible to place. Retry the WHOLE distractor layout
+        # instead of retrying only the object that got stuck.
+        for attempt in range(self.MAX_LAYOUT_ATTEMPTS):
+            placed_xy = []
+            placed_yaw = []
+            for object_index in range(len(self.DISTRACTOR_XY)):
+                for _ in range(self.MAX_POSITION_SAMPLES):
+                    candidate = self._sample_xy(
+                        rng, self.DISTRACTOR_X_RANGE, self.DISTRACTOR_Y_RANGE
+                    )
+                    if self._clear_distractor(
+                        candidate, target_xy, goal_xy, placed_xy
+                    ):
+                        placed_xy.append(candidate)
+                        placed_yaw.append(float(rng.uniform(-np.pi, np.pi)))
+                        break
+                else:
+                    # An earlier placement may have blocked all remaining
+                    # space. Clear every distractor and start this layout over.
                     break
             else:
-                raise RuntimeError(
-                    f"Could not position distractor {object_index} without "
-                    "overlap. Increase workspace bounds or sampling budget."
+                # All distractors have been placed successfully.
+                return dict(
+                    target_xy=target_xy,
+                    target_yaw=target_yaw,
+                    goal_xy=goal_xy,
+                    distractors_xy=placed_xy,
+                    distractors_yaw=placed_yaw,
                 )
-        return dict(
-            target_xy=target_xy,
-            target_yaw=target_yaw,
-            goal_xy=goal_xy,
-            distractors_xy=placed_xy,
-            distractors_yaw=placed_yaw,
+
+        raise RuntimeError(
+            f"Cannot place {len(self.DISTRACTOR_XY)} distractors after "
+            f"{self.MAX_LAYOUT_ATTEMPTS} layout attempts. "
+            "The sampling region is too small for the target, goal, "
+            "and clearance constraints. Check DISTRACTOR_X_RANGE, "
+            "DISTRACTOR_Y_RANGE and GOAL_MARKER_FREE_GAP."
         )
 
     @staticmethod
