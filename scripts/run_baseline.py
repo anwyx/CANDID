@@ -167,6 +167,23 @@ class DisturbanceMonitor(gym.Wrapper):
         residual_rotation = self._rotation_angle(
             self.initial_pose[:, 3:], ending[:, 3:]
         )
+        # Continuous disturbance metric
+        # Each object's translation is normalized by its characteristic size.
+        object_size = 2.0 * self.env.unwrapped.DISTRACTOR_HALF_SIZE
+
+        translation_score = self.peak_translation / object_size
+        rotation_score = self.peak_rotation / np.pi
+
+        w_p = 0.7
+        w_R = 0.3
+
+        object_disturbance = (
+            w_p * translation_score
+            + w_R * rotation_score
+        )
+
+        continuous_dr = float(np.mean(object_disturbance))
+        d_max = float(np.max(object_disturbance))
         # Keep raw per-object components.  Do not assign arbitrary weights
         # yet: D_max / D_mean will be computed after the team agrees on
         # translation, rotation, topple and fall weight conventions.
@@ -181,6 +198,9 @@ class DisturbanceMonitor(gym.Wrapper):
             "ever_fell_below_table": self.ever_fell.tolist(),
             "max_peak_translation_m": float(np.max(self.peak_translation)),
             "max_peak_rotation_rad": float(np.max(self.peak_rotation)),
+            "continuous_dr": continuous_dr,
+            "d_max": d_max,
+            "per_object_disturbance": object_disturbance.tolist(),
         }
 
 
@@ -355,7 +375,9 @@ def main():
                 print(
                     f"  success={result.success}  stage={result.stage}  "
                     f"steps={result.steps}  "
-                    f"peak_clutter_translation={labels.get('max_peak_translation_m', float('nan')):.4f} m"
+                    f"peak_translation={labels['max_peak_translation_m']:.4f} m  "
+                    f"continuous_dr={labels['continuous_dr']:.4f}  "
+                    f"d_max={labels['d_max']:.4f}"
                 )
     finally:
         env.close()
