@@ -1,400 +1,386 @@
-"""Run and record seeded, bounded-randomized CANDID Pick-and-Place.
+"""Generic CANDID ManiSkill environment runner and dataset recorder.
 
-Expected project tree:
+Run from the CANDID project root, e.g.:
 
-    CANDID/
-    ├── envs/
-    │   ├── __init__.py
-    │   └── candid_baseline_env.py
-    ├── planners/
-    │   ├── __init__.py
-    │   └── execute_baseline.py
-    └── scripts/
-        └── run_baseline.py
+  # Original environment/planner (compatible with earlier run_baseline.py)
+  python scripts/run_baseline.py --episodes 2 --obs-mode none --save-video
 
-Typical runs (from the CANDID project root):
+  # Any TEAM environment that registers a Gym/ManiSkill environment ID
+  python scripts/run_baseline.py \
+      --env-module envs.primitive_env --env-id CANDIDPrimitive-v0 \
+      --episodes 10 --obs-mode state --output-dir demos/primitive_test
 
-    # Quick test: one seeded randomized scene, no large RGB-D dataset
-    python scripts/run_baseline.py --episodes 1 --obs-mode none
+  # Pass environment-specific construction parameters in JSON
+  python scripts/run_baseline.py \
+      --env-module envs.ycb_env --env-id CANDIDYCB-v0 \
+      --env-kwargs '{"randomize_layout": true, "num_distractors": 4}'
 
-    # Collect RGB-D + proprioception + executed joint actions
-    python scripts/run_baseline.py --episodes 5 --obs-mode rgbd
+  # Optional custom planner implementing the shared solve() API
+  python scripts/run_baseline.py --env-module envs.ycb_env \
+      --env-id CANDIDYCB-v0 --planner planners.ycb_planner:solve \
+      --planner-config-class planners.ycb_planner:PlanConfig \
+      --plan-kwargs '{"lift_height": 0.15}'
 
-    # Generate a simple different TRANSFER route through a waypoint
-    python scripts/run_baseline.py --episodes 5 --lateral-offset 0.04
+CONTRACT:
+  Each --env-module must register --env-id when imported. An environment
+  compatible with the default xArm6 pick-and-place planner must provide
+  .cube, .goal_site, .agent, .cube_half_size and evaluate()["success"].
+  Different tasks/robots can supply a custom solve() with this signature:
+      solve(env, seed: int, config: Any, vis: bool, verbose: bool)
+  It MUST reset the environment before executing, using env.reset(seed=seed),
+  and return an object or dict with success, stage, steps (optional details).
 
-    # Visualize and save an MP4 (requires working renderer / display)
-    python scripts/run_baseline.py --episodes 1 --vis --save-video
-
-Important conventions:
-* The randomization BOUNDS are fixed; seed+k creates a new layout each episode.
-* --fixed-scene reproduces the previous static layout for regression tests.
-* MPlib uses control_mode='pd_joint_pos' for this baseline.
-* Both the real robot's joint states and RGB-D camera can produce the
-  observations stored for future DP imitation learning.
-* The planner itself may use simulator cube pose as an expert teacher.
-* Simulator distractor poses are read ONLY by the disturbance label logger,
-  NOT used as policy/predictor inputs.  They are NOT recorded in the HDF5
-  environment-state field (record_env_state=False).
-* Both successful and failed executed attempts are saved by default;
-  --save-success-only filters the HDF5 demonstrations for DP training.
+  Disturbance monitoring is independent of the planner and optional for
+  environments without distractor logging APIs. Raw simulator truth never
+  enters the policy's observation. One environment instance at a time.
 """
 
+from __future__ import annotations
+
 import argparse
+import importlib
 import json
-import math
+import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import gymnasium as gym
-import numpy as np
-
-# Running 'python scripts/run_baseline.py' puts scripts/ on sys.path, not the
-# project root.  Insert the root so both local modules can be imported.
+# Running from scripts/ would otherwise hide the project-root packages.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from envs import candid_baseline_env  # noqa: F401; register CANDIDBaseline-v0
-from planners.execute_baseline import BaselinePlanConfig, PlanResult, solve
-
+import gymnasium as gym
 from mani_skill.utils.wrappers.record import RecordEpisode
 
-
-class DisturbanceMonitor(gym.Wrapper):
-    """Track simulator ground-truth distractor motion for LABELS ONLY.
-
-    The monitor sees each executed physics/control step, without modifying
-    actions or observations.  Later this can be replaced by a standalone
-    chunk-level logger for the Disturbance Predictor.
-
-    The reported peak motion is the maximum offset relative to the starting
-    pose, while residual motion is the offset after the final action.
-    Rotation is quaternion angular difference in radians.  'Topple' is an
-    approximate geometric flag (local z-axis tilted > 60 degrees).
-    'Fall' here only means the actor centre drops below table height; it
-    is NOT a complete edge-of-table fall detector.
-    """
-
-    def __init__(self, env):
-        super().__init__(env)
-        self.initial_pose = None
-        self.peak_translation = None
-        self.peak_rotation = None
-        self.ever_toppled = None
-        self.ever_fell = None
-        self.steps = 0
-        self.pose_trace = []  # [initial pose, state after action 0, ...]
-
-    def _poses(self) -> np.ndarray:
-        """Get [N,7] ground truth ONLY from the environment label API."""
-        poses = self.env.unwrapped.get_distractor_poses_for_logging()
-        return poses.detach().cpu().numpy()[0].astype(np.float64)
-
-    def reset(self, **kwargs):
-        """Capture initial positions after ManiSkill resets the environment."""
-        obs, info = self.env.reset(**kwargs)
-        self.initial_pose = self._poses().copy()
-        n = self.initial_pose.shape[0]
-        self.peak_translation = np.zeros(n, dtype=np.float64)
-        self.peak_rotation = np.zeros(n, dtype=np.float64)
-        self.ever_toppled = np.zeros(n, dtype=bool)
-        self.ever_fell = np.zeros(n, dtype=bool)
-        self.steps = 0
-        self.pose_trace = [self.initial_pose.copy()]
-        return obs, info
-
-    @staticmethod
-    def _rotation_angle(q0: np.ndarray, q1: np.ndarray) -> np.ndarray:
-        """Smallest SO(3) angular difference for (w,x,y,z) quaternions."""
-        q0 = q0 / np.maximum(np.linalg.norm(q0, axis=-1, keepdims=True), 1e-9)
-        q1 = q1 / np.maximum(np.linalg.norm(q1, axis=-1, keepdims=True), 1e-9)
-        cos_half = np.abs(np.sum(q0 * q1, axis=-1))
-        return 2.0 * np.arccos(np.clip(cos_half, 0.0, 1.0))
-
-    def _measure(self):
-        """Accumulate per-distractor peak translation, rotation and flags."""
-        if self.initial_pose is None:
-            return
-        poses = self._poses()
-        self.pose_trace.append(poses.copy())
-        delta_p = poses[:, :3] - self.initial_pose[:, :3]
-        displacement = np.linalg.norm(delta_p, axis=-1)
-        angle = self._rotation_angle(self.initial_pose[:, 3:], poses[:, 3:])
-        self.peak_translation = np.maximum(self.peak_translation, displacement)
-        self.peak_rotation = np.maximum(self.peak_rotation, angle)
-
-        # For an object initially standing upright, its local z direction
-        # remains close to world +Z.  With (w,x,y,z) quaternions, the z-z
-        # entry of its rotation matrix is 1 - 2(x^2 + y^2).
-        quat = poses[:, 3:]
-        quat = quat / np.maximum(np.linalg.norm(quat, axis=-1, keepdims=True), 1e-9)
-        upright = 1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
-        self.ever_toppled |= upright < math.cos(math.radians(60.0))
-        self.ever_fell |= poses[:, 2] < -0.03
-
-    def step(self, action):
-        """Execute unchanged action, then read resulting physical state."""
-        result = self.env.step(action)
-        self.steps += 1
-        self._measure()
-        return result
-
-    def save_pose_trace(self, path: Path):
-        """Save simulator GT poses outside the DP observation trajectory.
-
-        Trace shape: [T+1, N_distractors, 7]; the first frame is after
-        reset and each later frame follows one control action.  This lets
-        the team compute *chunk-level* disturbance labels later.
-        """
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            path,
-            distractor_poses=np.asarray(self.pose_trace, dtype=np.float32),
-            dt_steps=np.int32(self.steps),
-        )
-
-    def summary(self) -> dict[str, Any]:
-        """Return small JSON-compatible episode-level labels and metadata."""
-        if self.initial_pose is None:
-            return {"steps": self.steps, "has_data": False}
-        ending = self._poses()
-        residual_translation = np.linalg.norm(
-            ending[:, :3] - self.initial_pose[:, :3], axis=-1
-        )
-        residual_rotation = self._rotation_angle(
-            self.initial_pose[:, 3:], ending[:, 3:]
-        )
-        # Continuous disturbance metric
-        # Each object's translation is normalized by its characteristic size.
-        object_size = 2.0 * self.env.unwrapped.DISTRACTOR_HALF_SIZE
-
-        translation_score = self.peak_translation / object_size
-        rotation_score = self.peak_rotation / np.pi
-
-        w_p = 0.7
-        w_R = 0.3
-
-        object_disturbance = (
-            w_p * translation_score
-            + w_R * rotation_score
-        )
-
-        continuous_dr = float(np.mean(object_disturbance))
-        d_max = float(np.max(object_disturbance))
-        # Keep raw per-object components.  Do not assign arbitrary weights
-        # yet: D_max / D_mean will be computed after the team agrees on
-        # translation, rotation, topple and fall weight conventions.
-        return {
-            "steps": self.steps,
-            "has_data": True,
-            "peak_translation_m": self.peak_translation.tolist(),
-            "residual_translation_m": residual_translation.tolist(),
-            "peak_rotation_rad": self.peak_rotation.tolist(),
-            "residual_rotation_rad": residual_rotation.tolist(),
-            "ever_toppled": self.ever_toppled.tolist(),
-            "ever_fell_below_table": self.ever_fell.tolist(),
-            "max_peak_translation_m": float(np.max(self.peak_translation)),
-            "max_peak_rotation_rad": float(np.max(self.peak_rotation)),
-            "continuous_dr": continuous_dr,
-            "d_max": d_max,
-            "per_object_disturbance": object_disturbance.tolist(),
-        }
+from metrics.disturbance_monitor import DisturbanceMonitor
 
 
-def parse_args():
-    """Provide reproducible CLI defaults shared across three teammates."""
+def _json_dict(value: str, flag: str) -> dict:
+    """Parse a small JSON object for environment/planner construction kwargs."""
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"{flag}: invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise argparse.ArgumentTypeError(f"{flag} expects a JSON object, e.g. '{{\"x\": 1}}'")
+    return data
+
+
+def _import_symbol(location: str):
+    """Import a callable/class expressed as 'package.module:object_name'."""
+    if ":" not in location:
+        raise ValueError(f"Expected 'module:symbol', got {location!r}")
+    module_name, name = location.split(":", 1)
+    return getattr(importlib.import_module(module_name), name)
+
+
+def _git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT,
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+
+def _safe_path_component(value: str) -> str:
+    """Prevent environment names containing slashes from changing paths."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def _json_safe(value):
+    """Convert common NumPy/tensor values to JSON-compatible Python values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "detach"):
+        return _json_safe(value.detach().cpu().numpy())
+    if hasattr(value, "tolist"):
+        return _json_safe(value.tolist())
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    return str(value)
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Execute ManiSkill3 xArm6 CANDID baseline with MPlib"
+        description="Run any registered CANDID pick-and-place environment with a selected planner"
     )
-    parser.add_argument("--episodes", type=int, default=1, help="Number of attempts")
-    parser.add_argument(
-        "--seed", type=int, default=0,
-        help="First scene seed; each episode uses seed + episode_index",
-    )
-    parser.add_argument(
-        "--fixed-scene", action="store_true",
-        help="Disable layout randomization and replay the old deterministic baseline",
-    )
-    parser.add_argument(
-        "--sim-backend", choices=("cpu", "gpu", "auto"), default="cpu",
-        help="Use CPU for the simple single-scene MPlib baseline",
-    )
-    parser.add_argument(
-        "--obs-mode", default="rgbd", choices=("rgbd", "pointcloud", "none"),
-        help="Store deployable camera/proprio observations; 'none' is for fast debug only",
-    )
-    parser.add_argument(
-        "--max-episode-steps", type=int, default=500,
-        help="Episode time limit (planning + release/settle need more than 250 steps sometimes)",
-    )
-    parser.add_argument(
-        "--lateral-offset", type=float, default=0.0,
-        help="Metre offset for an optional transfer midpoint; 0 = nominal route",
-    )
-    parser.add_argument(
-        "--output-dir", type=Path, default=Path("demos/candid_baseline"),
-        help="Folder for .h5/.json trajectory and episode_metrics.jsonl",
-    )
-    parser.add_argument(
-        "--traj-name", default=None, help="Optional explicit trajectory file basename",
-    )
-    parser.add_argument(
-        "--no-record", action="store_true", help="Run without HDF5 recording",
-    )
-    parser.add_argument(
-        "--save-success-only", action="store_true",
-        help="Discard failed attempts from HDF5, but retain failure metadata in JSONL",
-    )
-    parser.add_argument("--save-video", action="store_true", help="Record debugging MP4s")
-    parser.add_argument("--vis", action="store_true", help="Show interactive viewer")
-    parser.add_argument("--verbose", action="store_true", help="Print motion-planning stages")
-    args = parser.parse_args()
-    if args.episodes < 1:
-        parser.error("--episodes must be >= 1")
-    if args.max_episode_steps < 1:
-        parser.error("--max-episode-steps must be >= 1")
-    if abs(args.lateral_offset) > 0.15:
-        parser.error("--lateral-offset must stay within [-0.15, 0.15] m")
+    parser.add_argument("--env-id", default="CANDIDBaseline-v0",
+                        help="Registered Gym/ManiSkill environment ID")
+    parser.add_argument("--env-module", default="envs.candid_baseline_env",
+                        help="Python module importing/registering --env-id (e.g. envs.ycb_env)")
+    parser.add_argument("--env-kwargs", default="{}", metavar="JSON",
+                        help='Environment-specific kwargs, e.g. \'{"num_distractors": 6}\'')
+    parser.add_argument("--fixed-scene", action="store_true",
+                        help="For environments supporting randomize_layout: pass randomize_layout=False")
+    parser.add_argument("--robot-uid", default="xarm6_robotiq")
+    parser.add_argument("--control-mode", default="pd_joint_pos",
+                        help="Default official xArm6 MPlib planner requires pd_joint_pos")
+    parser.add_argument("--obs-mode", default="rgbd",
+                        help="none for speed; rgbd/pointcloud/state if supported by the env")
+    parser.add_argument("--reward-mode", default="dense")
+    parser.add_argument("--sim-backend", choices=("cpu", "gpu", "auto"), default="cpu")
+    parser.add_argument("--max-episode-steps", type=int, default=500)
+
+    parser.add_argument("--planner", default="planners.execute_baseline:solve",
+                        help="Planner function import path, MODULE:FUNCTION")
+    parser.add_argument("--planner-config-class", default="planners.execute_baseline:BaselinePlanConfig",
+                        help="Planner config class, MODULE:CLASS; use 'none' for no config")
+    parser.add_argument("--plan-kwargs", default="{}", metavar="JSON",
+                        help='Planner config kwargs, e.g. \'{"lift_height": 0.12}\'')
+    parser.add_argument("--lateral-offset", type=float, default=None,
+                        help="BaselinePlanConfig shortcut; omit for other planners")
+
+    parser.add_argument("--episodes", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Each episode uses seed + episode_index")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Default demos/<env-id>; put separate experiments in separate directories")
+    parser.add_argument("--traj-name", default=None,
+                        help="HDF5 basename (do not include extension)")
+    parser.add_argument("--no-record", action="store_true",
+                        help="Disable HDF5, but allow video/metrics")
+    parser.add_argument("--save-success-only", action="store_true",
+                        help="Keep only successful episodes in HDF5 and video")
+    parser.add_argument("--save-video", action="store_true")
+    parser.add_argument("--vis", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--translation-weight", type=float, default=0.7)
+    parser.add_argument("--rotation-weight", type=float, default=0.3)
+    parser.add_argument("--table-height", type=float, default=0.0,
+                        help="World Z of the tabletop, used by fall heuristic")
+
+    args = parser.parse_args(argv)
+    if args.episodes < 1 or args.max_episode_steps < 1:
+        parser.error("--episodes and --max-episode-steps must be >= 1")
+    if args.translation_weight < 0 or args.rotation_weight < 0:
+        parser.error("disturbance weights must be nonnegative")
+    try:
+        args.env_kwargs = _json_dict(args.env_kwargs, "--env-kwargs")
+        args.plan_kwargs = _json_dict(args.plan_kwargs, "--plan-kwargs")
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    if args.fixed_scene:
+        if "randomize_layout" in args.env_kwargs:
+            parser.error("Do not use --fixed-scene together with env-kwargs.randomize_layout")
+        args.env_kwargs["randomize_layout"] = False
+    if args.lateral_offset is not None:
+        if "lateral_offset" in args.plan_kwargs:
+            parser.error("Specify lateral_offset via only one of --lateral-offset/--plan-kwargs")
+        if abs(args.lateral_offset) > 0.15:
+            parser.error("--lateral-offset must be in [-0.15, 0.15] m")
+        args.plan_kwargs["lateral_offset"] = args.lateral_offset
+    if args.output_dir is None:
+        args.output_dir = Path("demos") / _safe_path_component(args.env_id)
     return args
 
 
-def build_env(args):
-    """Create the same exact environment/control modes for everyone.
+def load_planner(args):
+    """Load a planner and its config without hardcoded class imports."""
+    solve = _import_symbol(args.planner)
+    if not callable(solve):
+        raise TypeError(f"Planner {args.planner} is not callable")
+    if args.planner_config_class.lower() == "none":
+        if args.plan_kwargs:
+            raise ValueError("--plan-kwargs requires a --planner-config-class")
+        config = None
+    else:
+        config_cls = _import_symbol(args.planner_config_class)
+        config = config_cls(**args.plan_kwargs)
+    return solve, config
 
-    ``RecordEpisode`` records visual observations plus executed actions.
-    The **truth-based monitor** is a separate wrapper below the recorder;
-    it does not inject its pose measurements into policy observations.
-    """
+
+def build_env(args):
+    """Register custom environment module, wrap it for metrics and recording."""
+    importlib.import_module(args.env_module)
+    # General Gym registration can also be done by external packages. ManiSkill
+    # integrates into gym.make when custom env module import registers its ID.
     env = gym.make(
-        "CANDIDBaseline-v0",
+        args.env_id,
         obs_mode=args.obs_mode,
-        control_mode="pd_joint_pos",  # Required by official MPlib XArm6 solver
+        control_mode=args.control_mode,
         render_mode="rgb_array",
-        robot_uids="xarm6_robotiq",
-        reward_mode="dense",
+        robot_uids=args.robot_uid,
+        reward_mode=args.reward_mode,
         sim_backend=args.sim_backend,
         max_episode_steps=args.max_episode_steps,
-        randomize_layout=not args.fixed_scene,
+        **args.env_kwargs,
     )
-    monitor = DisturbanceMonitor(env)
-    if args.no_record:
-        return monitor, monitor, None
+    if getattr(env.unwrapped, "num_envs", 1) != 1:
+        env.close()
+        raise ValueError("This MPlib runner and DisturbanceMonitor require num_envs=1")
 
-    folder = args.output_dir
-    folder.mkdir(parents=True, exist_ok=True)
-    name = args.traj_name or datetime.now().strftime("baseline_%Y%m%d_%H%M%S_%f")
-    recorder = RecordEpisode(
-        monitor,
-        output_dir=str(folder),
-        trajectory_name=name,
-        save_trajectory=True,
-        save_video=args.save_video,
-        save_on_reset=False,
-        clean_on_close=True,
-        record_env_state=False,  # Avoid exposing simulator GT state as policy data
-        source_type="motionplanning",
-        source_desc="CANDID bounded-pose-randomization xArm6 MPlib baseline (task-only)",
-        video_fps=30,
+    monitor = DisturbanceMonitor(
+        env,
+        translation_weight=args.translation_weight,
+        rotation_weight=args.rotation_weight,
+        table_height_m=args.table_height,
     )
-    return recorder, monitor, recorder
+    recorder = None
+    if not args.no_record or args.save_video:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        name = args.traj_name or datetime.now().strftime("trajectories_%Y%m%d_%H%M%S_%f")
+        recorder = RecordEpisode(
+            monitor,
+            output_dir=str(args.output_dir),
+            trajectory_name=name,
+            save_trajectory=not args.no_record,
+            save_video=args.save_video,
+            save_on_reset=False,
+            clean_on_close=True,
+            record_env_state=False,  # NEVER inject simulator truth into DP data
+            source_type="motionplanning",
+            source_desc=f"CANDID {args.env_id} / {args.planner}",
+            video_fps=30,
+        )
+    return recorder or monitor, monitor, recorder
 
 
-def main():
-    """Run all attempts and save success/failure + raw disturbance metrics."""
-    args = parse_args()
+def _summarize_planner_result(result: Any, fallback_steps: int) -> dict[str, Any]:
+    """Normalize return objects from custom planners to standard status keys."""
+    def field(k, default=None):
+        return result.get(k, default) if isinstance(result, dict) else getattr(result, k, default)
+    if field("success") is None:
+        raise ValueError("Planner result must have a boolean 'success' field")
+    return {
+        "success": bool(field("success")),
+        "stage": str(field("stage", "completed")),
+        "steps": int(field("steps", fallback_steps)),
+        "grasped_after_lift": field("grasped_after_lift"),
+        "message": str(field("message", "")),
+    }
+
+
+def _read_scene_layout(base_env):
+    getter = getattr(base_env, "get_scene_layout_for_logging", None)
+    return _json_safe(getter()) if callable(getter) else None
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    solve, config = load_planner(args)
     env, monitor, recorder = build_env(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     metadata_path = args.output_dir / "episode_metrics.jsonl"
-    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
-
-    successes = 0
-    saved = 0
-    plan_config = BaselinePlanConfig(lateral_offset=args.lateral_offset)
+    commit = _git_commit()
+    successes = saved = 0
+    warned_no_poses = warned_no_sizes = False
 
     try:
-        with metadata_path.open("a", encoding="utf-8") as file:
+        with metadata_path.open("a", encoding="utf-8") as output:
             for k in range(args.episodes):
                 seed = args.seed + k
-                print(f"\n--- CANDID baseline, attempt {k + 1}/{args.episodes}, seed={seed} ---")
+                print(f"\n--- {args.env_id}: {k + 1}/{args.episodes}, seed={seed} ---")
+                resets_before = monitor.reset_count
                 try:
-                    result = solve(
-                        env, seed=seed, config=plan_config,
-                        vis=args.vis, verbose=args.verbose,
-                    )
+                    raw_result = solve(env, seed=seed, config=config,
+                                       vis=args.vis, verbose=args.verbose)
+                    status = _summarize_planner_result(raw_result, monitor.steps)
                 except Exception as exc:
-                    # Do not conceal the failure.  Save the reason and keep
-                    # running other attempts if the simulator remains usable.
-                    print(f"Planner exception: {type(exc).__name__}: {exc}")
-                    result = PlanResult(
-                        success=False, stage="exception", steps=monitor.steps,
-                        message=f"{type(exc).__name__}: {exc}",
-                    )
-
-                labels = monitor.summary()
-                # Save dense simulator truth in a SEPARATE label folder.  The
-                # recorded RGB-D/proprio HDF5 never receives these poses.
-                trace_path = args.output_dir / "label_traces" / f"{run_name}_attempt_{k:04d}.npz"
-                monitor.save_pose_trace(trace_path)
-                if result.success:
+                    # Capture the partial episode, if the planner already reset.
+                    status = {
+                        "success": False,
+                        "stage": "exception",
+                        "steps": monitor.steps if monitor.reset_count > resets_before else 0,
+                        "grasped_after_lift": None,
+                        "message": f"{type(exc).__name__}: {exc}",
+                    }
+                    print(f"Planner exception: {status['message']}")
+                episode_reset = monitor.reset_count > resets_before
+                if not episode_reset:
+                    # Prevent leftover labels from the previous attempt from
+                    # being incorrectly associated with this failed attempt.
+                    print("WARNING: planner did not call env.reset(); no current episode was recorded")
+                    labels = {"has_data": False, "steps": 0, "continuous_dr": None, "d_max": None}
+                else:
+                    labels = monitor.summary()
+                if episode_reset and not monitor.available and not warned_no_poses:
+                    print("WARNING: this environment exposes no distractor pose logger; "
+                          "trajectory collection works but disturbance labels are unavailable")
+                    warned_no_poses = True
+                if episode_reset and monitor.available and monitor.object_sizes_m is None and not warned_no_sizes:
+                    print("WARNING: no per-object characteristic sizes found; raw disturbance "
+                          "is saved, but continuous DR will be N/A. Implement "
+                          "get_distractor_sizes_for_logging() in your environment")
+                    warned_no_sizes = True
+                if status["success"]:
                     successes += 1
 
-                # With RecordEpisode the solver's executed control actions,
-                # not just the requested waypoints, get written to HDF5.
-                should_save = not args.save_success_only or result.success
-                is_nonempty = monitor.steps > 0
-                if recorder is not None:
-                    recorder.flush_trajectory(save=should_save)
+                # Save raw per-action distractor truth independently of
+                # policy observations. Unique names for each run and attempt.
+                trace_path = args.output_dir / "label_traces" / f"{run_id}_attempt_{k:05d}.npz"
+                trace_written = bool(episode_reset and monitor.save_pose_trace(trace_path))
+                should_save = not args.save_success_only or status["success"]
+                nonempty = episode_reset and monitor.steps > 0
+                recorded_key = None
+                recorded_path = None
+                if recorder is not None and episode_reset:
+                    if not args.no_record:
+                        recorder.flush_trajectory(save=should_save)
+                        if should_save and nonempty:
+                            saved += 1
+                            recorded_key = f"traj_{recorder._episode_id}"
+                            recorded_path = Path(recorder._h5_file.filename).name
                     if args.save_video:
                         recorder.flush_video(save=should_save)
-                    if should_save and is_nonempty:
-                        saved += 1
 
                 row = {
                     "time": datetime.now().isoformat(timespec="seconds"),
+                    "run_id": run_id,
+                    "attempt_index": k,
                     "seed": seed,
-                    "environment": "CANDIDBaseline-v0",
-                    "randomize_layout": not args.fixed_scene,
-                    "scene_layout": monitor.env.unwrapped.get_scene_layout_for_logging(),
-                    "control_mode": "pd_joint_pos",
+                    "env_id": args.env_id,
+                    "env_module": args.env_module,
+                    "env_kwargs": args.env_kwargs,
+                    "planner": args.planner,
+                    "planner_config_class": args.planner_config_class,
+                    "plan_kwargs": args.plan_kwargs,
+                    "git_commit": commit,
+                    "scene_layout": _read_scene_layout(env.unwrapped) if episode_reset else None,
+                    "control_mode": args.control_mode,
                     "obs_mode": args.obs_mode,
-                    "lateral_offset_m": args.lateral_offset,
-                    "task_success": result.success,
-                    "last_stage": result.stage,
-                    "planner_steps": result.steps,
-                    "grasped_after_lift": result.grasped_after_lift,
-                    "message": result.message,
-                    "saved_to_hdf5": bool(recorder and should_save and is_nonempty),
-                    "label_trace": str(trace_path),
+                    "task_success": status["success"],
+                    "last_stage": status["stage"],
+                    "planner_steps": status["steps"],
+                    "grasped_after_lift": status["grasped_after_lift"],
+                    "message": status["message"],
+                    "saved_to_hdf5": bool(recorded_key),
+                    "hdf5_file": recorded_path,
+                    "hdf5_trajectory_key": recorded_key,
+                    # Paths are relative to output_dir so moving a completed
+                    # Run to shared storage does not break metadata references.
+                    "label_trace": str(trace_path.relative_to(args.output_dir)) if trace_written else None,
                     "disturbance": labels,
                 }
-                file.write(json.dumps(row) + "\n")
-                file.flush()
+                output.write(json.dumps(_json_safe(row), ensure_ascii=False) + "\n")
+                output.flush()
+                dr = labels.get("continuous_dr")
+                dr_text = "N/A" if dr is None else f"{dr:.4f}"
+                peak = labels.get("max_peak_translation_m")
+                peak_text = "N/A" if peak is None else f"{peak:.4f} m"
                 print(
-                    f"  success={result.success}  stage={result.stage}  "
-                    f"steps={result.steps}  "
-                    f"peak_translation={labels['max_peak_translation_m']:.4f} m  "
-                    f"continuous_dr={labels['continuous_dr']:.4f}  "
-                    f"d_max={labels['d_max']:.4f}"
+                    f"  success={status['success']} stage={status['stage']} "
+                    f"steps={status['steps']} peak_translation={peak_text} "
+                    f"continuous_dr={dr_text}"
                 )
     finally:
         env.close()
 
-    print("\n=== CANDID baseline summary ===")
+    print("\n=== CANDID run summary ===")
+    print(f"Environment: {args.env_id}")
     print(f"Attempts: {args.episodes}")
     print(f"Task successes: {successes} ({successes / args.episodes:.1%})")
-    print(f"Saved trajectories: {saved} (HDF5 recording {'disabled' if args.no_record else 'enabled'})")
-    print(f"Episode metrics: {metadata_path.resolve()}")
-    if args.fixed_scene:
-        print("Note: --fixed-scene uses the original deterministic layout.")
-    else:
-        print(
-            "Note: reset seeds randomize poses within fixed bounds. "
-            "The planner route template is still fixed, so this does NOT "
-            "generate multiple distinct trajectory strategies per scene."
-        )
+    print(f"Saved HDF5 trajectories: {saved}")
+    print(f"Episode metadata: {metadata_path.resolve()}")
 
 
 if __name__ == "__main__":
