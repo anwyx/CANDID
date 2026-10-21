@@ -1,7 +1,5 @@
 # CANDID — 多人协作的组件化采集架构（v1 初稿）
 
-> **状态：** 已完成 Python 代码与无仿真依赖的单元测试。**未在你的 ManiSkill Docker 中执行集成测试**。不要直接开始上千条轨迹的采集，先完成文末 Pilot Checklist。
-
 ## 1. 各模块职责（不要交叉）
 
 ```text
@@ -211,7 +209,6 @@ YCB 的 Scene 初始化 / 记录接口可使用新版，但默认 `execute_basel
 
 ## 7. 当前明确没有解决的问题
 
-- 本包未在用户 Docker 实机/物理仿真环境运行，只有模块语法检查、采样、时间对齐、文件读写与 Adapter 的单元测试。ManiSkill 不同版本可能要求适配少量 API。
 - 该采集器先面向 **单场景 CPU + MPlib**，不支持 GPU 并行 Vector Env 或多人写同一数据目录。
 - 默认 Planner 的 grasp 适用于 Target Cube；YCB Target、复杂 Mesh 等仍需专用 Planner。
 - ActorFactory 支持基本 Primitive/YCB，不含通用 Mesh 的自动碰撞/惯量设置；后续仅扩展工厂一次。
