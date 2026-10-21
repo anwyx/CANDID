@@ -159,6 +159,7 @@ def solve(
     config: Optional[BaselinePlanConfig] = None,
     vis: bool = False,
     verbose: bool = False,
+    reset_env: bool = True,
 ) -> PlanResult:
     """Reset and execute exactly one CANDID baseline Pick-and-Place attempt.
 
@@ -187,7 +188,8 @@ def solve(
 
     # Reset BEFORE creating MPlib's planner, so both planners and physics
     # operate from the exact initial state that will be recorded.
-    env.reset(seed=seed)
+    if reset_env:
+        env.reset(seed=seed)
     base = env.unwrapped
     if base.num_envs != 1:
         raise ValueError("Baseline planner requires num_envs=1")
