@@ -1,222 +1,272 @@
-# CANDID — reusable environment runner and disturbance metrics
+# CANDID `scripts/`：运行命令与测试指南
 
-These files refactor the uploaded `scripts/run_baseline.py`. They **do not** change the baseline environment or `planners/execute_baseline.py`.
+本目录只有**命令行入口**。具体的 Environment、Runner 和数据处理逻辑分别在 `envs/`、`src/candid/` 和 `planners/` 中。请不要把新的 Disturbance 公式或文件写入逻辑塞进 `scripts/`。
 
-## 1. Install files into the Git repository
+下面的命令基于 **CANDID 组件化 v1（包含 Pose-based Settling）**，默认在 Docker 容器内执行。
 
-```text
-CANDID/
-├── envs/
-│   ├── __init__.py
-│   └── candid_baseline_env.py       # your existing environment
-├── planners/
-│   ├── __init__.py
-│   └── execute_baseline.py         # your existing planner
-├── metrics/
-│   ├── __init__.py                 # NEW
-│   └── disturbance_monitor.py      # NEW
-└── scripts/
-    └── run_baseline.py            # REPLACE old runner
-```
+## 1. 从哪里运行？
 
-Run commands **from the CANDID project root** inside your ManiSkill Docker container.
-
-## 2. Basic usage
+进入 ManiSkill Docker 容器后，先回到项目根目录：
 
 ```bash
-# Existing baseline: default environment, default planner
-python scripts/run_baseline.py --episodes 2 --seed 0 --obs-mode none --save-video
-
-# Collect observations suitable for state-based training *only after your
-# environment's _get_obs_extra includes the required object states*.
-python scripts/run_baseline.py --episodes 20 --obs-mode state \
-  --output-dir demos/baseline_state_test
-
-# Keep the original fixed baseline scene (if your env supports the flag).
-python scripts/run_baseline.py --episodes 1 --fixed-scene
-
-# Baseline planner waypoint variation
-python scripts/run_baseline.py --episodes 1 --seed 42 --lateral-offset 0.04
+cd /workspace/CANDID
 ```
 
-The default planner still uses `pd_joint_pos` and the xArm6 Robotiq robot.
-Using `--obs-mode none` is good for quick debugging, but **does not create policy training observations**.
+全部命令都假定当前工作目录为 `/workspace/CANDID`，所以使用 `python scripts/xxx.py`。已有的 `scripts/*.py` 会自行将项目根目录和 `src/` 加入 Python 搜索路径，一般不需要手动设置 `PYTHONPATH`。
 
-## 3. Run an environment created by a teammate
+如果还没有进入 Docker，可以从 Mac 终端进入**已存在的**容器（容器名称请按本机实际情况替换）：
 
-Suppose someone adds `envs/primitive_env.py`:
-
-```python
-from mani_skill.utils.registration import register_env
-from envs.candid_baseline_env import CANDIDBaselineEnv
-
-@register_env("CANDIDPrimitive-v0", max_episode_steps=500)
-class CANDIDPrimitiveEnv(CANDIDBaselineEnv):
-    # Override _load_scene() / _initialize_episode() and appropriate
-    # geometry metadata as needed. This is only a registration example.
-    pass
+```bash
+docker start maniskill-dev
+docker exec -it maniskill-dev bash
+cd /workspace/CANDID
 ```
 
-Use the **same runner**:
+## 2. 三个主要脚本
+
+| 脚本 | 用途 | 建议何时运行 |
+|---|---|---|
+| `run_baseline.py` | 创建 Scene，执行一条或多条 Planner Trajectory，自动保存数据 | 采集演示轨迹 |
+| `check_scene.py` | 不调用 Planner，检查环境 Reset + Settling 后有没有明显自然漂移 | 新写 Env、修改物体或随机区域后 |
+| `validate_dataset.py` | 检查 Scene/Trajectory 索引、HDF5/NPZ 文件及 Action/State 时间对齐 | 每次采集完成后、上传共享数据前 |
+
+### 2.1 最基础的 Baseline 采集
+
+生成 1 个随机 Scene、1 条 Trajectory：
 
 ```bash
 python scripts/run_baseline.py \
-  --env-module envs.primitive_env \
-  --env-id CANDIDPrimitive-v0 \
-  --episodes 20 --seed 100 \
-  --obs-mode none --save-video \
-  --output-dir demos/primitive_test
+  --env-id CANDIDBaseline-v1 \
+  --scenes 1 \
+  --seed 0 \
+  --output-dir demos/pilot_baseline
 ```
 
-`--env-module` is the **Python import path** (not a filesystem filename).
-Importing that module registers the ID before `gym.make()` runs.
+正常情况下会打印一条记录，包含 `success`、`steps` 和 `DR`。`success=True` 表示完成了任务，**不代表 DR 必须为零**。
 
-If an environment requires extra constructor settings, pass them using JSON:
+### 2.2 同一 Scene 生成三条不同 Trajectory
 
 ```bash
 python scripts/run_baseline.py \
-  --env-module envs.custom_env --env-id CANDIDCustom-v0 \
-  --env-kwargs '{"num_distractors": 6, "randomize_layout": true}' \
-  --episodes 5
+  --env-id CANDIDBaseline-v1 \
+  --scenes 1 \
+  --seed 42 \
+  --plan-variants '[{"lateral_offset":0.0},{"lateral_offset":0.04},{"lateral_offset":-0.04}]' \
+  --output-dir demos/pilot_multi
 ```
 
-All keys in `--env-kwargs` must be supported by that environment's constructor.
-The `--fixed-scene` shortcut passes `randomize_layout=False` and should only
-be used for environments accepting that parameter. It is not universal.
+这里的三个 `lateral_offset` 属于 Planner Config，单位是 m：0 表示直接搬运，正负值表示不同的侧向路径。Runner 先随机生成并稳定一个 Scene，再从同一份初始 Snapshot 恢复，记录三条不同尝试。
 
-## 4. Shared interface for environments and planners
+**注意：** `--plan-variants` 使用合法 JSON；Shell 中外层用单引号包住 JSON 列表即可。默认每个 Scene 的 Trajectory 数量等于列表长度。
 
-A teammate can use the **default** `planners.execute_baseline:solve` if their
-environment still supports the baseline Pick-and-Place interface:
+### 2.3 批量生成多个 Scene
 
-- `env.unwrapped.cube`: the grasp target object;
-- `env.unwrapped.goal_site`: placement goal;
-- `env.unwrapped.cube_half_size`: target half-height;
-- `env.unwrapped.agent`: xArm6 Robotiq agent;
-- `env.unwrapped.evaluate()["success"]`: task success;
-- `control_mode="pd_joint_pos"`.
-
-If these differ (e.g. the target is no longer a cube, or the gripper/robot is
-different), specify a **different planner**. The runner does **not** magically
-make the old xArm6 cube solver work on every task.
+例如 5 个 Scene，每个 3 条 Trajectory：
 
 ```bash
 python scripts/run_baseline.py \
-  --env-module envs.ycb_env --env-id CANDIDYCB-v0 \
-  --planner planners.ycb_planner:solve \
-  --planner-config-class planners.ycb_planner:PlanConfig \
-  --plan-kwargs '{"lift_height": 0.15}' \
-  --episodes 10 --obs-mode state
+  --env-id CANDIDBaseline-v1 \
+  --scenes 5 \
+  --seed 100 \
+  --plan-variants '[{"lateral_offset":0.0},{"lateral_offset":0.04},{"lateral_offset":-0.04}]' \
+  --output-dir demos/pilot_5scenes
 ```
 
-Required planner API:
+预期尝试数为 `5 × 3 = 15`。其中某些 Planner 可能失败；失败尝试同样会保留状态及扰动信息，但若没有实际执行任何动作，Recorder 不一定会生成对应的非空 HDF5 Group。`validate_dataset.py` 会依据 Manifest 中的 `saved_hdf5` 标志检查。
 
-```python
-def solve(env, seed, config=None, vis=False, verbose=False):
-    env.reset(seed=seed)  # required, or the recorder will not know episode start
-    # Execute actions by calling env.step(actual_action)
-    return {"success": True, "stage": "completed", "steps": 150}
-```
+### 2.4 在其他 Environment 里采集
 
-The solver can return a dict or a dataclass/object (e.g. `PlanResult`) with
-these fields. For planners not using a config class, pass
-`--planner-config-class none` (and no `--plan-kwargs`).
-
-**Each planner must explicitly reset exactly once per attempt.** During
-execution it must step the *wrapped* `env` passed into `solve`, not only
-`env.unwrapped`, so that actions are recorded and the monitor runs.
-
-## 5. Shared disturbance interface for new object types
-
-`metrics/disturbance_monitor.py` is **independent** of any particular env.
-For accurate metrics, implement these on each new environment:
-
-```python
-def get_distractor_poses_for_logging(self):
-    # [1, N, 7] tensor or [N, 7] NumPy array; quaternion order [w,x,y,z].
-    # Do NOT include these ground-truth poses in policy observations by accident.
-    return torch.stack([obj.pose.raw_pose for obj in self.clutter_cubes], dim=1)
-
-def get_distractor_sizes_for_logging(self):
-    # [N] positive characteristic sizes in metres, in the SAME object order.
-    # For cubes, side length; for irregular objects, select/document a
-    # comparable geometric scale (e.g. bounding-box max dimension).
-    return [0.04, 0.08, 0.06, 0.10]
-
-def get_scene_layout_for_logging(self):
-    # Optional reproducible scene config; do not use these truths in DP inputs.
-    return {"objects": "...", "seed_info": "..."}
-```
-
-The monitor also falls back to `clutter_cubes` and `DISTRACTOR_HALF_SIZE` for
-old cube environments. **Do not rely on `DISTRACTOR_HALF_SIZE` when shapes or
-sizes vary:** implement `get_distractor_sizes_for_logging()` to avoid silently
-mis-normalizing the continuous disturbance.
-
-If no pose interface exists, the runner still records task actions/observations;
-`continuous_dr` is **null** and no pose trace is saved. Missing labels are
-never treated as zero disturbance.
-
-Continuous DR is currently the average per-object **peak** consequence:
-
-```text
-D_i = w_p * peak_translation_i / characteristic_size_i
-    + w_R * peak_rotation_i / pi
-continuous_dr = mean(D_i)
-d_max = max(D_i)
-```
-
-Default weights: `w_p=0.7, w_R=0.3`. Override using
-`--translation-weight 0.7 --rotation-weight 0.3`.
-The peak is measured relative to the **episode's initial object pose**.
-Topple/Fall are separate heuristic flags; adjust definitions before using them
-for YCB objects, tilted initial states, or different table heights.
-
-The pure `continuous_disturbance_score()` function is defined in the same
-`metrics/disturbance_monitor.py` so future **chunk-level** preprocessing can
-reuse exactly the same normalisation. Current `continuous_dr` is episode-level;
-it is **not** yet a chunk-level label.
-
-## 6. Outputs and dataset handling
-
-Each run creates files under its `--output-dir`:
-
-```text
-demos/primitive_test/
-├── trajectories_<timestamp>.h5
-├── trajectories_<timestamp>.json
-├── episode_metrics.jsonl
-├── label_traces/
-│   ├── run_<timestamp>_attempt_00000.npz
-│   └── ...
-└── *.mp4                 # only with --save-video
-```
-
-- HDF5: executed actions and observations, not raw simulator truth as env state.
-- `.npz`: `[T+1,N,7]` distractor pose trace, plus object normalisation sizes.
-- JSONL: success/failure, env/planner/config/seed/commit, metric summaries,
-  HDF5 trajectory key and the matching label trace file.
-- New `hdf5_file` and `label_trace` fields are **relative to output-dir** so a
-  completed Run can be moved to shared storage without breaking its references.
-- Keep separate `--output-dir` values for runs generated with different
-  object geometries or observation formats; do not mix them in one training set
-  without checking compatibility.
-- Use `--save-success-only` for a DP imitation dataset, but for the Predictor
-  generally retain valid failed rollouts too (default).
-- `--no-record --save-video` saves videos/metrics without large HDF5 files.
-
-Finally, multiple trajectories for **the same scene** require reusing the same
-seed and changing explicit planner parameters; `--episodes 10` normally means
-*ten different seeds*, not ten trajectory variants of the same scene.
-
-## 7. Suggested sanity checks
+对于组员新增的环境，需要**同时**指定 Python 模块与注册的 Env ID。例如 Primitive：
 
 ```bash
-python -m py_compile scripts/run_baseline.py metrics/disturbance_monitor.py
+python scripts/run_baseline.py \
+  --env-module envs.candid_primitive_env \
+  --env-id CANDIDPrimitive-v1 \
+  --scenes 3 \
+  --seed 10 \
+  --output-dir demos/pilot_primitive
+```
+
+YCB 初始化和无动作检查可用公共组件，但 **`execute_baseline.py` 的 Top-down Cube Planner 尚不保证能成功抓取 Strawberry**。因此不要将 YCB 采集命令的 Task Failure 直接理解为数据组件错误；正式采集 YCB 成功示范前，需要适配 Planner。
+
+若 Docker 中尚未安装 YCB 资源，可执行：
+
+```bash
+python -m mani_skill.utils.download_asset ycb -y
+```
+
+### 2.5 固定布局调试
+
+```bash
+python scripts/run_baseline.py \
+  --env-id CANDIDBaseline-v1 \
+  --fixed-scene \
+  --scenes 1 \
+  --output-dir demos/debug_fixed
+```
+
+`--fixed-scene` 使 ObjectSpec 的 `fixed_xy` 和 `fixed_yaw` 生效，用于回归测试；大规模随机数据采集应使用默认的 `randomize_layout=True`。
+
+### 2.6 控制 Settling 参数
+
+Pose-based Settling 的参数来自公共 `CANDIDTabletopEnv`，通过 `--env-kwargs` 传入 JSON。下面只延长最大 Settling 时间，其他条件不变：
+
+```bash
+python scripts/run_baseline.py \
+  --env-id CANDIDBaseline-v1 \
+  --scenes 5 \
+  --seed 100 \
+  --env-kwargs '{"max_settle_steps":400}' \
+  --output-dir demos/pilot_settling_400
+```
+
+常用参数还有 `settle_min_steps`、`stable_steps`（Pose 窗口长度）、`settle_translation_m`、`settle_rotation_deg`、`idle_verify_steps`、`idle_translation_m` 和 `idle_rotation_deg`。如果 Scene 一直无法稳定，应先检查初始碰撞、物体形状与持续运动，**不要为了采集通过而无限放宽阈值**。
+
+### 2.7 录制视频与调试
+
+```bash
+python scripts/run_baseline.py \
+  --env-id CANDIDBaseline-v1 \
+  --scenes 1 \
+  --save-video \
+  --verbose \
+  --output-dir demos/pilot_video
+```
+
+`--save-video` 需要 Docker 的 ManiSkill 渲染配置可用。在没有 CUDA 的 Mac Docker 上出现 `sapien_cuda` 回退 CPU 警告并不一定影响物理模拟，但**不能保证视频渲染正常**。
+
+只想调试，不需要保存训练轨迹时可以使用 `--no-record`；它不会保存 HDF5 Action/Observation，但 Runner 仍会写 Scene、Disturbance Trace 和索引：
+
+```bash
+python scripts/run_baseline.py \
+  --env-id CANDIDBaseline-v1 \
+  --scenes 1 \
+  --no-record \
+  --output-dir demos/debug_no_h5
+```
+
+若使用 `--save-success-only`，未成功尝试的 HDF5 可能不保存；正式训练 Predictor 需要保留失败轨迹时，不要开启该选项。
+
+## 3. 新环境必须运行的无动作测试
+
+Baseline：
+
+```bash
+python scripts/check_scene.py \
+  --env-module envs.candid_baseline_env \
+  --env-id CANDIDBaseline-v1 \
+  --seed 42 \
+  --steps 100
+```
+
+YCB：
+
+```bash
+python scripts/check_scene.py \
+  --env-module envs.candid_ycb_fruit_env \
+  --env-id CANDIDYCBFruit-v1 \
+  --seed 42 \
+  --steps 100
+```
+
+批量检查不同 Seed（以 Baseline 为例）：
+
+```bash
+for seed in 10 20 30 40 50; do
+  echo "=== seed ${seed} ==="
+  python scripts/check_scene.py \
+    --env-id CANDIDBaseline-v1 \
+    --seed "$seed" \
+    --steps 100
+done
+```
+
+此脚本会先正常 Reset 和 Settling，再运行 100 个无动作控制步，并打印 `Idle disturbance`。默认只以 `dr_mean <= 0.01` 为粗筛标准；请同时关注 `peak_translation_m` 与 `peak_rotation_rad`，因为平均值可能掩盖单个物体的明显漂移。
+
+**当前的 `check_scene.py` 不提供 `--env-kwargs` 参数。** 如果需要改变 Settling 配置，请通过 `run_baseline.py --env-kwargs ...` 测试，或者由团队统一扩展 `check_scene.py`，不要直接在各个 Env 复制一套检查逻辑。
+
+## 4. 数据集完整性校验
+
+每次采集结束后执行：
+
+```bash
+python scripts/validate_dataset.py demos/pilot_multi
+```
+
+预期类似：
+
+```text
+{'num_scenes': 1, 'num_trajectories': 3, 'num_recorded_hdf5': 3}
+```
+
+该脚本检查 Scene/Trajectory ID 是否重复、索引关联是否存在、Scene Snapshot 是否非空、Trace 的 `[T+1,N,7]` / `[T+1,N,3]` 时间结构是否正确，以及已有 HDF5 中 `actions` 的长度是不是 `T`、`obs` 的长度是不是 `T+1`。
+
+**通过不等于任务成功，也不等于轨迹之间一定不同。** 新的 Planner 还应抽检视频或 HDF5 Actions，以验证执行的真实差异。
+
+## 5. 运行单元测试
+
+使用已安装的 Python 环境，在项目根目录执行：
+
+```bash
+PYTHONPATH=src:. python -m unittest discover -s tests -p 'test_settling.py' -v
+```
+
+数据契约测试：
+
+```bash
+PYTHONPATH=src:. python -m pytest tests/test_contract.py -q
+```
+
+这两类测试检查稳定性计算和数据结构的纯 Python 逻辑；**不替代 ManiSkill 的真实物理测试**。如果当前 Docker 环境没有安装 `pytest`，可先确认 `python -m pytest --version`，再使用项目维护的依赖安装方式。
+
+## 6. 常见运行参数速查
+
+以下参数都属于 `scripts/run_baseline.py`，实际实现位于 `src/candid/runner/collect.py`：
+
+| 参数 | 默认值 / 用途 |
+|---|---|
+| `--env-id` | `CANDIDBaseline-v1`，Gym 注册 ID |
+| `--env-module` | `envs.candid_baseline_env`，导入以完成注册 |
+| `--scenes` | Scene 数量，默认 1 |
+| `--seed` | 第一个 Scene 的 Seed；随后 Scene 使用递增 Seed |
+| `--plan-variants` | JSON 列表；一个 Scene 的不同 Planner 配置 |
+| `--trajectories-per-scene` | 若未指定，按 `--plan-variants` 长度决定；多轨迹时两者数量须匹配 |
+| `--plan-kwargs` | 应用于所有 Trajectory 的共同 Planner 参数 JSON |
+| `--planner` | `模块:函数`，默认为 `planners.execute_baseline:solve` |
+| `--planner-config-class` | `模块:类`，默认为 `planners.execute_baseline:BaselinePlanConfig` |
+| `--fixed-scene` | 使用固定位置和朝向而不是随机布局 |
+| `--env-kwargs` | 传给 Environment 的构造参数 JSON，例如 Settling 设置 |
+| `--control-mode` | 默认 `pd_joint_pos`，与当前 Planner 保持一致 |
+| `--obs-mode` | 默认 `state_dict`；正式 HDF5 采集必须用它 |
+| `--sim-backend` | 默认 `cpu`；当前流程仍限制 `num_envs=1` |
+| `--save-video` | 另外录制视频（要求渲染可用） |
+| `--save-success-only` | 只将成功尝试录入 HDF5；慎用于 Predictor 数据 |
+| `--no-record` | 不写 HDF5 轨迹，仅用于调试 |
+| `--translation-weight` / `--rotation-weight` | DR 权重，默认 0.7 / 0.3 |
+| `--output-dir` | 输出目录，默认 `demos/candid_v1` |
+
+查看最完整的参数帮助：
+
+```bash
 python scripts/run_baseline.py --help
-python scripts/run_baseline.py --episodes 2 --obs-mode none --save-video
 ```
 
-If you see `continuous_dr=N/A`, check the environment's pose and size callbacks.
-This refactor was syntax-checked and exercised with simulated (mock) environment
-interfaces; full ManiSkill/MPlib runtime testing must be done in your Docker.
+## 7. 输出目录与团队协作约定
+
+```text
+demos/pilot_multi/
+├── trajectories_<run_id>.h5
+├── trajectories_<run_id>.json
+├── scenes.jsonl
+├── trajectories.jsonl
+├── scenes/<scene_id>.npz
+└── disturbance_traces/<trajectory_id>.npz
+```
+
+- 每个组员使用**自己的输出目录**（例如 `demos/member_a/...`），不要多人同时写一个 JSONL/HDF5 文件。
+- 数据先运行 `validate_dataset.py`，再上传团队共享数据存储。
+- 统一 ManiSkill 版本、资产版本、`pd_joint_pos`、`state_dict`、control timestep 和 DR 定义。
+- 划分训练/验证/测试集时按 **Scene ID** 分，而不是把同一 Scene 的不同 Trajectory 随机分到多个集合。
+- `demos/`、HDF5、NPZ 和视频不应提交 GitHub；代码、测试、README 和 SceneSpec 应提交。
+
+更多关于模块职责和 DP/Predictor 字段说明，请阅读 [`../src/README.md`](../src/README.md)。
