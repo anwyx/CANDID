@@ -47,6 +47,9 @@ def validate_dataset(root):
                 n=len(sizes)
                 if poses.shape!=(T+1,n,7) or linear.shape!=(T+1,n,3) or angular.shape!=(T+1,n,3):
                     raise ValueError(f"Misaligned trace: {row['trajectory_id']}")
+                for key in ("distractor_toppled","distractor_fallen"):
+                    if key in data and (data[key].shape!=(T+1,n) or data[key].dtype.kind!="b"):
+                        raise ValueError(f"Misaligned event flags: {row['trajectory_id']}:{key}")
                 if n!=len(row["object_ids"]):raise ValueError("Object order/count mismatch")
                 if not np.isfinite(poses).all() or not np.isfinite(linear).all() or not np.isfinite(angular).all():
                     raise ValueError("Non-finite physics measurements")

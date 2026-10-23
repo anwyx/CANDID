@@ -6,7 +6,7 @@ observation. Scene creation/settling is complete before reset returns here.
 from __future__ import annotations
 import gymnasium as gym
 import numpy as np
-from candid.data.metrics import disturbance_from_poses
+from candid.data.metrics import disturbance_from_poses, event_flags_from_poses
 
 
 def as_numpy(value):
@@ -27,6 +27,7 @@ class PhysicsTrace(gym.Wrapper):
         self.angular_trace=[]
         self.names=[]
         self.sizes=[]
+        self.kinds=[]
 
     def _actors(self):
         base=self.env.unwrapped
@@ -60,9 +61,11 @@ class PhysicsTrace(gym.Wrapper):
         if hasattr(base,"distractor_metadata"):
             self.names=[m.spec.name for m in base.distractor_metadata]
             self.sizes=[m.characteristic_size for m in base.distractor_metadata]
+            self.kinds=[m.spec.kind for m in base.distractor_metadata]
         else:
             actors=self._actors()
             self.names=[getattr(a,"name",f"obj_{i}") for i,a in enumerate(actors)]
+            self.kinds=["unknown"]*len(actors)
             if hasattr(base,"get_distractor_sizes_for_logging"):
                 self.sizes=list(as_numpy(base.get_distractor_sizes_for_logging()).reshape(-1))
             elif hasattr(base,"DISTRACTOR_HALF_SIZE"):
@@ -89,10 +92,13 @@ class PhysicsTrace(gym.Wrapper):
         return {"distractor_poses":poses,
                 "distractor_linear_velocities":linear,
                 "distractor_angular_velocities":angular,
-                "object_sizes_m":np.asarray(self.sizes,dtype=np.float32)}
+                "object_sizes_m":np.asarray(self.sizes,dtype=np.float32),
+                **event_flags_from_poses(poses,kinds=self.kinds)}
 
     def summary(self):
         data=self.arrays()
         return disturbance_from_poses(data["distractor_poses"],self.sizes,
                                       w_translation=self.w_translation,
-                                      w_rotation=self.w_rotation)
+                                      w_rotation=self.w_rotation,
+                                      topple_flags=data["distractor_toppled"],
+                                      fall_flags=data["distractor_fallen"])

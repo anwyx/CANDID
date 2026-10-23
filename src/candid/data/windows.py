@@ -42,5 +42,7 @@ def prepare_window(observations, actions, trace, t, observation_horizon=2,
     action_chunk=actions[t:t+action_horizon]
     labels=disturbance_from_poses(states,sizes,t,t+action_horizon,
                                  w_translation=translation_weight,
-                                 w_rotation=rotation_weight)
+                                 w_rotation=rotation_weight,
+                                 topple_flags=trace.get("distractor_toppled"),
+                                 fall_flags=trace.get("distractor_fallen"))
     return {"obs":obs,"actions":action_chunk,"predictor_labels":labels}
