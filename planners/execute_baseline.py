@@ -28,6 +28,7 @@ from typing import Optional
 
 import numpy as np
 import sapien
+from candid.runner.variants import validate_xyz_offset, waypoint_between
 
 from mani_skill.examples.motionplanning.base_motionplanner.utils import (
     compute_grasp_info_by_obb,
@@ -60,6 +61,11 @@ class BaselinePlanConfig:
     # waypoint.  This is an intentionally simple, non-random baseline for
     # later waypoint perturbations and demonstration diversity.
     lateral_offset: float = 0.0
+    # XYZ offsets in WORLD coordinates. The final grasp and goal stay fixed.
+    early_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    lift_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    transfer_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    strategy: str = "manual"
 
     # Intermediate transfer motion uses RRT*, as in the official examples.
     # Approach/place use the simpler screw motion when possible.
@@ -185,6 +191,9 @@ def solve(
         An RRT/screw planning failure is not a successful demonstration.
     """
     cfg = config if config is not None else BaselinePlanConfig()
+    early_delta = validate_xyz_offset(cfg.early_offset_xyz, "early_offset_xyz")
+    lift_delta = validate_xyz_offset(cfg.lift_offset_xyz, "lift_offset_xyz")
+    transfer_delta = validate_xyz_offset(cfg.transfer_offset_xyz, "transfer_offset_xyz")
 
     # Reset BEFORE creating MPlib's planner, so both planners and physics
     # operate from the exact initial state that will be recorded.
@@ -219,6 +228,18 @@ def solve(
         grasp_pose = _grasp_pose(base, cfg.finger_length)
         pregrasp = grasp_pose * sapien.Pose([0, 0, -cfg.approach_height])
 
+        # New: sample a distinct approach corridor BEFORE the common grasp.
+        # Apply a limited Z deviation while retaining grasp clearance.
+        if np.linalg.norm(early_delta) > 1e-8:
+            stage = "early_waypoint"
+            early_xyz = np.asarray(pregrasp.p, dtype=float) + early_delta
+            # Allow limited negative Z for axis ablation, while keeping
+            # the waypoint >=3 cm above the final grasp TCP position.
+            early_xyz[2] = max(early_xyz[2], float(grasp_pose.p[2]) + 0.030)
+            if not _stage(planner, stage, _pose(early_xyz, pregrasp.q), "rrt", verbose):
+                return PlanResult(False, stage, planner.elapsed_steps,
+                                  message="early waypoint planning failed")
+
         stage = "pregrasp"
         if not _stage(planner, stage, pregrasp, "rrt", verbose):
             return PlanResult(False, stage, planner.elapsed_steps, message="pregrasp planning failed")
@@ -232,6 +253,15 @@ def solve(
 
         stage = "lift"
         lift_pose = grasp_pose * sapien.Pose([0, 0, -cfg.lift_height])
+        # New: route the carried object through a varied 3D lift path.
+        if np.linalg.norm(lift_delta) > 1e-8:
+            stage = "lift_waypoint"
+            lift_xyz = waypoint_between(grasp_pose.p, lift_pose.p, lift_delta,
+                                        min_z=float(grasp_pose.p[2]) + 0.025)
+            if not _stage(planner, stage, _pose(lift_xyz, grasp_pose.q), "rrt", verbose):
+                return PlanResult(False, stage, planner.elapsed_steps,
+                                  message="lift waypoint planning failed")
+            stage = "lift"
         if not _stage(planner, stage, lift_pose, "screw", verbose):
             return PlanResult(False, stage, planner.elapsed_steps, message="lifting failed")
 
@@ -264,11 +294,14 @@ def solve(
         # For later trajectory diversification: setting a nonzero lateral
         # offset creates a single intermediate waypoint, without introducing
         # a new manipulation task or actively relocating a distractor.
-        if abs(cfg.lateral_offset) > 1e-6:
+        if abs(cfg.lateral_offset) > 1e-6 or np.linalg.norm(transfer_delta) > 1e-8:
             stage = "transfer_waypoint"
             waypoint_xyz = 0.5 * (tcp_xyz + tcp_above_goal_xyz)
             waypoint_xyz[1] += cfg.lateral_offset
             waypoint_xyz[2] = max(tcp_xyz[2], tcp_above_goal_xyz[2])
+            if np.linalg.norm(transfer_delta) > 1e-8:
+                waypoint_xyz += transfer_delta
+                waypoint_xyz[2] = max(waypoint_xyz[2], base.cube_half_size + 0.06)
             if not _stage(planner, stage, _pose(waypoint_xyz, grasp_quat), "rrt", verbose):
                 return PlanResult(False, stage, planner.elapsed_steps, grasped_after_lift)
 
