@@ -16,6 +16,7 @@ from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
 from candid.sim.actors import build_actor, describe_actor
 from candid.sim.layout import sample_layout
+from candid.sim.distractor_selection import select_distractors
 from candid.sim.settling import SettlingConfig, settle_scene
 
 
@@ -28,6 +29,7 @@ class CANDIDTabletopEnv(BaseEnv):
     SCENE = None  # Set to a SceneSpec in a thin envs/*.py module.
 
     def __init__(self, *args, robot_uids="xarm6_robotiq", randomize_layout=True,
+                 num_distractors=None, distractor_seed=0,
                  robot_init_qpos_noise=0.0, max_settle_steps=180,
                  stable_steps=15, linear_vel_threshold=0.005,
                  angular_vel_threshold=0.05,
@@ -38,6 +40,11 @@ class CANDIDTabletopEnv(BaseEnv):
                  **kwargs):
         if self.SCENE is None:
             raise ValueError("Subclass must declare SCENE: SceneSpec")
+        # Restrict the physical actor set BEFORE BaseEnv builds the scene.
+        # Assign to the instance, not to the shared class SceneSpec.
+        self.SCENE = select_distractors(
+            self.SCENE, count=num_distractors, seed=distractor_seed
+        )
         if robot_uids != "xarm6_robotiq":
             raise ValueError("CANDIDTabletopEnv requires xarm6_robotiq")
         if robot_init_qpos_noise != 0:

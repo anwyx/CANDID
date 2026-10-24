@@ -42,6 +42,8 @@ def build_parser():
                    help="Attempts per scene (default: 24; minimum: 14)")
     p.add_argument("--seed", type=int, default=42,
                    help="First scene seed (default: 42)")
+    p.add_argument("--num-distractors", type=int, default=None,
+                   help="Number of distractors from the scene spec (default: all)")
     p.add_argument("--output-dir", type=Path,
                    help="Output directory (default: new timestamped demos folder)")
     p.add_argument("--save-video", action="store_true",
@@ -75,6 +77,13 @@ def parse_args(argv=None):
             raise ValueError("--env-kwargs must be a JSON object")
     except (ValueError, TypeError) as exc:
         p.error(str(exc))
+    if args.num_distractors is not None:
+        if args.num_distractors < 1:
+            p.error("--num-distractors must be >= 1")
+        if "num_distractors" in args.env_kwargs or "distractor_seed" in args.env_kwargs:
+            p.error("Do not specify distractor selection both as CLI argument and env kwargs")
+        args.env_kwargs["num_distractors"] = args.num_distractors
+        args.env_kwargs["distractor_seed"] = args.seed
     if args.output_dir is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output_dir = Path("demos") / f"candid_{stamp}_{uuid4().hex[:6]}"
@@ -163,6 +172,8 @@ def main(argv=None):
     if getattr(env.unwrapped, "num_envs", 1) != 1:
         env.close()
         raise ValueError("Production collector currently requires num_envs=1")
+    active = [obj.name for obj in env.unwrapped.SCENE.distractors]
+    print(f"Selected distractors ({len(active)}): {', '.join(active)}", flush=True)
     trace = PhysicsTrace(env)
     writer = DatasetWriter(args.output_dir)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
