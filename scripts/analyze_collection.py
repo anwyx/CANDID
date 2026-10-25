@@ -27,7 +27,13 @@ def main(argv=None):
     report = []
     for scene in scenes:
         sid = scene["scene_id"]
-        rs = sorted(by_scene.get(sid, []), key=lambda r: int(r["trajectory_index"]))
+        # Do not redefine the original feedback baseline using the
+        # independent collision-aware reference at trajectory_index=-1.
+        rs = sorted(
+            (r for r in by_scene.get(sid, [])
+             if r.get("sampling_selection") != "collision_aware"),
+            key=lambda r: int(r["trajectory_index"])
+        )
         if not rs:
             continue
         baseline_succeeded = bool(rs[0].get("task_success"))
