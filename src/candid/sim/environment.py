@@ -37,6 +37,8 @@ class CANDIDTabletopEnv(BaseEnv):
                  settle_translation_m=0.0007, settle_rotation_deg=1.0,
                  idle_verify_steps=30,
                  idle_translation_m=0.0010, idle_rotation_deg=1.5,
+                 max_initial_xy_shift_mm=10.0,
+                 max_initial_tilt_deg=15.0,
                  **kwargs):
         if self.SCENE is None:
             raise ValueError("Subclass must declare SCENE: SceneSpec")
@@ -68,6 +70,14 @@ class CANDIDTabletopEnv(BaseEnv):
         self._initial_stability = {}
         self.goal_thresh = self.SCENE.goal_xy_tolerance
         self.goal_radius = self.SCENE.goal_marker_radius
+        self.max_initial_xy_shift_mm = float(max_initial_xy_shift_mm)
+        self.max_initial_tilt_deg = float(max_initial_tilt_deg)
+
+        if not np.isfinite(self.max_initial_xy_shift_mm) or self.max_initial_xy_shift_mm <= 0:
+            raise ValueError("max_initial_xy_shift_mm must be positive")
+
+        if not np.isfinite(self.max_initial_tilt_deg) or not 0 < self.max_initial_tilt_deg <= 180:
+            raise ValueError("max_initial_tilt_deg must be in (0, 180]")
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
@@ -159,26 +169,143 @@ class CANDIDTabletopEnv(BaseEnv):
             for obj in objects
         ], axis=0)
 
+    
+    
     def reset(self, seed=None, options=None):
         obs, original_info = super().reset(seed=seed, options=options)
+
         if options and "reset_to_env_states" in options:
-            # Do not perturb an exact Scene snapshot being replayed.
             return obs, original_info
+
         if self.num_envs != 1:
             raise ValueError("CANDID v1 settling supports only num_envs=1")
-        names = [self.SCENE.target.name] + [s.name for s in self.SCENE.distractors]
+
+        if self.control_mode == "pd_joint_pos":
+            qpos = self.agent.robot.get_qpos()[0].detach().clone()
+            hold_action = self.agent.controller.from_qpos(qpos).unsqueeze(0)
+            self.agent.set_action(hold_action)
+
+        specs = [self.SCENE.target, *self.SCENE.distractors]
+        names = [spec.name for spec in specs]
+        is_sphere = np.array([spec.kind == "sphere" for spec in specs])
+
+        initial = self._pose_snapshot_for_settling()
+        peak_xy = np.zeros(len(names), dtype=np.float64)
+        peak_tilt = np.zeros(len(names), dtype=np.float64)
+
+        def up_axes(poses):
+            q = poses[:, 3:].astype(np.float64)
+            q = q / np.maximum(
+                np.linalg.norm(q, axis=1, keepdims=True), 1e-12
+            )
+
+            w, x, y, z = q.T
+
+            return np.stack([
+                2 * (x * z + w * y),
+                2 * (y * z - w * x),
+                1 - 2 * (x * x + y * y)
+            ], axis=1)
+
+        initial_up = up_axes(initial)
+
+        def pose_changes(current):
+            xy_shift = np.linalg.norm(
+                current[:, :2] - initial[:, :2], axis=1
+            )
+
+            current_up = up_axes(current)
+
+            cosine = np.sum(
+                initial_up * current_up, axis=1
+            )
+
+            tilt = np.degrees(
+                np.arccos(np.clip(cosine, -1.0, 1.0))
+            )
+
+            tilt[is_sphere] = 0.0
+
+            return xy_shift, tilt
+
+        def settling_step():
+            self._step_action(None)
+
+            current = self._pose_snapshot_for_settling()
+            xy_shift, tilt = pose_changes(current)
+
+            np.maximum(peak_xy, xy_shift, out=peak_xy)
+            np.maximum(peak_tilt, tilt, out=peak_tilt)
+
         self._initial_stability = settle_scene(
-            step=lambda: self._step_action(None),
+            step=settling_step,
             snapshot=self._pose_snapshot_for_settling,
             config=self.settling_config,
             object_names=names,
         )
+
+        final = self._pose_snapshot_for_settling()
+        final_xy, final_tilt = pose_changes(final)
+
+        xy_limit = self.max_initial_xy_shift_mm / 1000.0
+        tilt_limit = self.max_initial_tilt_deg
+
+        problems = []
+        object_results = {}
+
+        for i, name in enumerate(names):
+            object_results[name] = {
+                "peak_xy_shift_mm": float(peak_xy[i] * 1000),
+                "final_xy_shift_mm": float(final_xy[i] * 1000),
+                "peak_tilt_deg": float(peak_tilt[i]),
+                "final_tilt_deg": float(final_tilt[i]),
+            }
+
+            if peak_xy[i] > xy_limit:
+                problems.append(
+                    f"{name}: XY shift {peak_xy[i] * 1000:.2f} mm "
+                    f"(limit {self.max_initial_xy_shift_mm:.1f} mm)"
+                )
+
+            if not is_sphere[i] and peak_tilt[i] > tilt_limit:
+                problems.append(
+                    f"{name}: tilt {peak_tilt[i]:.2f} deg "
+                    f"(limit {tilt_limit:.1f} deg)"
+                )
+
+        self._initial_stability["initial_pose_check"] = {
+            "passed": len(problems) == 0,
+            "max_allowed_xy_shift_mm": self.max_initial_xy_shift_mm,
+            "max_allowed_tilt_deg": tilt_limit,
+            "max_peak_xy_shift_mm": float(peak_xy.max() * 1000),
+            "max_peak_tilt_deg": float(peak_tilt.max()),
+            "objects": object_results,
+        }
+
+        if problems:
+            raise RuntimeError(
+                "Invalid initial scene after settling: "
+                + "; ".join(problems)
+            )
+
+        print(
+            "Initial scene validation PASSED: "
+            f"max XY shift={peak_xy.max() * 1000:.3f} mm, "
+            f"max tilt={peak_tilt.max():.3f} deg",
+            flush=True
+        )
+
         self._elapsed_steps[:] = 0
+
         info = self.get_info()
         info["reconfigure"] = original_info.get("reconfigure", False)
+
         obs = self.get_obs(info)
         self._last_obs = obs
+
         return obs, info
+
+
 
     def _get_obs_extra(self, info):
         data = {"tcp_pose": self.agent.tcp_pose.raw_pose,
