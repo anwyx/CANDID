@@ -66,6 +66,8 @@ class BaselinePlanConfig:
     lift_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     transfer_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     strategy: str = "manual"
+    collision_aware: bool = False
+    collision_margin_m: float = 0.008
 
     # Intermediate transfer motion uses RRT*, as in the official examples.
     # Approach/place use the simpler screw motion when possible.
@@ -96,6 +98,31 @@ def _numpy_position(pose) -> np.ndarray:
 def _pose(p_xyz, quaternion) -> sapien.Pose:
     """Construct a world-frame TCP pose, keeping gripper orientation."""
     return sapien.Pose(p=np.asarray(p_xyz, dtype=float), q=np.asarray(quaternion, dtype=float))
+
+
+def _add_distractor_collisions(planner, base_env, margin_m: float):
+    """Add only distractors to MPlib as approximate, padded oriented boxes.
+
+    The target cube is deliberately excluded so the robot can grasp it.
+    SAPIEN still simulates the real geometries and all contact physics.
+    This is a static point-cloud approximation, not a proof of collision freedom.
+    """
+    if not np.isfinite(margin_m) or not 0.0 <= margin_m <= 0.05:
+        raise ValueError("collision_margin_m must be within [0, 0.05]")
+
+    for actor in base_env.distractor_actors:
+        mesh = actor.get_first_collision_mesh(to_world_frame=False)
+        if mesh is None:
+            raise RuntimeError(f"No collision mesh for distractor {actor.name}")
+        bounds = np.asarray(mesh.bounding_box.bounds, dtype=np.float64)
+        if bounds.shape != (2, 3) or not np.isfinite(bounds).all():
+            raise RuntimeError(f"Invalid collision bounds for {actor.name}")
+        centre_local = (bounds[0] + bounds[1]) / 2.0
+        extent = bounds[1] - bounds[0] + 2.0 * margin_m
+        if np.any(extent <= 0):
+            raise RuntimeError(f"Invalid collision extent for {actor.name}")
+        world_box_pose = actor.pose.sp * sapien.Pose(p=centre_local)
+        planner.add_box_collision(extent, world_box_pose)
 
 
 def _stage(planner, name: str, tcp_pose: sapien.Pose, method: str, verbose: bool):
@@ -221,6 +248,8 @@ def solve(
         # IMPORTANT: no distractor point cloud is added to MPlib.  The
         # simulation nevertheless keeps distractor collisions ENABLED.
         planner.use_point_cloud = False
+        if cfg.collision_aware:
+            _add_distractor_collisions(planner, base, cfg.collision_margin_m)
 
         stage = "open_gripper"
         planner.open_gripper(t=cfg.gripper_open_steps)

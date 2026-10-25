@@ -57,6 +57,10 @@ def build_parser():
     advanced.add_argument("--env-module", default="envs.candid_baseline_env")
     advanced.add_argument("--env-kwargs", default="{}")
     advanced.add_argument("--verbose", action="store_true")
+    advanced.add_argument("--no-collision-aware", action="store_true",
+                          help="Skip the extra obstacle-aware reference trial")
+    advanced.add_argument("--collision-margin-m", type=float, default=0.008,
+                          help="Bounding-box padding around distractors in metres")
     return p
 
 
@@ -71,6 +75,8 @@ def parse_args(argv=None):
         p.error("--max-episode-steps must be positive")
     if not (0 < args.variant_scale <= 1.5):
         p.error("--variant-scale must be in (0, 1.5]")
+    if not np.isfinite(args.collision_margin_m) or not 0 <= args.collision_margin_m <= 0.05:
+        p.error("--collision-margin-m must be in [0, 0.05]")
     try:
         args.env_kwargs = json.loads(args.env_kwargs)
         if not isinstance(args.env_kwargs, dict):
@@ -217,14 +223,82 @@ def main(argv=None):
                 "distractor_asset_ids": [m.spec.asset_id or m.spec.kind for m in base.distractor_metadata],
                 "initial_tcp_xyz": sampler_args["initial_tcp_xyz"],
                 "sampling": {"algorithm": "feedback_v1", "warmup_count": WARMUP_COUNT,
+                             "collision_aware_reference": not args.no_collision_aware,
+                             "collision_margin_m": args.collision_margin_m,
                              "uniform_every": sampler.uniform_every,
                              "variant_seed": args.variant_seed, "variant_scale": args.variant_scale,
                              "trajectories_per_scene": args.trajectories_per_scene,
                              "shared_scene_snapshot": True},
             })
+            # Extra trial, independent of the original 24-trial feedback history.
+            # If it fails at ANY planning stage, record the attempt and continue.
+            if not args.no_collision_aware:
+                ref_config = BaselinePlanConfig(
+                    strategy="collision_aware_reference",
+                    collision_aware=True,
+                    collision_margin_m=args.collision_margin_m,
+                )
+                reference_seed = _planner_seed(seed, args.variant_seed, -1)
+                random.seed(reference_seed)
+                np.random.seed(reference_seed)
+                try:
+                    ref_result = solve(
+                        recorder, seed=seed, config=ref_config,
+                        reset_env=False, vis=False, verbose=args.verbose
+                    )
+                    ref_status = _status(ref_result, trace.steps)
+                except Exception as exc:
+                    ref_status = {
+                        "task_success": False,
+                        "stage": "exception",
+                        "planner_steps": trace.steps,
+                        "message": f"{type(exc).__name__}: {exc}",
+                    }
+                    print(f"WARNING: collision-aware reference seed={seed}: "
+                          f"{ref_status['message']}", flush=True)
+
+                # Record all failures, including planning failure before the first step.
+                # The ManiSkill recorder intentionally creates no HDF5 for zero steps;
+                # the JSONL entry and NPZ physics trace still record the attempt.
+                recorder.flush_trajectory(save=True)
+                if args.save_video:
+                    recorder.flush_video(save=True)
+                ref_saved_hdf5 = trace.steps > 0
+                ref_file = (Path(recorder._h5_file.filename).name
+                            if ref_saved_hdf5 else None)
+                ref_key = (f"traj_{recorder._episode_id}"
+                           if ref_saved_hdf5 else None)
+                ref_dr = float(trace.summary()["dr_mean"])
+                ref_id = f"{scene_id}_collision_aware"
+                writer.save_trajectory(ref_id, scene_id, trace, {
+                    "seed": seed,
+                    "trajectory_index": -1,
+                    "trial_order": 0,
+                    "planner": "planners.execute_baseline:solve",
+                    "planner_config": vars(ref_config).copy(),
+                    "proposal": {"collection_phase": "reference",
+                                 "collision_geometry": "padded_oriented_bounding_boxes",
+                                 "collision_margin_m": args.collision_margin_m},
+                    "sampling_selection": "collision_aware",
+                    "planner_seed": reference_seed,
+                    "control_mode": "pd_joint_pos",
+                    "obs_mode": "state_dict",
+                    "control_dt_s": float(base.control_timestep),
+                    "hdf5_file": ref_file,
+                    "hdf5_trajectory_key": ref_key,
+                    "saved_hdf5": ref_saved_hdf5,
+                    **ref_status,
+                })
+                print(
+                    f"REFERENCE seed={seed} success={ref_status['task_success']} "
+                    f"stage={ref_status['stage']} steps={trace.steps} "
+                    f"DR={ref_dr:.6f}", flush=True
+                )
+
+            # These are still the ORIGINAL 24 trials, with baseline at index 0.
             records = []
             for index in range(args.trajectories_per_scene):
-                if index > 0:
+                if index > 0 or not args.no_collision_aware:
                     recorder.reset(seed=seed, options={"reset_to_env_states": {"env_states": snapshot}})
                     recorder.last_reset_kwargs = {"seed": seed, "options": {"restored_scene_id": scene_id}}
                     _verify_start(stable_start, _scene_start(base, trace))
