@@ -7,6 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from candid.data.validate import validate_dataset
+from candid.data.splits import load_or_create_scene_split
 from candid.train.dataset import (
     ACTION_HORIZON,
     OBSERVATION_HORIZON,
@@ -14,7 +15,6 @@ from candid.train.dataset import (
     WindowDataset,
     fit_normalizer,
     load_trajectories,
-    split_scene_ids,
 )
 from candid.train.models import DiffusionPolicy, DisturbancePredictor
 
@@ -199,18 +199,23 @@ def run_pilot(
     output_dir,
     steps: int = 40,
     seed: int = 0,
-    val_ratio: float = 0.2,
+    val_ratio: float = 0.15,
     diffusion_steps: int = 8,
     device: str = "cpu",
+    test_ratio: float = 0.15,
 ):
-    """Validate a collection, train both models, and sample one action chunk."""
+    """Validate data, train on fixed train/val scenes, and hold out test scenes."""
     dataset_root = Path(dataset_root)
     output_dir = Path(output_dir)
     report = validate_dataset(dataset_root)
-    trajectories = load_trajectories(dataset_root)
-    train_scenes, val_scenes = split_scene_ids(
-        [item.scene_id for item in trajectories], val_ratio=val_ratio, seed=seed
+    split = load_or_create_scene_split(
+        dataset_root, seed=seed, val_ratio=val_ratio, test_ratio=test_ratio
     )
+    train_scenes = split["train"]
+    val_scenes = split["validation"]
+    test_scenes = split["test"]
+    # Test scenes are held out of every training and validation window.
+    trajectories = load_trajectories(dataset_root)
     policy_train = WindowDataset(trajectories, train_scenes, success_only=True)
     predictor_train = WindowDataset(trajectories, train_scenes, success_only=False)
     policy_val = WindowDataset(trajectories, val_scenes, success_only=True) if val_scenes else None
@@ -252,6 +257,8 @@ def run_pilot(
         "validation": report,
         "train_scenes": train_scenes,
         "val_scenes": val_scenes,
+        "test_scenes": test_scenes,
+        "split_file": str(dataset_root / "split.json"),
         "policy_train_windows": len(policy_train),
         "predictor_train_windows": len(predictor_train),
         "policy_losses": policy_result["losses"],

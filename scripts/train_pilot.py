@@ -1,16 +1,10 @@
 """Train the pilot diffusion policy and disturbance predictor.
 
 The collection format is the one written by ``scripts/collect.py``:
-``state_dict`` observations and  ``pd_joint_pos`` actions. Video files are
-not read.
+``state_dict`` observations and ``pd_joint_pos`` actions. Video files are not read.
 
-Before a real collection exists, ``--synthetic`` writes a small stand-in
-dataset and trains on it.
-
-Examples
---------
-python scripts/train_pilot.py --synthetic --steps 40 --output-dir runs/pilot_synthetic
-python scripts/train_pilot.py --dataset demos/team_a --output-dir runs/pilot_team_a
+On the first training run a dataset's split.json is created automatically.
+Later training runs reuse the same train/validation/test scene split.
 """
 from __future__ import annotations
 
@@ -39,7 +33,8 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--val-ratio", type=float, default=0.2)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--diffusion-steps", type=int, default=8)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
@@ -47,6 +42,10 @@ def parse_args(argv=None):
         parser.error("--steps must be positive")
     if not 0 <= args.val_ratio < 1:
         parser.error("--val-ratio must be in [0, 1)")
+    if not 0 < args.test_ratio < 1:
+        parser.error("--test-ratio must be in (0, 1)")
+    if args.val_ratio + args.test_ratio >= 1:
+        parser.error("--val-ratio + --test-ratio must be less than 1")
     return args
 
 
@@ -64,12 +63,15 @@ def main(argv=None):
         val_ratio=args.val_ratio,
         diffusion_steps=args.diffusion_steps,
         device=args.device,
+        test_ratio=args.test_ratio,
     )
     print("CANDID train pilot")
     print(f"dataset: {dataset}")
     print(f"validation: {result['validation']}")
+    print(f"split file: {result['split_file']}")
     print(f"train scenes: {result['train_scenes']}")
     print(f"val scenes: {result['val_scenes']}")
+    print(f"test scenes (held out): {result['test_scenes']}")
     print(
         f"windows: policy {result['policy_train_windows']}, "
         f"predictor {result['predictor_train_windows']}"
