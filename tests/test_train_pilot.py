@@ -1,16 +1,51 @@
-"""Run the training pipeline on a synthetic collection. No simulator required."""
+"""Vanilla DP and the predictor train independently on a synthetic collection."""
+import ast
 import sys
 from pathlib import Path
 
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
+from candid.data.synthetic import ACTION_DIM, write_synthetic_dataset
+from candid.data.trajectories import load_trajectories
 from candid.data.validate import validate_dataset
-from candid.train.dataset import WindowDataset, load_trajectories, split_scene_ids
-from candid.train.loop import load_diffusion_policy, load_predictor, run_pilot
-from candid.train.synthetic import ACTION_DIM, write_synthetic_dataset
+from model.predictor.checkpoint import load_predictor
+from model.predictor.config import PredictorConfig
+from model.predictor.inference import predict
+from model.predictor.train import train_predictor
+from model.vanilla_dp.checkpoint import load_policy
+from model.vanilla_dp.config import DPConfig
+from model.vanilla_dp.train import train_vanilla_dp
+
+
+def _imported_modules(path: Path) -> list[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    modules = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.append(node.module)
+    return modules
+
+
+def test_models_do_not_import_each_other_or_baselines():
+    checks = (
+        (ROOT / "model" / "vanilla_dp", ("model.predictor", "baselines")),
+        (ROOT / "model" / "predictor", ("model.vanilla_dp", "baselines")),
+        (ROOT / "src", ("model", "baselines")),
+    )
+    for directory, forbidden in checks:
+        for path in directory.rglob("*.py"):
+            for module in _imported_modules(path):
+                for prefix in forbidden:
+                    assert not module.startswith(prefix), f"{path} imports {module}"
+    source = "\n".join(path.read_text(encoding="utf-8") for path in (ROOT / "src").rglob("*.py"))
+    assert "nn.Module" not in source
+    assert "ConditionalUnet1D" not in source
 
 
 def test_synthetic_collection_matches_the_training_contract(tmp_path):
@@ -19,50 +54,37 @@ def test_synthetic_collection_matches_the_training_contract(tmp_path):
     assert report["num_scenes"] == 3
     assert report["num_trajectories"] == 6
     assert report["num_recorded_hdf5"] == 6
-
     trajectories = load_trajectories(root)
     assert {item.actions.shape[-1] for item in trajectories} == {ACTION_DIM}
     assert all(item.observations["robot_qpos"].shape[-1] != ACTION_DIM for item in trajectories)
-    train_scenes, val_scenes = split_scene_ids([item.scene_id for item in trajectories], seed=0)
-    assert set(train_scenes).isdisjoint(val_scenes)
-    assert set(train_scenes) | set(val_scenes) == {item.scene_id for item in trajectories}
-
-    policy = WindowDataset(trajectories, train_scenes, success_only=True)
-    predictor = WindowDataset(trajectories, train_scenes, success_only=False)
-    assert policy.samples
-    assert all(policy.successes)
-    assert len(predictor) > len(policy)
-    assert any(not success for success in predictor.successes)
-    assert policy[0]["obs"].shape[0] == 2
-    assert policy[0]["action"].shape == (12, ACTION_DIM)
-    assert policy[0]["target"].shape == (4,)
 
 
-def test_diffusion_policy_and_predictor_train_on_synthetic_data(tmp_path):
+def test_vanilla_dp_trains_and_reloads_without_the_predictor(tmp_path):
     root = write_synthetic_dataset(tmp_path / "data")
-    result = run_pilot(root, tmp_path / "run", steps=40, seed=0, diffusion_steps=8)
+    config = DPConfig(total_iters=2, batch_size=8, cuda=False, seed=1)
+    result = train_vanilla_dp(root, tmp_path / "dp", config)
+    assert result["checkpoint"].is_file()
+    assert set(result["train_scenes"]).isdisjoint(result["test_scenes"])
+    assert set(result["val_scenes"]).isdisjoint(result["test_scenes"])
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in result["losses"])
+    policy = load_policy(result["checkpoint"], device="cpu")
+    action = policy.act(torch.zeros(policy.obs_horizon, policy.obs_dim).numpy())
+    assert action.shape == (config.act_horizon, ACTION_DIM)
+    assert torch.isfinite(torch.from_numpy(action)).all()
 
-    assert result["sample_action"].shape == (1, 12, ACTION_DIM)
-    assert result["sample_prediction"].shape == (1, 4)
-    assert torch.isfinite(result["sample_action"]).all()
-    assert torch.isfinite(result["sample_prediction"]).all()
-    assert result["policy_losses"][-1] < result["policy_losses"][0]
-    assert result["predictor_losses"][-1] < result["predictor_losses"][0]
-    assert result["policy_val_loss"] is not None
-    assert result["predictor_val_loss"] is not None
 
-    policy, policy_norm = load_diffusion_policy(result["policy_checkpoint"])
-    predictor, predictor_norm = load_predictor(result["predictor_checkpoint"])
-    raw_obs = torch.zeros(1, 2, policy.obs_dim)
-    with torch.no_grad():
-        action = policy_norm.denormalize_action(policy.sample(policy_norm.normalize_obs(raw_obs)))
-        prediction = predictor_norm.denormalize_target(
-            predictor(
-                predictor_norm.normalize_obs(raw_obs),
-                predictor_norm.normalize_action(action),
-            )
-        )
-    assert action.shape == (1, 12, ACTION_DIM)
-    assert prediction.shape == (1, 4)
-    assert torch.isfinite(action).all()
-    assert torch.isfinite(prediction).all()
+def test_predictor_trains_and_reloads_without_vanilla_dp(tmp_path):
+    root = write_synthetic_dataset(tmp_path / "data")
+    config = PredictorConfig(steps=40, device="cpu")
+    result = train_predictor(root, tmp_path / "predictor", config)
+    assert result["losses"][-1] < result["losses"][0]
+    assert result["val_loss"] is not None
+    model, normalizer = load_predictor(result["checkpoint"], device="cpu")
+    score = predict(
+        model,
+        normalizer,
+        torch.zeros(1, config.obs_horizon, model.obs_dim),
+        torch.zeros(1, config.action_horizon, ACTION_DIM),
+    )
+    assert tuple(score.shape) == (1, 4)
+    assert torch.isfinite(score).all()

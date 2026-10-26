@@ -1,7 +1,8 @@
-"""Run a trained CANDID state-based diffusion policy in real ManiSkill episodes.
+"""Closed-loop episode runner shared by every CANDID policy.
 
-Replay held-out initial Scene snapshots; feed two live state_dict observations
-into the same adapter used by training; execute policy chunks in closed loop.
+Replay held-out initial Scene snapshots, feed live state_dict observations
+through the canonical adapter, and execute whatever action chunk the policy
+returns. This module does not load a checkpoint or define a network.
 """
 from __future__ import annotations
 
@@ -12,17 +13,13 @@ from collections import deque
 from pathlib import Path
 
 import numpy as np
-import torch
 
-from candid.data.adapter import canonical_observation
-from candid.data.metrics import disturbance_from_poses
+from candid.data.adapter import canonical_observation, observation_vector
 from candid.data.splits import validate_scene_split
 from candid.data.storage import load_state_npz
 from candid.data.validate import validate_dataset
 from candid.eval.metrics import SafetyLimits, evaluate_outcome, summarize_episodes
 from candid.eval.replay_env import resolve_scene_environment
-from candid.train.dataset import observation_vector
-from candid.train.loop import load_diffusion_policy
 
 
 def _numpy(value):
@@ -111,8 +108,7 @@ def _clamp_action(action: np.ndarray, action_space) -> tuple[np.ndarray, bool]:
 def _rollout_single(
     scene: dict,
     dataset: Path,
-    model,
-    normalizer,
+    policy,
     episode_dir: Path,
     limits: SafetyLimits,
     *,
@@ -122,15 +118,15 @@ def _rollout_single(
     save_video: bool,
     stop_on_success: bool,
 ) -> dict:
-    """One episode, new environment and exact scene snapshot, one stochastic DP rollout."""
+    """One episode from the saved scene snapshot, using the supplied policy."""
     import gymnasium as gym
     from mani_skill.utils.wrappers.record import RecordEpisode
     from candid.data.monitor import PhysicsTrace
 
     if scene.get("control_mode", "pd_joint_pos") != "pd_joint_pos":
-        raise ValueError("Only pd_joint_pos scenes are compatible with this DP")
+        raise ValueError("Only pd_joint_pos scenes can be replayed")
     if scene.get("obs_mode", "state_dict") != "state_dict":
-        raise ValueError("Only state_dict scenes are compatible with this DP")
+        raise ValueError("Only state_dict scenes can be replayed")
     env_id, environment_source = resolve_scene_environment(scene)
     episode_dir.mkdir(parents=True, exist_ok=False)
     raw_env = gym.make(
@@ -169,13 +165,15 @@ def _rollout_single(
         if getattr(env.unwrapped, "num_envs", 1) != 1:
             raise ValueError("CANDID Evaluation requires one CPU environment")
         _check_initial_scene(scene, env.unwrapped, trace)
-        if int(np.prod(env.action_space.shape)) != model.action_dim:
-            raise ValueError("Checkpoint action dimension does not match environment")
+        if int(np.prod(env.action_space.shape)) != policy.action_dim:
+            raise ValueError("Policy action dimension does not match environment")
         num_distractors = len(trace.names)
         current = _canonical_live(raw_obs, num_distractors)
-        if current.shape[-1] != model.obs_dim:
-            raise ValueError(f"Checkpoint expects obs_dim={model.obs_dim}, got {current.shape[-1]}")
-        history = deque([current.copy() for _ in range(model.obs_horizon)], maxlen=model.obs_horizon)
+        if current.shape[-1] != policy.obs_dim:
+            raise ValueError(f"Policy expects obs_dim={policy.obs_dim}, got {current.shape[-1]}")
+        if hasattr(policy, "begin_episode"):
+            policy.begin_episode(eval_seed)
+        history = deque([current.copy() for _ in range(policy.obs_horizon)], maxlen=policy.obs_horizon)
         frames = [_frame_record(raw_obs)]
         actions: list[np.ndarray] = []
         clipped_actions = 0
@@ -185,11 +183,8 @@ def _rollout_single(
         replans = 0
         while len(actions) < max_steps:
             window = np.stack(list(history)).astype(np.float32)
-            batch = torch.from_numpy(window[None]).to(next(model.parameters()).device)
-            with torch.no_grad():
-                predicted = model.sample(normalizer.normalize_obs(batch))
-                chunk = normalizer.denormalize_action(predicted)[0].detach().cpu().numpy()
-            if chunk.shape != (model.action_horizon, model.action_dim):
+            chunk = np.asarray(policy.act(window), dtype=np.float32)
+            if chunk.shape != (policy.action_horizon, policy.action_dim):
                 raise RuntimeError(f"Invalid predicted action chunk: {chunk.shape}")
             replans += 1
             for action in chunk[:exec_horizon]:
@@ -216,7 +211,7 @@ def _rollout_single(
         episode_npz = episode_dir / "trajectory.npz"
         np.savez_compressed(
             episode_npz,
-            actions=np.stack(actions).astype(np.float32) if actions else np.zeros((0, model.action_dim), dtype=np.float32),
+            actions=np.stack(actions).astype(np.float32) if actions else np.zeros((0, policy.action_dim), dtype=np.float32),
             **{key: np.stack([frame[key] for frame in frames]) for key in frames[0]},
             **arrays,
         )
@@ -252,17 +247,17 @@ def _rollout_single(
 
 def evaluate_dataset(
     dataset_root,
-    checkpoint,
+    policy,
     output_dir,
     limits: SafetyLimits,
     *,
+    checkpoint=None,
     max_scenes: int | None = None,
     scene_id: str | None = None,
     episodes_per_scene: int = 1,
     max_steps: int = 300,
     exec_horizon: int = 8,
     eval_seed: int = 2026,
-    device: str = "cpu",
     save_video: bool = True,
     stop_on_success: bool = True,
 ) -> dict:
@@ -288,10 +283,8 @@ def evaluate_dataset(
     if not test_ids:
         raise ValueError("No test scenes available")
     scenes = {row["scene_id"]: row for row in _read_jsonl(dataset / "scenes.jsonl")}
-    model, normalizer = load_diffusion_policy(checkpoint, device=device)
-    if exec_horizon < 1 or exec_horizon > model.action_horizon:
-        raise ValueError(f"exec_horizon must be in [1, {model.action_horizon}]")
-    model.eval()
+    if exec_horizon < 1 or exec_horizon > policy.action_horizon:
+        raise ValueError(f"exec_horizon must be in [1, {policy.action_horizon}]")
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Evaluation output folder must be empty: {output}")
     output.mkdir(parents=True, exist_ok=True)
@@ -300,11 +293,10 @@ def evaluate_dataset(
         scene = scenes[selected_id]
         for repetition in range(episodes_per_scene):
             seed = eval_seed + index * 100000 + repetition
-            torch.manual_seed(seed)
             np.random.seed(seed % (2**32))
             name = f"{index:03d}_{_safe_file_stem(selected_id)}_rep{repetition:02d}"
             row = _rollout_single(
-                scene, dataset, model, normalizer, output / name, limits,
+                scene, dataset, policy, output / name, limits,
                 max_steps=max_steps, exec_horizon=exec_horizon,
                 eval_seed=seed, save_video=save_video,
                 stop_on_success=stop_on_success,
@@ -339,7 +331,7 @@ def evaluate_dataset(
         "disturbance": "CANDID weighted, size-normalized peak displacement/rotation from initial scene",
     }
     report.update({
-        "dataset": str(dataset), "checkpoint": str(checkpoint),
+        "dataset": str(dataset), "checkpoint": None if checkpoint is None else str(checkpoint),
         "split_file": str(split_path), "test_scene_ids": test_ids,
         "episodes_per_scene": episodes_per_scene, "exec_horizon": exec_horizon,
         "max_steps": max_steps, "eval_seed": eval_seed,

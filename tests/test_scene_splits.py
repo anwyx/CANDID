@@ -87,17 +87,25 @@ def test_disabled_validation_still_has_test_holdout(tmp_path):
 
 
 def test_training_pipeline_uses_auto_split(tmp_path):
-    from candid.train.synthetic import write_synthetic_dataset
-    from candid.train.loop import run_pilot
+    sys.path.insert(0, str(ROOT))
+    from candid.data.synthetic import write_synthetic_dataset
+    from model.predictor.config import PredictorConfig
+    from model.predictor.train import train_predictor
+    from model.vanilla_dp.config import DPConfig
+    from model.vanilla_dp.train import train_vanilla_dp
 
     root = write_synthetic_dataset(tmp_path / "synthetic")
     assert not (root / "split.json").exists()
-    result = run_pilot(root, tmp_path / "checkpoints", steps=2, seed=0, device="cpu")
+    policy = train_vanilla_dp(
+        root, tmp_path / "dp", DPConfig(total_iters=1, batch_size=8, cuda=False)
+    )
+    predictor = train_predictor(root, tmp_path / "predictor", PredictorConfig(steps=1))
     split = json.loads((root / "split.json").read_text(encoding="utf-8"))
-    assert result["train_scenes"] == split["train"]
-    assert result["val_scenes"] == split["validation"]
-    assert result["test_scenes"] == split["test"]
-    assert set(result["train_scenes"]).isdisjoint(result["test_scenes"])
-    assert set(result["val_scenes"]).isdisjoint(result["test_scenes"])
-    assert result["policy_checkpoint"].is_file()
-    assert result["predictor_checkpoint"].is_file()
+    assert policy["train_scenes"] == split["train"]
+    assert policy["val_scenes"] == split["validation"]
+    assert policy["test_scenes"] == split["test"]
+    assert predictor["train_scenes"] == split["train"]
+    assert set(policy["train_scenes"]).isdisjoint(policy["test_scenes"])
+    assert set(policy["val_scenes"]).isdisjoint(policy["test_scenes"])
+    assert policy["checkpoint"].is_file()
+    assert predictor["checkpoint"].is_file()
