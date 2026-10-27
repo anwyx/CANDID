@@ -16,6 +16,7 @@ with batch size 1024 would otherwise yield no updates.
 from __future__ import annotations
 
 import argparse
+import csv
 import random
 from pathlib import Path
 
@@ -32,6 +33,8 @@ from model.vanilla_dp.dataset import DiffusionWindowDataset
 from model.vanilla_dp.ema import EMAModel
 from model.vanilla_dp.normalizer import fit_action_normalizer
 from model.vanilla_dp.policy import Agent
+from model.vanilla_dp.validation import (compute_validation_loss, make_validation_loader,
+                                          plot_loss_history)
 
 
 class _IterationBasedBatchSampler:
@@ -90,6 +93,15 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
     dataset = DiffusionWindowDataset(
         trajectories, split["train"], config.obs_horizon, config.pred_horizon
     )
+    validation_dataset = DiffusionWindowDataset(
+        trajectories, split["validation"], config.obs_horizon, config.pred_horizon
+    )
+    validation_loader, validation_count = make_validation_loader(
+        validation_dataset, config.val_batch_size, config.val_max_windows, config.seed + 17
+    )
+    if (dataset.obs_dim, dataset.action_dim) != (validation_dataset.obs_dim, validation_dataset.action_dim):
+        raise ValueError("Train and validation observation/action dimensions differ")
+    print(f"validation: {validation_count} windows, every {config.eval_freq} iterations", flush=True)
     normalizer = fit_action_normalizer(dataset.training_actions()).to(device)
     agent = Agent(dataset.obs_dim, dataset.action_dim, config).to(device)
     ema_agent = Agent(dataset.obs_dim, dataset.action_dim, config).to(device)
@@ -114,7 +126,20 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
     loader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=0)
 
     agent.train()
+    ema_agent.eval()
     losses = []
+    history = []
+    train_loss_sum = 0.0
+    train_sample_count = 0
+    best_val_loss = float("inf")
+    best_iteration = None
+    best_checkpoint = output_dir / "checkpoints" / "best_val.pt"
+    loss_csv = output_dir / "loss_history.csv"
+    loss_png = output_dir / "loss_curve.png"
+    loss_csv.parent.mkdir(parents=True, exist_ok=True)
+    csv_file = loss_csv.open("w", encoding="utf-8", newline="")
+    writer = csv.DictWriter(csv_file, fieldnames=("iteration", "train_loss", "val_loss", "lr"))
+    writer.writeheader()
     for iteration, batch in enumerate(loader):
         observations = batch["observations"].to(device)
         actions = normalizer.normalize(batch["actions"].to(device))
@@ -124,7 +149,30 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
         optimizer.step()
         lr_scheduler.step()
         ema.step(agent.parameters())
-        losses.append(float(loss.detach().cpu()))
+        current_loss = float(loss.detach().cpu())
+        losses.append(current_loss)
+        batch_count = observations.shape[0]
+        train_loss_sum += current_loss * batch_count
+        train_sample_count += batch_count
+        step = iteration + 1
+        if step % config.eval_freq == 0 or step == config.total_iters:
+            ema.copy_to(ema_agent.parameters())
+            val_loss = compute_validation_loss(
+                ema_agent, validation_loader, normalizer, device, config.seed + 10000
+            )
+            row = {"iteration": step, "train_loss": train_loss_sum / train_sample_count,
+                   "val_loss": val_loss, "lr": optimizer.param_groups[0]["lr"]}
+            history.append(row)
+            writer.writerow(row)
+            csv_file.flush()
+            print(f"validation iter={step}: train={row['train_loss']:.6f} val_EMA={val_loss:.6f}", flush=True)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_iteration = step
+                save_checkpoint(best_checkpoint, agent, ema_agent, config, normalizer)
+                print(f"new best: iteration {step}, validation={val_loss:.6f}", flush=True)
+            train_loss_sum = 0.0
+            train_sample_count = 0
         if iteration % config.log_freq == 0 or iteration + 1 == config.total_iters:
             print(
                 f"vanilla_dp iter {iteration}: loss={losses[-1]:.6f} "
@@ -132,6 +180,7 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
                 flush=True,
             )
 
+    csv_file.close()
     ema.copy_to(ema_agent.parameters())
     checkpoint = save_checkpoint(
         output_dir / "checkpoints" / "vanilla_dp.pt",
@@ -140,8 +189,16 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
         config,
         normalizer,
     )
+    plot_loss_history(history, loss_png)
     return {
         "checkpoint": checkpoint,
+        "best_checkpoint": best_checkpoint,
+        "best_iteration": best_iteration,
+        "best_val_loss": best_val_loss,
+        "loss_history_csv": loss_csv,
+        "loss_figure": loss_png,
+        "loss_history": history,
+        "validation_windows": validation_count,
         "train_scenes": split["train"],
         "val_scenes": split["validation"],
         "test_scenes": split["test"],
@@ -163,6 +220,10 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--eval-freq", type=int, default=500)
+    parser.add_argument("--val-max-windows", type=int, default=4096)
+    parser.add_argument("--val-batch-size", type=int, default=256)
+    parser.add_argument("--log-freq", type=int, default=1000)
     parser.add_argument("--obs-horizon", type=int, default=2)
     parser.add_argument("--act-horizon", type=int, default=8)
     parser.add_argument("--pred-horizon", type=int, default=16)
@@ -177,6 +238,10 @@ def main(argv=None):
         lr=args.lr,
         batch_size=args.batch_size,
         total_iters=args.total_iters,
+        eval_freq=args.eval_freq,
+        val_max_windows=args.val_max_windows,
+        val_batch_size=args.val_batch_size,
+        log_freq=args.log_freq,
         seed=args.seed,
         split_seed=args.split_seed,
         cuda=not args.no_cuda,
@@ -185,6 +250,10 @@ def main(argv=None):
     )
     result = train_vanilla_dp(args.dataset, args.output_dir, config)
     print(f"checkpoint: {result['checkpoint']}")
+    print(f"best checkpoint: {result['best_checkpoint']}")
+    print(f"best validation MSE: {result['best_val_loss']:.6f} at iteration {result['best_iteration']}")
+    print(f"loss history: {result['loss_history_csv']}")
+    print(f"loss curve: {result['loss_figure']}")
     print(f"train scenes: {result['train_scenes']}")
     print(f"val scenes: {result['val_scenes']}")
     print(f"test scenes (held out): {result['test_scenes']}")

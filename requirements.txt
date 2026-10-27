@@ -1,0 +1,34 @@
+# CANDID server dependencies
+# Target: Ubuntu 22.04/24.04, Linux x86_64, Python 3.10, NVIDIA GPU
+# Based on the CANDID train_pilot codebase (2026-10-27).
+# Recommended: install CUDA-enabled PyTorch first using the command for
+# your server from https://pytorch.org/get-started/locally/
+# Then run: python -m pip install -r requirements.txt
+
+# Neural networks, Vanilla Diffusion Policy and disturbance predictor
+torch>=2.3,<3.0
+diffusers==0.32.2
+huggingface-hub>=0.27,<1.0
+
+# ManiSkill 3 simulator, SAPIEN physics and motion planning
+mani-skill==3.0.1
+sapien==3.0.3
+mplib==0.1.1
+gymnasium>=0.29,<2.0
+transforms3d>=0.4.2,<1.0
+trimesh>=4.0,<5.0
+
+# Dataset, numerical processing and validation
+numpy>=1.26,<2.0
+scipy>=1.11,<2.0
+h5py>=3.10,<4.0
+
+# Training curves, plots and off-screen video output
+matplotlib>=3.7,<4.0
+imageio>=2.34,<3.0
+imageio-ffmpeg>=0.5.1,<1.0
+pillow>=10,<13
+
+# General runtime utilities and project tests
+pyyaml>=6,<7
+pytest>=8,<10

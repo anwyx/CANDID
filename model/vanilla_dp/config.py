@@ -26,6 +26,9 @@ class DPConfig:
     test_ratio: float = 0.15
     warmup_steps: int = 500
     log_freq: int = 1000
+    eval_freq: int = 500
+    val_max_windows: int = 4096
+    val_batch_size: int = 256
 
     def __post_init__(self):
         self.unet_dims = tuple(int(value) for value in self.unet_dims)
@@ -35,6 +38,8 @@ class DPConfig:
             raise ValueError("Require obs_horizon + act_horizon - 1 <= pred_horizon")
         if self.num_diffusion_iters < 1 or self.total_iters < 1 or self.batch_size < 1:
             raise ValueError("Iteration counts and batch size must be positive")
+        if min(self.log_freq, self.eval_freq, self.val_max_windows, self.val_batch_size) < 1:
+            raise ValueError("Logging/validation frequency and sizes must be positive")
         if any(dim % self.n_groups != 0 for dim in self.unet_dims):
             raise ValueError("Each UNet channel width must be divisible by n_groups")
         downsamples = max(len(self.unet_dims) - 1, 0)
