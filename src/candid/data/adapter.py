@@ -47,3 +47,33 @@ def canonical_observation(raw_obs_group, num_distractors, max_distractors=6):
         "distractor_mask":mask,                     # [T+1,6]
         "goal_xy":get(extra,"goal_pos")[:,:2],     # [T+1,2]
     }
+
+
+OBSERVATION_FIELDS = (
+    "robot_qpos",
+    "robot_qvel",
+    "tcp_pose",
+    "target_state",
+    "distractor_states",
+    "distractor_mask",
+    "goal_xy",
+)
+
+
+def observation_vector(obs_window: dict) -> np.ndarray:
+    """Stack named state fields into ``[time, features]``.
+
+    ``obs_window`` is either a full trajectory or one model window. Every
+    field must share the same time length. Future disturbance labels are not
+    part of this vector.
+    """
+    parts = []
+    horizon = None
+    for key in OBSERVATION_FIELDS:
+        array = np.asarray(obs_window[key], dtype=np.float32)
+        if horizon is None:
+            horizon = array.shape[0]
+        if array.shape[0] != horizon:
+            raise ValueError(f"Observation field {key} has a different horizon")
+        parts.append(array.reshape(horizon, -1))
+    return np.concatenate(parts, axis=-1)

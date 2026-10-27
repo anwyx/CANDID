@@ -266,7 +266,7 @@ DR_i = 0.7\frac{\max_t\|p_i(t)-p_i(0)\|_2}{s_i} + 0.3\frac{\max_t\theta(q_i(t),q
 - **DP：** 可用成功轨迹进行行为克隆；是否包含失败样本由训练端自行决定。
 - **Predictor：** 以状态历史和候选 Action Chunk 为输入，以该动作区间的真实 DR / Topple / Fall 作为监督标签；失败轨迹也可保留。
 
-计算监督标签所用的未来物体 Pose **不能**泄漏进模型输入。当前仓库提供的是转换函数和切片函数，并未提交完整的 PyTorch Dataset/DataLoader 或模型训练实现。
+计算监督标签所用的未来物体 Pose **不能**泄漏进模型输入。模型训练入口见第 10 节。Vanilla DP 按 ManiSkill 的预测时域构造样本；Predictor 仍使用这里的 2 步观测和 12 步动作窗口。
 
 ## 7. 验证与数据质量检查
 
@@ -348,3 +348,17 @@ python scripts/collect.py \
 ---
 
 **团队建议：** 将本文件作为仓库根目录的 `README.md`。此前根目录和子目录的部分说明仍描述早期 v1 架构及手动 `--plan-variants`，以本文档与实际 `main` 代码为准。正式采集遇到错误时，优先提供 `git rev-parse HEAD`、完整命令、终端报错及对应数据目录的 `scenes.jsonl` / `trajectories.jsonl`。
+
+## 10. 模型训练与评估
+
+Vanilla DP 和 Disturbance Predictor 各自独立，代码在 `model/vanilla_dp` 与 `model/predictor`。删除 `baselines/` 不影响二者运行。Vanilla DP 的网络、损失和采样跟随 ManiSkill commit `62ff3a5896b4d5b4cf0ac4c8d79afe600c9404a3` 的 state Diffusion Policy。动作是绝对 `pd_joint_pos`，训练前会线性映射到 `[-1, 1]`，执行前再映射回来。
+
+```bash
+python scripts/train_dp.py --dataset demos/dense_random --output-dir runs/vanilla_dp --total-iters 1000
+python scripts/train_predictor.py --dataset demos/dense_random --output-dir runs/predictor
+python scripts/eval_dp.py --dataset demos/dense_random --checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt --output-dir runs/vanilla_dp_eval --safe-dr-mean-max 0.2 --no-video
+```
+
+三处都会在当前 Python 能看到 CUDA 时使用 GPU，否则使用 CPU。强制 CPU：DP 训练加 `--no-cuda`，Predictor 和评估加 `--device cpu`。物理回放仍由 ManiSkill 执行；评估时 GPU 只运行策略网络。
+
+第一次训练会在数据集目录写入 `split.json`。评估只回放其中的 test scenes，并且需要 ManiSkill。`--total-iters` 的上游默认值是 1000000；上面的 1000 只是一次短训练。

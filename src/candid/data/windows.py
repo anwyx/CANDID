@@ -1,7 +1,9 @@
-"""Shared sliding-window rules for Vanilla DP and Predictor datasets.
+"""Model-neutral sliding windows over a recorded trajectory.
 
-This module contains NO physical simulator dependencies. It accepts already
-loaded arrays, with per-time observation dictionary arrays aligned to actions.
+This module contains no simulator and no neural network. A caller chooses the
+observation history and the action-chunk length. The disturbance predictor uses
+the defaults, history 2 and chunk 12. Vanilla DP does not train on these
+windows; it builds the ManiSkill prediction horizon in its own dataset adapter.
 """
 from __future__ import annotations
 import numpy as np
