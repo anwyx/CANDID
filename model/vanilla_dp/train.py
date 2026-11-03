@@ -30,6 +30,8 @@ from diffusers.optimization import get_scheduler
 from model.vanilla_dp.checkpoint import save_checkpoint
 from model.vanilla_dp.config import DPConfig
 from model.vanilla_dp.dataset import DiffusionWindowDataset
+from model.vanilla_dp.paired_dataset import PairedDiffusionWindowDataset
+from model.vanilla_dp.temporal_loss import compute_temporal_losses
 from model.vanilla_dp.ema import EMAModel
 from model.vanilla_dp.normalizer import fit_action_normalizer
 from model.vanilla_dp.policy import Agent
@@ -96,6 +98,16 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
     validation_dataset = DiffusionWindowDataset(
         trajectories, split["validation"], config.obs_horizon, config.pred_horizon
     )
+    regularized = (config.delta_loss_weight > 0 or config.overlap_loss_weight > 0)
+    if regularized:
+        optimization_dataset = PairedDiffusionWindowDataset(
+            dataset, stride=config.overlap_stride, act_horizon=config.act_horizon
+        )
+        print(f'temporal training: {len(optimization_dataset)} paired windows, '
+              f'delta={config.delta_loss_weight}, overlap={config.overlap_loss_weight}, '
+              f'stride={config.overlap_stride}', flush=True)
+    else:
+        optimization_dataset = dataset
     validation_loader, validation_count = make_validation_loader(
         validation_dataset, config.val_batch_size, config.val_max_windows, config.seed + 17
     )
@@ -116,14 +128,17 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
         num_warmup_steps=warmup,
         num_training_steps=config.total_iters,
     )
-    batch_size = min(config.batch_size, len(dataset))
-    drop_last = len(dataset) >= config.batch_size
-    sampler = RandomSampler(dataset, replacement=False)
+    # Each pair contains two windows. Keep ~the same number of network
+    # windows/update as the original batch_size for a fairer comparison.
+    requested_batch_size = max(1, config.batch_size // 2) if regularized else config.batch_size
+    batch_size = min(requested_batch_size, len(optimization_dataset))
+    drop_last = len(optimization_dataset) >= requested_batch_size
+    sampler = RandomSampler(optimization_dataset, replacement=False)
     batch_sampler = _IterationBasedBatchSampler(
         BatchSampler(sampler, batch_size=batch_size, drop_last=drop_last),
         config.total_iters,
     )
-    loader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=0)
+    loader = DataLoader(optimization_dataset, batch_sampler=batch_sampler, num_workers=0)
 
     agent.train()
     ema_agent.eval()
@@ -131,6 +146,7 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
     history = []
     train_loss_sum = 0.0
     train_sample_count = 0
+    train_component_sums = {"noise": 0.0, "delta": 0.0, "overlap": 0.0}
     best_val_loss = float("inf")
     best_iteration = None
     best_checkpoint = output_dir / "checkpoints" / "best_val.pt"
@@ -138,12 +154,30 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
     loss_png = output_dir / "loss_curve.png"
     loss_csv.parent.mkdir(parents=True, exist_ok=True)
     csv_file = loss_csv.open("w", encoding="utf-8", newline="")
-    writer = csv.DictWriter(csv_file, fieldnames=("iteration", "train_loss", "val_loss", "lr"))
+    writer = csv.DictWriter(csv_file, fieldnames=(
+        "iteration", "train_loss", "train_noise_loss", "train_delta_loss",
+        "train_overlap_loss", "val_loss", "lr"
+    ))
     writer.writeheader()
     for iteration, batch in enumerate(loader):
         observations = batch["observations"].to(device)
         actions = normalizer.normalize(batch["actions"].to(device))
-        loss = agent.compute_loss(observations, actions)
+        if regularized:
+            next_observations = batch["next_observations"].to(device)
+            next_actions = normalizer.normalize(batch["next_actions"].to(device))
+            parts = compute_temporal_losses(
+                agent, observations, actions, next_observations, next_actions,
+                stride=config.overlap_stride,
+                max_timestep=config.regularization_max_timestep,
+            )
+            loss = (parts["noise"]
+                    + config.delta_loss_weight * parts["delta"]
+                    + config.overlap_loss_weight * parts["overlap"])
+        else:
+            noise_loss = agent.compute_loss(observations, actions)
+            parts = {"noise": noise_loss, "delta": noise_loss * 0.0,
+                     "overlap": noise_loss * 0.0}
+            loss = noise_loss
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -154,6 +188,8 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
         batch_count = observations.shape[0]
         train_loss_sum += current_loss * batch_count
         train_sample_count += batch_count
+        for name in train_component_sums:
+            train_component_sums[name] += float(parts[name].detach().cpu()) * batch_count
         step = iteration + 1
         if step % config.eval_freq == 0 or step == config.total_iters:
             ema.copy_to(ema_agent.parameters())
@@ -161,6 +197,9 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
                 ema_agent, validation_loader, normalizer, device, config.seed + 10000
             )
             row = {"iteration": step, "train_loss": train_loss_sum / train_sample_count,
+                   "train_noise_loss": train_component_sums["noise"] / train_sample_count,
+                   "train_delta_loss": train_component_sums["delta"] / train_sample_count,
+                   "train_overlap_loss": train_component_sums["overlap"] / train_sample_count,
                    "val_loss": val_loss, "lr": optimizer.param_groups[0]["lr"]}
             history.append(row)
             writer.writerow(row)
@@ -173,6 +212,7 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
                 print(f"new best: iteration {step}, validation={val_loss:.6f}", flush=True)
             train_loss_sum = 0.0
             train_sample_count = 0
+            train_component_sums = {"noise": 0.0, "delta": 0.0, "overlap": 0.0}
         if iteration % config.log_freq == 0 or iteration + 1 == config.total_iters:
             print(
                 f"vanilla_dp iter {iteration}: loss={losses[-1]:.6f} "
@@ -230,6 +270,10 @@ def main(argv=None):
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--no-cuda", action="store_true")
+    parser.add_argument("--delta-loss-weight", type=float, default=0.0)
+    parser.add_argument("--overlap-loss-weight", type=float, default=0.0)
+    parser.add_argument("--overlap-stride", type=int, default=4)
+    parser.add_argument("--regularization-max-timestep", type=int, default=20)
     args = parser.parse_args(argv)
     config = DPConfig(
         obs_horizon=args.obs_horizon,
@@ -247,6 +291,10 @@ def main(argv=None):
         cuda=not args.no_cuda,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
+        delta_loss_weight=args.delta_loss_weight,
+        overlap_loss_weight=args.overlap_loss_weight,
+        overlap_stride=args.overlap_stride,
+        regularization_max_timestep=args.regularization_max_timestep,
     )
     result = train_vanilla_dp(args.dataset, args.output_dir, config)
     print(f"checkpoint: {result['checkpoint']}")

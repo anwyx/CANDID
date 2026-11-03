@@ -39,14 +39,17 @@ def plot_loss_history(history, path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     x = [row["iteration"] for row in history]
-    tr = [row["train_loss"] for row in history]
+    tr = [row.get("train_noise_loss", row["train_loss"]) for row in history]
     va = [row["val_loss"] for row in history]
     best = min(range(len(history)), key=lambda i: va[i])
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(x, tr, label="Train loss (interval mean)")
-    ax.plot(x, va, label="Validation loss (EMA, fixed windows/noise)")
+    ax.plot(x, tr, label="Train DDPM noise MSE (interval mean)")
+    ax.plot(x, va, label="Validation DDPM noise MSE (EMA)")
+    if "train_noise_loss" in history[0]:
+        ax.plot(x, [row["train_loss"] for row in history],
+                label="Train total objective", linestyle="--", alpha=0.65)
     ax.scatter([x[best]], [va[best]], label="Best validation")
-    ax.set(xlabel="Iteration", ylabel="Diffusion noise prediction MSE", title="Vanilla DP losses")
+    ax.set(xlabel="Iteration", ylabel="Loss", title="DP training and validation losses")
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
