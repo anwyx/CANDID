@@ -1,0 +1,21 @@
+name: CANDID baseline smoke
+on:
+  push:
+    branches:
+      - feat/maniskill-four-baselines
+  workflow_dispatch:
+
+jobs:
+  static-and-export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Compile imported baseline sources
+        run: python -m compileall -q baselines tests/test_baselines_contract.py
+      - name: Install CPU data-test dependencies
+        run: python -m pip install numpy h5py pytest torch
+      - name: Frozen train-demo export smoke test
+        run: PYTHONPATH=.:src python -m pytest -q tests/test_baselines_contract.py -k demo_export
