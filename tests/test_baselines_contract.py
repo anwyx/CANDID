@@ -113,9 +113,12 @@ def test_cpu_vector_wrapper_exposes_canonical_observation_space():
             return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
     wrapped = restore_cpu_canonical_space(DummyCPU(), canonical)
     assert wrapped.observation_space.shape == (4,)
-    with gym.vector.SyncVectorEnv([lambda: wrapped]) as vector:
+    vector = gym.vector.SyncVectorEnv([lambda: wrapped])
+    try:
         obs, _ = vector.reset()
         assert obs.shape == (1, 4)
+    finally:
+        vector.close()
 
 
 def test_cpu_imitation_wrapper_vector_reset_contract():
@@ -156,12 +159,15 @@ def test_cpu_imitation_wrapper_vector_reset_contract():
             ignore_terminations=True, record_metrics=True
         )
 
-    with gym.vector.SyncVectorEnv([make]) as envs:
+    envs = gym.vector.SyncVectorEnv([make])
+    try:
         assert isinstance(envs.single_observation_space, gym.spaces.Box)
         obs, _ = envs.reset()
         assert obs.shape == (1, 4)
         obs, *_ = envs.step(np.zeros((1, 7), dtype=np.float32))
         assert obs.shape == (1, 4)
+    finally:
+        envs.close()
 
 
 def test_act_and_bc_cpu_make_env_use_space_repair():
