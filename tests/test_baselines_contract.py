@@ -116,3 +116,58 @@ def test_cpu_vector_wrapper_exposes_canonical_observation_space():
     with gym.vector.SyncVectorEnv([lambda: wrapped]) as vector:
         obs, _ = vector.reset()
         assert obs.shape == (1, 4)
+
+
+def test_cpu_imitation_wrapper_vector_reset_contract():
+    """Reproduce CPUGymWrapper's Dict-space overwrite, then vector reset.
+
+    Does not require ManiSkill/SAPIEN: the fake wrapper reproduces its
+    relevant reset/space behavior, and ensures the common adapter repairs it.
+    """
+    gym = pytest.importorskip("gymnasium")
+    from baselines.common.candid_env import wrap_cpu_canonical_state
+
+    old_space = gym.spaces.Dict({
+        "extra": gym.spaces.Box(-1, 1, (2,), dtype=np.float32),
+    })
+    canonical = gym.spaces.Box(-np.inf, np.inf, (4,), dtype=np.float32)
+
+    class FakeCanonical(gym.Env):
+        def __init__(self):
+            self.single_observation_space = canonical
+            self.observation_space = gym.spaces.Box(-np.inf, np.inf, (1, 4), dtype=np.float32)
+            self.action_space = gym.spaces.Box(-1, 1, (7,), dtype=np.float32)
+            self.base_raw_space = old_space
+
+        def reset(self, *, seed=None, options=None):
+            return np.zeros(4, dtype=np.float32), {}
+
+        def step(self, action):
+            return np.ones(4, dtype=np.float32), 0.0, False, False, {}
+
+    class FakeCPUGymWrapper(gym.Wrapper):
+        def __init__(self, env, ignore_terminations=False, record_metrics=False):
+            super().__init__(env)
+            self.observation_space = env.base_raw_space
+
+    def make():
+        return wrap_cpu_canonical_state(
+            FakeCanonical(), FakeCPUGymWrapper,
+            ignore_terminations=True, record_metrics=True
+        )
+
+    with gym.vector.SyncVectorEnv([make]) as envs:
+        assert isinstance(envs.single_observation_space, gym.spaces.Box)
+        obs, _ = envs.reset()
+        assert obs.shape == (1, 4)
+        obs, *_ = envs.step(np.zeros((1, 7), dtype=np.float32))
+        assert obs.shape == (1, 4)
+
+
+def test_act_and_bc_cpu_make_env_use_space_repair():
+    """Prevent a repeat of the prior bug: helper existed but was never called."""
+    root = ROOT / "baselines"
+    for rel in ("bc/behavior_cloning/make_env.py", "act/act/make_env.py"):
+        source = (root / rel).read_text(encoding="utf-8")
+        assert "wrap_cpu_canonical_state(" in source, rel
+        assert "env = CPUGymWrapper(env," not in source, rel

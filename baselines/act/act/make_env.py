@@ -5,7 +5,7 @@ import mani_skill.envs
 from mani_skill.utils import gym_utils
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 from mani_skill.utils.wrappers import RecordEpisode, CPUGymWrapper
-from baselines.common.candid_env import CanonicalStateWrapper, restore_cpu_canonical_space
+from baselines.common.candid_env import CanonicalStateWrapper, wrap_cpu_canonical_state
 
 
 def make_eval_envs(env_id, num_envs: int, sim_backend: str, env_kwargs: dict, other_kwargs: dict, video_dir: Optional[str] = None, wrappers: list[gym.Wrapper] = []):
@@ -28,7 +28,9 @@ def make_eval_envs(env_id, num_envs: int, sim_backend: str, env_kwargs: dict, ot
                 env = CanonicalStateWrapper(env)
                 for wrapper in wrappers:
                     env = wrapper(env)
-                env = CPUGymWrapper(env, ignore_terminations=True, record_metrics=True)
+                env = wrap_cpu_canonical_state(
+                    env, CPUGymWrapper, ignore_terminations=True, record_metrics=True
+                )
                 if video_dir:
                     env = RecordEpisode(env, output_dir=video_dir, save_trajectory=False, info_on_video=True, source_type="act", source_desc="act evaluation rollout")
                 env.action_space.seed(seed)

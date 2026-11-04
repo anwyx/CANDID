@@ -16,6 +16,6 @@ jobs:
       - name: Compile imported baseline sources
         run: python -m compileall -q baselines tests/test_baselines_contract.py
       - name: Install CPU data-test dependencies
-        run: python -m pip install numpy h5py pytest torch
+        run: python -m pip install numpy h5py pytest torch gymnasium
       - name: Frozen train-demo export smoke test
-        run: PYTHONPATH=.:src python -m pytest -q tests/test_baselines_contract.py -k 'demo_export or act_ema'
+        run: PYTHONPATH=.:src python -m pytest -q tests/test_baselines_contract.py -k 'demo_export or act_ema or cpu_imitation_wrapper or cpu_vector_wrapper or act_and_bc_cpu_make_env'

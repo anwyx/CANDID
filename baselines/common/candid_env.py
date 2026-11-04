@@ -84,3 +84,17 @@ def restore_cpu_canonical_space(cpu_env, canonical_space):
         raise TypeError("CPU canonical observation space must be a flat Box")
     cpu_env.observation_space = canonical_space
     return cpu_env
+
+
+def wrap_cpu_canonical_state(env, cpu_wrapper_cls, **kwargs):
+    """Wrap a CANDID canonical-state env with the official ManiSkill CPU wrapper.
+
+    CPUGymWrapper replaces observation_space with the raw unwrapped env's
+    state_dict Dict. Restore the flat [D] Box immediately after construction,
+    BEFORE gym.vector.SyncVectorEnv examines the space.
+    """
+    flat_space = env.single_observation_space
+    if not isinstance(flat_space, gym.spaces.Box) or len(flat_space.shape) != 1:
+        raise TypeError(f"Expected flat canonical single_observation_space, got {flat_space}")
+    wrapped = cpu_wrapper_cls(env, **kwargs)
+    return restore_cpu_canonical_space(wrapped, flat_space)
