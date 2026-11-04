@@ -93,3 +93,26 @@ def test_act_ema_matches_upstream_default_decay():
     ema.copy_to([destination])
     expected = (2.0 / 11.0) * 2.0 + (9.0 / 11.0) * 4.0
     assert torch.allclose(destination, torch.tensor([expected]))
+
+
+def test_cpu_vector_wrapper_exposes_canonical_observation_space():
+    """Regression: CPUGymWrapper must not expose its base state_dict space."""
+    gym = pytest.importorskip("gymnasium")
+    from baselines.common.candid_env import restore_cpu_canonical_space
+
+    raw_space = gym.spaces.Dict({
+        "agent": gym.spaces.Dict({"qpos": gym.spaces.Box(-1, 1, (2,), dtype=np.float32)})
+    })
+    canonical = gym.spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32)
+    class DummyCPU(gym.Env):
+        observation_space = raw_space
+        action_space = gym.spaces.Box(-1, 1, (2,), dtype=np.float32)
+        def reset(self, *, seed=None, options=None):
+            return np.zeros(4, dtype=np.float32), {}
+        def step(self, action):
+            return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
+    wrapped = restore_cpu_canonical_space(DummyCPU(), canonical)
+    assert wrapped.observation_space.shape == (4,)
+    with gym.vector.SyncVectorEnv([lambda: wrapped]) as vector:
+        obs, _ = vector.reset()
+        assert obs.shape == (1, 4)

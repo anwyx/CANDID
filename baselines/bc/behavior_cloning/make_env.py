@@ -5,7 +5,7 @@ import mani_skill.envs
 from mani_skill.utils import gym_utils
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 from mani_skill.utils.wrappers import RecordEpisode, CPUGymWrapper
-from baselines.common.candid_env import CanonicalStateWrapper
+from baselines.common.candid_env import CanonicalStateWrapper, restore_cpu_canonical_space
 
 
 def make_eval_envs(env_id, num_envs: int, sim_backend: str, env_kwargs: dict, video_dir: Optional[str] = None, wrappers: list[gym.Wrapper] = []):

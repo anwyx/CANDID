@@ -71,3 +71,16 @@ class CanonicalStateWrapper(gym.ObservationWrapper):
         value = canonical_live(observation, self.n_distractors)
         return torch.as_tensor(value, dtype=torch.float32,
                                device=self.env.unwrapped.device)
+
+
+def restore_cpu_canonical_space(cpu_env, canonical_space):
+    """Restore the flat observation declaration overwritten by CPUGymWrapper.
+
+    ManiSkill CPUGymWrapper exposes base_env.single_observation_space, which
+    is the raw state_dict (Dict) even after CanonicalStateWrapper has converted
+    observations to a flat state. Gym's SyncVectorEnv requires these to match.
+    """
+    if not isinstance(canonical_space, gym.spaces.Box) or len(canonical_space.shape) != 1:
+        raise TypeError("CPU canonical observation space must be a flat Box")
+    cpu_env.observation_space = canonical_space
+    return cpu_env
