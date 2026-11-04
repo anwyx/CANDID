@@ -292,7 +292,7 @@ if __name__ == "__main__":
         print(f"Epoch: {iteration}, global_step={global_step}")
         final_values = torch.zeros((args.num_steps, args.num_envs), device=device)
         agent.eval()
-        if iteration % args.eval_freq == 1:
+        if args.eval_freq > 0 and iteration % args.eval_freq == 1:
             print("Evaluating")
             eval_obs, _ = eval_envs.reset()
             eval_metrics = defaultdict(list)
@@ -313,7 +313,7 @@ if __name__ == "__main__":
                 print(f"eval_{k}_mean={mean}")
             if args.evaluate:
                 break
-        if args.save_model and iteration % args.eval_freq == 1:
+        if args.save_model and args.eval_freq > 0 and iteration % args.eval_freq == 1:
             model_path = f"runs/{run_name}/ckpt_{iteration}.pt"
             torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")

@@ -22,7 +22,7 @@ from candid.data.adapter import canonical_observation, observation_vector
 from candid.data.splits import load_or_create_scene_split
 
 
-def export_demos(dataset_root, output_path, success_only=True, seed=0):
+def export_demos(dataset_root, output_path, success_only=True, seed=0, max_trajectories=None):
     root = Path(dataset_root)
     out = Path(output_path)
     if out.suffix != ".h5":
@@ -36,6 +36,10 @@ def export_demos(dataset_root, output_path, success_only=True, seed=0):
               (json.loads(s) for s in (root / "scenes.jsonl").read_text().splitlines() if s.strip())}
     rows = [row for row in rows if row["scene_id"] in allowed
             and row.get("saved_hdf5") and (row.get("task_success") or not success_only)]
+    if max_trajectories is not None:
+        if max_trajectories < 1:
+            raise ValueError("--max-trajectories must be positive")
+        rows = rows[:max_trajectories]
     if not rows:
         raise ValueError("No recorded training trajectories satisfy the filter")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -100,6 +104,7 @@ def export_demos(dataset_root, output_path, success_only=True, seed=0):
             ],
             "env_info_is_representative": True,
             "success_only": bool(success_only),
+            "max_trajectories": max_trajectories,
             "observation_dim": observation_dim, "action_dim": action_dim,
             "observation_fields": "candid.data.adapter.OBSERVATION_FIELDS",
         },
@@ -115,9 +120,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--include-failures", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max-trajectories", type=int, default=None,
+                        help="Export only the first N eligible TRAIN trajectories for quick CPU smoke tests")
     args = parser.parse_args()
     print(export_demos(args.dataset, args.output,
-                       success_only=not args.include_failures, seed=args.seed))
+                       success_only=not args.include_failures, seed=args.seed,
+                       max_trajectories=args.max_trajectories))
 
 
 if __name__ == "__main__":

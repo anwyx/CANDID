@@ -21,8 +21,8 @@ def test_demo_export_frozen_split(tmp_path):
     import h5py
     root = write_synthetic_dataset(tmp_path / "data")
     output = tmp_path / "bc_train.h5"
-    summary = export_demos(root, output)
-    assert summary["trajectories"] > 0
+    summary = export_demos(root, output, max_trajectories=2)
+    assert summary["trajectories"] == 2
     assert summary["action_dim"] == 7
     with h5py.File(output, "r") as f:
         assert f["traj_0/actions"].shape[1] == 7
@@ -31,6 +31,7 @@ def test_demo_export_frozen_split(tmp_path):
     metadata = json.loads(output.with_suffix(".json").read_text())
     assert metadata["candid"]["source_environments"]
     assert metadata["candid"]["env_info_is_representative"] is True
+    assert metadata["candid"]["max_trajectories"] == 2
     with pytest.raises(FileExistsError):
         export_demos(root, output)
 

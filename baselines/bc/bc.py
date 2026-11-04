@@ -348,7 +348,7 @@ if __name__ == "__main__":
             )
             writer.add_scalar("losses/total_loss", loss.item(), iteration)
 
-        if iteration % args.eval_freq == 0:
+        if args.eval_freq > 0 and iteration % args.eval_freq == 0:
             actor.eval()
 
             def sample_fn(obs):

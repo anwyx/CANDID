@@ -159,6 +159,139 @@ task reward still require proper validation and tuning. ACT/BC `--total-iters`
 counts gradient updates, PPO/SAC `--total-timesteps` counts interactions.
 Report both training timesteps and wall-clock costs.
 
+## Extremely small CPU smoke test using `ring_120`
+
+This checks **one model update and generation of finite actions**, not success,
+convergence, or fairness. `demos/merged_all` is NOT required.
+
+Keep any locally created `envs/candid_ring_env.py` importable. The dataset
+alone contains recorded states and does not register the source Gym env.
+
+```bash
+cd /workspace/CANDID
+export PYTHONPATH="$PWD:$PWD/src"
+test -f demos/ring_120/scenes.jsonl
+python - <<'PY'
+import json
+from pathlib import Path
+p = Path("demos/ring_120/scenes.jsonl")
+rows = [json.loads(line) for line in p.read_text().splitlines() if line.strip()]
+print("RING ENVIRONMENTS:")
+for env_id, module in sorted({(r["env_id"], r["env_module"]) for r in rows}):
+    print(env_id, module)
+PY
+```
+
+Set the actual environment ID/module from the displayed data. For the commonly
+used Ring environment these are `CANDIDRing-v1` and
+`envs.candid_ring_env`, but **verify the metadata**, and don't assume its
+module exists in GitHub if it was only created locally.
+
+```bash
+export ENV_ID=CANDIDRing-v1
+export ENV_MODULE=envs.candid_ring_env
+# fail early if the env module was deleted locally:
+python -c "import importlib; importlib.import_module('$ENV_MODULE')"
+python baselines/common/export_demos.py \
+  --dataset demos/ring_120 \
+  --output demos/ring_smoke_train.h5 \
+  --max-trajectories 2
+```
+
+The exporter reads only successful demonstrations in the TRAIN split. If
+`ring_smoke_train.h5` already exists, choose a new output name.
+
+BC: **one optimizer update**, no online evaluation:
+
+```bash
+python baselines/bc/bc.py \
+  --env-id "$ENV_ID" --env-module "$ENV_MODULE" \
+  --demo-path demos/ring_smoke_train.h5 --no-cuda \
+  --sim-backend cpu --control-mode pd_joint_pos \
+  --num-demos 2 --batch-size 2 --total-iters 1 \
+  --max-episode-steps 10 --num-eval-envs 1 \
+  --eval-freq 0 --save-freq 1 --log-freq 1 \
+  --no-capture-video --exp-name ring_smoke_bc
+```
+
+ACT: **one optimizer update**, tiny Transformer for a *smoke test only*
+(the formal ACT baseline must restore its original architecture):
+
+```bash
+python baselines/act/train.py \
+  --env-id "$ENV_ID" --env-module "$ENV_MODULE" \
+  --demo-path demos/ring_smoke_train.h5 --no-cuda \
+  --sim-backend cpu --control-mode pd_joint_pos \
+  --num-demos 2 --batch-size 2 --total-iters 1 \
+  --num-queries 2 --hidden-dim 64 --nheads 2 \
+  --enc-layers 1 --dec-layers 1 --dim-feedforward 128 \
+  --max-episode-steps 10 --num-eval-envs 1 \
+  --eval-freq 0 --save-freq 1 --log-freq 1 \
+  --no-capture-video --exp-name ring_smoke_act
+```
+
+PPO: **four real environment steps**, one update. CANDID currently supports
+only one CPU simulation environment:
+
+```bash
+python baselines/ppo/ppo.py \
+  --env-id "$ENV_ID" --env-module "$ENV_MODULE" \
+  --no-cuda --sim-backend cpu --control-mode pd_joint_pos \
+  --num-envs 1 --num-eval-envs 1 --num-steps 4 \
+  --num-minibatches 2 --update-epochs 1 --total-timesteps 4 \
+  --eval-freq 0 --no-capture-video --exp-name ring_smoke_ppo
+```
+
+SAC: **four real environment steps**, one Q/Actor update (not just random
+collection):
+
+```bash
+python baselines/sac/sac.py \
+  --env-id "$ENV_ID" --env-module "$ENV_MODULE" \
+  --no-cuda --sim-backend cpu --control-mode pd_joint_pos \
+  --num-envs 1 --num-eval-envs 1 --buffer-device cpu \
+  --buffer-size 64 --batch-size 4 --learning-starts 1 \
+  --training-freq 4 --utd 0.25 --total-timesteps 4 \
+  --eval-freq 0 --log-freq 4 --no-capture-video \
+  --exp-name ring_smoke_sac
+```
+
+**Generate actions without another simulator rollout**:
+
+```bash
+for method in bc act ppo sac; do
+  case "$method" in
+    bc)  ckpt=runs/ring_smoke_bc/checkpoints/0.pt ;;
+    act) ckpt=runs/ring_smoke_act/checkpoints/0.pt ;;
+    ppo) ckpt=runs/ring_smoke_ppo/final_ckpt.pt ;;
+    sac) ckpt=runs/ring_smoke_sac/final_ckpt.pt ;;
+  esac
+  python baselines/common/smoke_actions.py \
+    --method "$method" --demo-path demos/ring_smoke_train.h5 \
+    --checkpoint "$ckpt" --output "runs/ring_smoke_${method}/actions.npy"
+done
+```
+
+A `passed: true` for all four confirms weights were saved, reloaded, and
+produced finite `[H,7]` actions from a recorded Ring observation. It **does
+not** prove those actions solve the task. For a real 1-scene closed-loop
+rollout use `baselines/common/eval_baseline.py --dataset demos/ring_120
+--max-scenes 1 --max-steps 10`, with an agreed safety threshold, after
+verifying the source scene's environment module is available.
+
+### Pitfalls
+
+- `--eval-freq 0` disables slow training-time evaluations in ACT/BC/PPO/SAC;
+  checkpoints are still saved by the smoke commands.
+- Two demonstrations have **very little training signal** and must never be
+  used to compare success rates or publish metrics.
+- PPO/SAC randomize Ring environment resets; they do **not** replay the
+  `ring_120` dataset, or enforce a held-out train scene set.
+- The policy action generator uses a recorded Ring state; it doesn't require
+  rendering, state restoration, or another simulation rollout.
+- Avoid reusing prior `--exp-name`/output paths if you want to keep old
+  checkpoints intact.
+
 ## Held-out evaluation (the same protocol for all four)
 
 ```bash
