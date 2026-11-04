@@ -56,7 +56,7 @@ def test_ppo_sac_actor_network_shapes():
 
 def test_act_state_model_forward():
     pytest.importorskip("gymnasium")
-    pytest.importorskip("diffusers")
+    pytest.importorskip("mani_skill")
     from baselines.act.train import Agent, Args
     fake = SimpleNamespace(
         single_observation_space=SimpleNamespace(shape=(24,)),
@@ -67,3 +67,24 @@ def test_act_state_model_forward():
     with torch.no_grad():
         action = model.get_action(torch.zeros((1, 24)))
     assert action.shape == (1, 8, 7)
+
+
+def test_act_ema_matches_upstream_default_decay():
+    """ACT's EMA must preserve diffusers 0.32.2 non-warmup behavior."""
+    from baselines.act.ema import EMAModel
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+    ema = EMAModel([parameter], power=0.75)
+    with torch.no_grad():
+        parameter.fill_(2.0)
+    ema.step([parameter])
+    assert ema.get_decay(1) == 0.0
+
+    with torch.no_grad():
+        parameter.fill_(4.0)
+    ema.step([parameter])
+    assert np.isclose(ema.get_decay(2), 2.0 / 11.0)
+    destination = torch.nn.Parameter(torch.zeros_like(parameter))
+    ema.copy_to([destination])
+    expected = (2.0 / 11.0) * 2.0 + (9.0 / 11.0) * 4.0
+    assert torch.allclose(destination, torch.tensor([expected]))

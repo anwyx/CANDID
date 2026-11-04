@@ -17,7 +17,7 @@ guidance. All final results must use CANDID's **frozen test scenes** and shared
 
 Core losses, networks, and optimization remain from ManiSkill. CANDID changes
 include env registration, observation adaptation, control mode, CPU defaults,
-dataset export, ACT's broken upstream stats method, BC normalization-at-eval,
+dataset export, ACT's broken upstream stats method, a standalone diffusers-compatible EMA to avoid unnecessary torchvision imports, BC normalization-at-eval,
 action-space-aware SAC random exploration, and a shared test evaluator.
 **Do not cite any benchmark numbers until end-to-end ManiSkill simulator tests
 have been performed.**

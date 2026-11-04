@@ -30,7 +30,7 @@ from torch.utils.data.sampler import RandomSampler, BatchSampler
 from torch.utils.data.dataloader import DataLoader
 from act.utils import IterationBasedBatchSampler, worker_init_fn
 from act.make_env import make_eval_envs
-from diffusers.training_utils import EMAModel
+from baselines.act.ema import EMAModel
 from act.detr.transformer import build_transformer
 from act.detr.detr_vae import build_encoder, DETRVAE
 from dataclasses import dataclass, field
