@@ -19,7 +19,7 @@ def test_demo_export_frozen_split(tmp_path):
     from candid.data.synthetic import write_synthetic_dataset
     from baselines.common.export_demos import export_demos
     import h5py
-    root = write_synthetic_dataset(tmp_path / "data")
+    root = write_synthetic_dataset(tmp_path / "data", num_scenes=6)
     output = tmp_path / "bc_train.h5"
     summary = export_demos(root, output, max_trajectories=2)
     assert summary["trajectories"] == 2
