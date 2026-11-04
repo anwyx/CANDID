@@ -60,11 +60,49 @@ python baselines/common/export_demos.py \
   --output demos/candid_baselines_train.h5
 ```
 
-The exporter reads **train scenes only**, and emits a flattened
+The exporter reads **train scenes only** (potentially across different source environments), and emits a flattened
 `traj_N/obs [T+1,D]`, `actions [T,7]`, `success [T]` HDF5 along with
-ManiSkill-compatible `.json` metadata. It refuses to overwrite existing
+ManiSkill-compatible `.json` metadata. The exported `env_info.env_id` is a representative first-training-scene environment only, not evidence of a single source environment; `candid.source_environments` lists all source environments. It refuses to overwrite existing
 exports. Datasets with distinct scene geometries must keep identical feature
 dimensions, and all training trajectories must use `pd_joint_pos`.
+
+## Identify the real environment before training
+
+`demos/merged_all` is a **dataset**, not a Gym environment. Its scenes may come
+from multiple teammate environment modules. Inspect its metadata first:
+
+```bash
+python - <<'PY'
+import json
+from collections import Counter
+from pathlib import Path
+root = Path("demos/merged_all")
+rows = [json.loads(line) for line in (root/"scenes.jsonl").read_text().splitlines() if line.strip()]
+split = json.loads((root/"split.json").read_text())
+for split_name in ("train", "validation", "test"):
+    selected = set(split[split_name])
+    counter = Counter((r["env_id"], r["env_module"]) for r in rows if r["scene_id"] in selected)
+    print(split_name, dict(counter))
+PY
+```
+
+Choose a **real, importable** pair from the TRAIN split, for example:
+
+```bash
+export ENV_ID='ACTUAL_ENV_ID_FROM_METADATA'
+export ENV_MODULE='envs.actual_env_module_from_metadata'
+```
+
+BC/ACT may imitate mixed-environment training demonstrations only when their
+canonical observation and action contracts are identical. Their built-in online
+training-time evaluation picks the single environment provided by `ENV_ID` /
+`ENV_MODULE`; this is not the frozen test evaluation.
+
+PPO/SAC train **online**, so a single chosen `ENV_ID`/`ENV_MODULE` does not
+automatically cover a merged multi-environment dataset. In particular, do NOT
+call a baseline `merged_all`-trained RL agent until an explicit train-scene
+sampling mechanism exists. The final held-out evaluator reconstructs each
+recorded test scene from its own metadata and snapshot.
 
 ## Training examples
 
@@ -72,7 +110,7 @@ dimensions, and all training trajectories must use `pd_joint_pos`.
 
 ```bash
 python baselines/bc/bc.py --demo-path demos/candid_baselines_train.h5 \
-  --env-id CANDIDBaseline-v1 --env-module envs.candid_baseline_env \
+  --env-id $ENV_ID --env-module $ENV_MODULE \
   --sim-backend cpu --control-mode pd_joint_pos --max-episode-steps 300 \
   --total-iters 10000 --batch-size 64 --num-eval-envs 1 --no-capture-video \
   --exp-name candid_bc
@@ -82,7 +120,7 @@ python baselines/bc/bc.py --demo-path demos/candid_baselines_train.h5 \
 
 ```bash
 python baselines/act/train.py --demo-path demos/candid_baselines_train.h5 \
-  --env-id CANDIDBaseline-v1 --env-module envs.candid_baseline_env \
+  --env-id $ENV_ID --env-module $ENV_MODULE \
   --sim-backend cpu --control-mode pd_joint_pos --max-episode-steps 300 \
   --total-iters 30000 --batch-size 64 --num-eval-envs 1 --num-queries 30 \
   --exp-name candid_act --no-capture-video
@@ -97,8 +135,8 @@ the final metrics.
 ### PPO (online RL)
 
 ```bash
-python baselines/ppo/ppo.py --env-id CANDIDBaseline-v1 \
-  --env-module envs.candid_baseline_env \
+python baselines/ppo/ppo.py --env-id $ENV_ID \
+  --env-module $ENV_MODULE \
   --control-mode pd_joint_pos --sim-backend cpu \
   --num-envs 1 --num-eval-envs 1 --num-minibatches 4 \
   --num-steps 64 --total-timesteps 200000 --no-capture-video \
@@ -108,8 +146,8 @@ python baselines/ppo/ppo.py --env-id CANDIDBaseline-v1 \
 ### SAC (online RL)
 
 ```bash
-python baselines/sac/sac.py --env-id CANDIDBaseline-v1 \
-  --env-module envs.candid_baseline_env \
+python baselines/sac/sac.py --env-id $ENV_ID \
+  --env-module $ENV_MODULE \
   --control-mode pd_joint_pos --sim-backend cpu \
   --num-envs 1 --num-eval-envs 1 --buffer-device cpu \
   --buffer-size 100000 --training-freq 64 --total-timesteps 200000 \

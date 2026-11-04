@@ -27,6 +27,10 @@ def test_demo_export_frozen_split(tmp_path):
     with h5py.File(output, "r") as f:
         assert f["traj_0/actions"].shape[1] == 7
         assert len(f["traj_0/obs"]) == len(f["traj_0/actions"]) + 1
+    import json
+    metadata = json.loads(output.with_suffix(".json").read_text())
+    assert metadata["candid"]["source_environments"]
+    assert metadata["candid"]["env_info_is_representative"] is True
     with pytest.raises(FileExistsError):
         export_demos(root, output)
 

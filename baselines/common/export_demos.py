@@ -79,6 +79,11 @@ def export_demos(dataset_root, output_path, success_only=True, seed=0):
         for handle in source_files.values():
             handle.close()
     first_scene = scenes[rows[0]["scene_id"]]
+    source_environments = {}
+    for row in rows:
+        source = scenes[row["scene_id"]]
+        source_key = (source["env_id"], source["env_module"])
+        source_environments[source_key] = source_environments.get(source_key, 0) + 1
     metadata = {
         "env_info": {
             "env_id": first_scene["env_id"],
@@ -88,6 +93,12 @@ def export_demos(dataset_root, output_path, success_only=True, seed=0):
         "candid": {
             "source_dataset": str(root), "split": "train",
             "split_sha256": split["dataset_sha256"],
+            "source_environments": [
+                {"env_id": env_id, "env_module": env_module,
+                 "num_trajectories": count}
+                for (env_id, env_module), count in sorted(source_environments.items())
+            ],
+            "env_info_is_representative": True,
             "success_only": bool(success_only),
             "observation_dim": observation_dim, "action_dim": action_dim,
             "observation_fields": "candid.data.adapter.OBSERVATION_FIELDS",
