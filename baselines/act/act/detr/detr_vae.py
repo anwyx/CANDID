@@ -11,8 +11,6 @@ from act.detr.transformer import build_transformer, TransformerEncoder, Transfor
 
 import numpy as np
 
-import IPython
-e = IPython.embed
 
 
 def reparametrize(mu, logvar):

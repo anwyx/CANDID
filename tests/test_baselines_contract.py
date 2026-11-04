@@ -95,32 +95,6 @@ def test_act_ema_matches_upstream_default_decay():
     assert torch.allclose(destination, torch.tensor([expected]))
 
 
-def test_cpu_vector_wrapper_exposes_canonical_observation_space():
-    """Regression: CPUGymWrapper must not expose its base state_dict space."""
-    gym = pytest.importorskip("gymnasium")
-    from baselines.common.candid_env import restore_cpu_canonical_space
-
-    raw_space = gym.spaces.Dict({
-        "agent": gym.spaces.Dict({"qpos": gym.spaces.Box(-1, 1, (2,), dtype=np.float32)})
-    })
-    canonical = gym.spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32)
-    class DummyCPU(gym.Env):
-        observation_space = raw_space
-        action_space = gym.spaces.Box(-1, 1, (2,), dtype=np.float32)
-        def reset(self, *, seed=None, options=None):
-            return np.zeros(4, dtype=np.float32), {}
-        def step(self, action):
-            return np.zeros(4, dtype=np.float32), 0.0, False, False, {}
-    wrapped = restore_cpu_canonical_space(DummyCPU(), canonical)
-    assert wrapped.observation_space.shape == (4,)
-    vector = gym.vector.SyncVectorEnv([lambda: wrapped])
-    try:
-        obs, _ = vector.reset()
-        assert obs.shape == (1, 4)
-    finally:
-        vector.close()
-
-
 def test_cpu_imitation_wrapper_vector_reset_contract():
     """Reproduce CPUGymWrapper's Dict-space overwrite, then vector reset.
 

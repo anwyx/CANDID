@@ -65,7 +65,7 @@ class Args:
     """logging frequency in terms of environment steps"""
 
     # Environment specific arguments
-    env_id: str = "PickCube-v1"
+    env_id: str = "CANDIDBaseline-v1"
     """the id of the environment"""
     env_vectorization: str = "gpu"
     """the type of environment vectorization to use"""
@@ -374,6 +374,7 @@ if __name__ == "__main__":
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
+    log_alpha = None  # No temperature parameter when --no-autotune is used.
     if args.autotune:
         target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
         log_alpha = torch.zeros(1, requires_grad=True, device=device)
