@@ -86,7 +86,7 @@ def export_demos(dataset_root, output_path, success_only=True, seed=0, max_traje
     source_environments = {}
     for row in rows:
         source = scenes[row["scene_id"]]
-        source_key = (source["env_id"], source["env_module"])
+        source_key = (source["env_id"], source.get("env_module"))
         source_environments[source_key] = source_environments.get(source_key, 0) + 1
     metadata = {
         "env_info": {
@@ -100,7 +100,7 @@ def export_demos(dataset_root, output_path, success_only=True, seed=0, max_traje
             "source_environments": [
                 {"env_id": env_id, "env_module": env_module,
                  "num_trajectories": count}
-                for (env_id, env_module), count in sorted(source_environments.items())
+                for (env_id, env_module), count in sorted(source_environments.items(), key=lambda item: (item[0][0], item[0][1] or ""))
             ],
             "env_info_is_representative": True,
             "success_only": bool(success_only),
