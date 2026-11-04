@@ -29,6 +29,11 @@ imageio>=2.34,<3.0
 imageio-ffmpeg>=0.5.1,<1.0
 pillow>=10,<13
 
+# Baseline training: CLI flags, TensorBoard logs, and progress bars
+tyro>=0.8,<1.0
+tensorboard>=2.14,<3.0
+tqdm>=4.66,<5.0
+
 # General runtime utilities and project tests
 pyyaml>=6,<7
 pytest>=8,<10
