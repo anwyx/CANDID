@@ -207,12 +207,9 @@ class TrajectoryBatchSampler:
         self.dataset = dataset
         self.batch_size = batch_size
         self.generator = torch.Generator().manual_seed(seed)
-        self.groups = []
         indices = dataset.indices[:, 0]
-        for trajectory_index in range(len(dataset.records)):
-            positions = np.flatnonzero(indices == trajectory_index)
-            if len(positions):
-                self.groups.append(positions)
+        _, starts, counts = np.unique(indices, return_index=True, return_counts=True)
+        self.groups = [np.arange(start, start + count) for start, count in zip(starts, counts)]
 
     def __len__(self):
         return sum((len(group) + self.batch_size - 1) // self.batch_size
