@@ -86,5 +86,5 @@ def test_predictor_trains_and_reloads_without_vanilla_dp(tmp_path):
         torch.zeros(1, config.obs_horizon, model.obs_dim),
         torch.zeros(1, config.action_horizon, ACTION_DIM),
     )
-    assert tuple(score.shape) == (1, 4)
-    assert torch.isfinite(score).all()
+    assert set(score) == {'dr_mean', 'dr_max', 'topple_prob', 'fall_prob'}
+    assert all(value.shape == (1,) and torch.isfinite(value).all() for value in score.values())
