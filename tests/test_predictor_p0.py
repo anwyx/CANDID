@@ -85,3 +85,18 @@ def test_predictor_validation_runs_on_last_step(tmp_path):
     assert [int(row["step"]) for row in rows] == [2, 3]
     assert all(row["val_loss"] for row in rows)
     assert result["best_step"] in (2, 3)
+
+
+def test_predictor_without_validation_saves_last_only(tmp_path):
+    data = write_synthetic_dataset(tmp_path / "data", num_scenes=3)
+    config = PredictorConfig(
+        steps=2, batch_size=8, device="cpu",
+        log_freq=1, eval_freq=1, val_ratio=0.0, test_ratio=0.3,
+    )
+    result = train_predictor(data, tmp_path / "out", config)
+    assert result["val_loss"] is None
+    assert result["best_step"] is None
+    assert result["best_checkpoint"] is None
+    assert result["checkpoint"] == result["last_checkpoint"]
+    assert result["checkpoint"].is_file()
+    assert not (tmp_path / "out" / "checkpoints" / "best_val.pt").exists()
