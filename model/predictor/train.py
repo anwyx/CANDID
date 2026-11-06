@@ -11,7 +11,6 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from candid.data.splits import load_or_create_scene_split
-from candid.data.trajectories import load_trajectories
 from model.predictor.checkpoint import save_checkpoint
 from model.predictor.config import PredictorConfig
 from model.predictor.dataset import PredictorWindowDataset
@@ -51,6 +50,8 @@ def _mean_loss(model, normalizer, dataset, device, batch_size=256) -> float | No
                 normalizer.normalize_obs(batch["obs"]),
                 normalizer.normalize_action(batch["action"]),
                 normalizer.normalize_target(batch["target"]),
+                batch["event_mask"],
+                normalizer.event_pos_weight,
             )
             total += loss.item() * batch["obs"].shape[0]
             count += batch["obs"].shape[0]
@@ -79,13 +80,14 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
         val_ratio=config.val_ratio,
         test_ratio=config.test_ratio,
     )
-    trajectories = load_trajectories(dataset_root)
     train_set = PredictorWindowDataset(
-        trajectories, split["train"], config.obs_horizon, config.action_horizon
+        dataset_root, split["train"], config.obs_horizon, config.action_horizon,
+        allow_missing_event_labels=config.allow_missing_event_labels,
     )
     val_set = (
         PredictorWindowDataset(
-            trajectories, split["validation"], config.obs_horizon, config.action_horizon
+            dataset_root, split["validation"], config.obs_horizon, config.action_horizon,
+            allow_missing_event_labels=config.allow_missing_event_labels,
         )
         if split["validation"]
         else None
@@ -132,6 +134,8 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
                     normalizer.normalize_obs(batch["obs"]),
                     normalizer.normalize_action(batch["action"]),
                     normalizer.normalize_target(batch["target"]),
+                    batch["event_mask"],
+                    normalizer.event_pos_weight,
                 )
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -185,7 +189,11 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
         "test_scenes": split["test"],
         "split_file": str(dataset_root / "split.json"),
         "train_windows": len(train_set),
+        "train_missing_event_trajectories": train_set.missing_event_trajectories,
+        "train_missing_event_windows": train_set.missing_event_windows,
+        "train_skipped_short_trajectories": train_set.skipped_short,
         "validation_windows": len(fixed_val_set) if fixed_val_set is not None else 0,
+        "validation_missing_event_trajectories": val_set.missing_event_trajectories if val_set is not None else 0,
         "steps_completed": step,
         "device": str(device),
         "config": asdict(config),
@@ -222,6 +230,7 @@ def main(argv=None):
     parser.add_argument("--eval-freq", type=int, default=defaults.eval_freq)
     parser.add_argument("--val-max-windows", type=int, default=defaults.val_max_windows)
     parser.add_argument("--val-batch-size", type=int, default=defaults.val_batch_size)
+    parser.add_argument("--allow-missing-event-labels", action="store_true")
     args = parser.parse_args(argv)
     config = PredictorConfig(
         obs_horizon=args.obs_horizon,
@@ -238,6 +247,7 @@ def main(argv=None):
         eval_freq=args.eval_freq,
         val_max_windows=args.val_max_windows,
         val_batch_size=args.val_batch_size,
+        allow_missing_event_labels=args.allow_missing_event_labels,
     )
     result = train_predictor(args.dataset, args.output_dir, config)
     print(f"checkpoint: {result['checkpoint']}")
