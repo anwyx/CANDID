@@ -195,3 +195,36 @@ class PredictorWindowDataset(Dataset):
                 record.task_success if self.root is None else bool(record["task_success"])
             )
         return result
+
+
+
+class TrajectoryBatchSampler:
+    """Shuffle trajectory-local batches to avoid random full-HDF5 reload per sample."""
+
+    def __init__(self, dataset, batch_size, seed=0):
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.generator = torch.Generator().manual_seed(seed)
+        self.groups = []
+        indices = dataset.indices[:, 0]
+        for trajectory_index in range(len(dataset.records)):
+            positions = np.flatnonzero(indices == trajectory_index)
+            if len(positions):
+                self.groups.append(positions)
+
+    def __len__(self):
+        return sum((len(group) + self.batch_size - 1) // self.batch_size
+                   for group in self.groups)
+
+    def __iter__(self):
+        batches = []
+        for positions in self.groups:
+            order = torch.randperm(len(positions), generator=self.generator).numpy()
+            shuffled = positions[order]
+            for start in range(0, len(shuffled), self.batch_size):
+                batches.append(shuffled[start:start + self.batch_size].tolist())
+        order = torch.randperm(len(batches), generator=self.generator).tolist()
+        for index in order:
+            yield batches[index]
