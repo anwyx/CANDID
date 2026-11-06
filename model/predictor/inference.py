@@ -1,19 +1,26 @@
-"""Load a predictor and score a proposed action chunk.
-
-The returned vector is ``[dr_mean, dr_max, topple_count, fall_count]`` in the
-original label units. This module does not import Vanilla DP.
-"""
+"""Predict DR values and event probabilities for a proposed action chunk."""
 from __future__ import annotations
 
 import torch
 
-from model.predictor.checkpoint import load_predictor
-
 
 def predict(model, normalizer, obs, actions):
+    """Return original-unit DR estimates and calibrated-by-sigmoid event scores."""
+    device = next(model.parameters()).device
+    obs = torch.as_tensor(obs, dtype=torch.float32, device=device)
+    actions = torch.as_tensor(actions, dtype=torch.float32, device=device)
+    if not torch.isfinite(obs).all() or not torch.isfinite(actions).all():
+        raise ValueError("Predictor inputs must be finite")
     with torch.no_grad():
-        normalized = model(
+        outputs = model(
             normalizer.normalize_obs(obs),
             normalizer.normalize_action(actions),
         )
-        return normalizer.denormalize_target(normalized)
+        dr = normalizer.denormalize_target(outputs["dr"])
+        events = torch.sigmoid(outputs["event_logits"])
+        return {
+            "dr_mean": dr[:, 0],
+            "dr_max": dr[:, 1],
+            "topple_prob": events[:, 0],
+            "fall_prob": events[:, 1],
+        }
