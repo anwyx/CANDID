@@ -29,6 +29,8 @@ cd /workspace/CANDID
 | `run_baseline.py` | 创建 Scene，执行一条或多条 Planner Trajectory，自动保存数据 | 采集演示轨迹 |
 | `check_scene.py` | 不调用 Planner，检查环境 Reset + Settling 后有没有明显自然漂移 | 新写 Env、修改物体或随机区域后 |
 | `validate_dataset.py` | 检查 Scene/Trajectory 索引、HDF5/NPZ 文件及 Action/State 时间对齐 | 每次采集完成后、上传共享数据前 |
+| `generate_scenes.py` | 只生成并保存稳定后的 Scene 快照，不执行 Planner | 先准备场景，之后再采集轨迹 |
+| `preview_scene.py` | 将稳定后的一个 Scene 渲染为 PNG | 查看物体大小与初始布局 |
 
 ### 2.1 最基础的 Baseline 采集
 
@@ -147,6 +149,57 @@ python scripts/run_baseline.py \
 
 若使用 `--save-success-only`，未成功尝试的 HDF5 可能不保存；正式训练 Predictor 需要保留失败轨迹时，不要开启该选项。
 
+### 2.8 先生成场景，之后再执行
+
+以下命令只创建并稳定两个场景（seed 3 和 4），保存 `scenes.jsonl` 与 `scenes/*.npz`，不会执行抓取规划器，也不会生成动作轨迹：
+
+```bash
+python scripts/generate_scenes.py \
+  --env-module envs.candid_tight_upright_env \
+  --env-id CANDIDTightUpright-v1 \
+  --scenes 2 --seed 3 \
+  --output-dir demos/tight_scenes
+
+python scripts/validate_dataset.py demos/tight_scenes
+```
+
+要给这批**已保存的场景快照**逐个生成对应的预览图：
+
+```bash
+python scripts/preview_scene.py --scene-source demos/tight_scenes
+```
+
+图片保存在 `demos/tight_scenes/previews/`，文件名与 `scenes.jsonl` 中的 `scene_id` 对应。渲染只恢复场景状态，不执行机械臂动作；需要当前 Docker 的 SAPIEN CPU 渲染可用。
+
+前面的两场景示例预期校验结果为 2 个 Scene、0 个 Trajectory、0 个 HDF5。需要执行时，在**新的输出目录**中读取这些快照：
+
+```bash
+python scripts/run_baseline.py \
+  --env-module envs.candid_tight_upright_env \
+  --env-id CANDIDTightUpright-v1 \
+  --scene-source demos/tight_scenes \
+  --save-video \
+  --output-dir demos/tight_rollouts
+
+python scripts/validate_dataset.py demos/tight_rollouts
+```
+
+`--scene-source` 默认执行源目录中的全部 Scene；可加 `--scenes N` 只执行前 N 个。`--save-video` 会在轨迹目录中保存 MP4。每条输出轨迹的场景记录包含 `source_scene_id`，并会检查恢复后的目标、干扰物与机械臂初始状态是否和快照一致。重放需要相同的环境代码、`SceneSpec`、ManiSkill/资产和控制配置。采集时保留与干扰物的真实碰撞及任务失败结果；不要加 `--save-success-only` 来过滤失败轨迹。`--no-record` 仍会执行机械臂，只是不保存 HDF5；要真正只生成场景，请使用 `generate_scenes.py`。
+
+如果需要更明显的位置变化，可使用 `candid_tight_upright_diverse_env`。它保留原场景的物体尺寸，扩大矮方块的摆放范围，并要求每个物体与最近物体按外接圆估算的间距不超过 8 cm。高物体的摆放范围较窄，以保持初始物理稳定。它使用新的环境 ID，因此不会改变旧场景快照对应的环境：
+
+```bash
+python scripts/generate_scenes.py \
+  --env-module envs.candid_tight_upright_diverse_env \
+  --env-id CANDIDTightUprightDiverse-v1 \
+  --env-kwargs '{"num_distractors":5,"distractor_seed":4105}' \
+  --scenes 20 --seed 4105 \
+  --output-dir demos/test_scence_toy_diverse
+
+python scripts/preview_scene.py --scene-source demos/test_scence_toy_diverse
+python scripts/validate_dataset.py demos/test_scence_toy_diverse
+```
+
 ## 3. 新环境必须运行的无动作测试
 
 Baseline：
@@ -244,6 +297,8 @@ PYTHONPATH=src:. python -m pytest tests/test_contract.py -q
 | `--no-record` | 不写 HDF5 轨迹，仅用于调试 |
 | `--translation-weight` / `--rotation-weight` | DR 权重，默认 0.7 / 0.3 |
 | `--output-dir` | 输出目录，默认 `demos/candid_v1` |
+| `--scene-only` | 只保存稳定 Scene，不运行 Planner；`generate_scenes.py` 会自动设置 |
+| `--scene-source` | 从已有输出目录的 `scenes.jsonl` 和 NPZ 快照恢复场景并执行 |
 
 查看最完整的参数帮助：
 
@@ -270,3 +325,20 @@ demos/pilot_multi/
 - `demos/`、HDF5、NPZ 和视频不应提交 GitHub；代码、测试、README 和 SceneSpec 应提交。
 
 更多关于模块职责和 DP/Predictor 字段说明，请阅读 [`../src/README.md`](../src/README.md)。
+
+## 路线意图试采（`scripts/collect.py`）
+
+使用 `--route-intents` 后，每四次尝试组成一组：`direct`、`left`、`right`、`over`。同组使用同一个场景快照和相同的抓取/抬起扰动，只改变夹起方块后的搬运路线。`left/right` 以实际搬运方向定义，`over` 根据附近物体顶部生成较高的中间点。路线候选点有 XY/Z 范围约束；机械臂可达性、整臂碰撞和任务结果仍由 MPlib 规划与仿真执行判断。失败尝试照常记录。
+
+```bash
+python scripts/collect.py \
+  --env-module envs.candid_tight_upright_diverse_env \
+  --env-id CANDIDTightUprightDiverse-v1 \
+  --scenes 1 --trajectories-per-scene 4 --seed 42 \
+  --route-intents --no-collision-aware --save-video \
+  --output-dir demos/route_intent_pilot
+
+python scripts/validate_dataset.py demos/route_intent_pilot
+```
+
+`--trajectories-per-scene` 在此模式下必须是 4 的倍数；设置为 24 即每场景六组、每组四条，共 24 次尝试。采集结果的 `trajectories.jsonl` 包含 `planner_config.route_intent`、`proposal.route_block`、实际使用的 `route_waypoints_xyz` 和失败阶段；`collection_summary.csv` 列出各路线的成功次数。默认模式不受影响。若不加 `--no-collision-aware`，每个场景还会额外执行一次独立的避障参考尝试，不计入指定的轨迹次数。

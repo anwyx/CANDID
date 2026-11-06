@@ -8,7 +8,7 @@ from candid.sim.environment import CANDIDTabletopEnv
 from candid.sim.spec import SceneSpec, ObjectSpec, XYRegion
 
 FRUIT_TARGET=XYRegion((-.145,-.095),(-.035,.035))
-FRUIT_CLUTTER=XYRegion((-.235,.165),(-.215,.215))
+FRUIT_CLUTTER=XYRegion((-.235,.125),(-.195,.195))
 GOAL=XYRegion((.080,.120),(-.04,.04))
 
 SCENE=SceneSpec(

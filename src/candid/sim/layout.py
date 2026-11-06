@@ -22,6 +22,7 @@ def sample_layout(spec, radii, rng, randomize=True):
             "distractors_yaw": [o.fixed_yaw for o in spec.distractors],
         }
     n = len(spec.distractors)
+    max_nearest_gap = getattr(spec, "max_nearest_surface_gap_m", None)
     for _ in range(spec.max_layout_attempts):
         target_xy = np.asarray(spec.target.region.sample(rng))
         goal_xy = np.asarray(spec.goal_region.sample(rng))
@@ -48,6 +49,18 @@ def sample_layout(spec, radii, rng, randomize=True):
             else:
                 failed = True
                 break
+        if not failed and max_nearest_gap is not None:
+            positions = np.asarray([target_xy, *result_xy])
+            # Optional density check for scenes that need wider spawn regions
+            # without leaving an isolated object at the edge of a region.
+            for i, position in enumerate(positions):
+                nearest_gap = min(
+                    np.linalg.norm(position - other) - radii[i] - radii[j]
+                    for j, other in enumerate(positions) if j != i
+                )
+                if nearest_gap > max_nearest_gap:
+                    failed = True
+                    break
         if not failed:
             return {
                 "target_xy": target_xy.tolist(),

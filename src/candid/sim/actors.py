@@ -27,9 +27,22 @@ def build_actor(scene, obj_spec):
         actor = actors.build_box(scene, half_sizes=[v/2 for v in obj_spec.size],
                                  color=list(obj_spec.color), name=name, initial_pose=pose)
     elif kind == "cylinder":
-        actor = actors.build_cylinder(scene, radius=obj_spec.size[0]/2,
-                                      half_length=obj_spec.size[2]/2,
-                                      color=list(obj_spec.color), name=name, initial_pose=pose)
+        # SAPIEN cylinders are aligned with local X by default. Rotate both
+        # collision and visual geometry into local Z before placing the actor;
+        # the environment later applies only a world-Z yaw to its pose.
+        upright = sapien.Pose(q=[np.sqrt(0.5), 0, -np.sqrt(0.5), 0])
+        builder = scene.create_actor_builder()
+        builder.add_cylinder_collision(
+            pose=upright, radius=obj_spec.size[0]/2,
+            half_length=obj_spec.size[2]/2,
+        )
+        builder.add_cylinder_visual(
+            pose=upright, radius=obj_spec.size[0]/2,
+            half_length=obj_spec.size[2]/2,
+            material=sapien.render.RenderMaterial(base_color=list(obj_spec.color)),
+        )
+        builder.set_initial_pose(pose)
+        actor = builder.build(name=name)
     elif kind == "sphere":
         actor = actors.build_sphere(scene, radius=obj_spec.size[0]/2,
                                     color=list(obj_spec.color), name=name, initial_pose=pose)
@@ -43,6 +56,14 @@ def build_actor(scene, obj_spec):
 
 
 def describe_actor(spec, actor):
+    if spec.kind == "cylinder":
+        # The collision-mesh helper reports the native cylinder mesh on a
+        # different axis from SAPIEN's shape. Use the known upright dimensions
+        # for spawn height, footprint checks, and dataset metadata.
+        dimensions = tuple(float(v) for v in spec.size)
+        radius = float(np.hypot(dimensions[0]/2, dimensions[1]/2))
+        return BuiltObject(spec, actor, dimensions, dimensions[2]/2,
+                           radius, max(dimensions))
     mesh = actor.get_first_collision_mesh(to_world_frame=False)
     if mesh is None:
         raise RuntimeError(f"Actor {spec.name} has no collision mesh")
