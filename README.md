@@ -261,12 +261,12 @@ DR_i = 0.7\frac{\max_t\|p_i(t)-p_i(0)\|_2}{s_i} + 0.3\frac{\max_t\theta(q_i(t),q
 | `distractor_mask` | `[6]`（1 为真实物体，0 为补位） |
 | `goal_xy` | `[2]` |
 
-`windows.py` 的默认设置为 **Observation Horizon = 2、Action Horizon = 12**。每个时刻 `t` 取过去的状态历史，以及未来 `actions[t:t+12]`：
+`windows.py` 是通用滑动窗口工具，其默认参数仍是 Observation Horizon = 2、Action Horizon = 12；**Predictor 训练配置现在使用 Observation Horizon = 2、Action Horizon = 8**，并显式传入窗口长度，以匹配 Vanilla DP 输出的 8 步动作：
 
 - **DP：** 可用成功轨迹进行行为克隆；是否包含失败样本由训练端自行决定。
 - **Predictor：** 以状态历史和候选 Action Chunk 为输入，以该动作区间的真实 DR / Topple / Fall 作为监督标签；失败轨迹也可保留。
 
-计算监督标签所用的未来物体 Pose **不能**泄漏进模型输入。模型训练入口见第 10 节。Vanilla DP 按 ManiSkill 的预测时域构造样本；Predictor 仍使用这里的 2 步观测和 12 步动作窗口。
+计算监督标签所用的未来物体 Pose **不能**泄漏进模型输入。模型训练入口见第 10 节。Vanilla DP 按 ManiSkill 的预测时域构造样本；Predictor 使用 2 步观测和 8 步动作窗口。已有 12 步 Predictor checkpoint 不适用于新的 8 步输入，需要重新训练。
 
 ## 7. 验证与数据质量检查
 
@@ -355,10 +355,12 @@ Vanilla DP 和 Disturbance Predictor 各自独立，代码在 `model/vanilla_dp`
 
 ```bash
 python scripts/train_dp.py --dataset demos/dense_random --output-dir runs/vanilla_dp --total-iters 1000
-python scripts/train_predictor.py --dataset demos/dense_random --output-dir runs/predictor
+python scripts/train_predictor.py --dataset demos/dense_random --output-dir runs/predictor --action-horizon 8 --steps 10000 --log-freq 100 --eval-freq 500 --val-max-windows 4096 --device cpu
 python scripts/eval_dp.py --dataset demos/dense_random --checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt --output-dir runs/vanilla_dp_eval --safe-dr-mean-max 0.2 --no-video
 ```
 
 三处都会在当前 Python 能看到 CUDA 时使用 GPU，否则使用 CPU。强制 CPU：DP 训练加 `--no-cuda`，Predictor 和评估加 `--device cpu`。物理回放仍由 ManiSkill 执行；评估时 GPU 只运行策略网络。
 
 第一次训练会在数据集目录写入 `split.json`。评估只回放其中的 test scenes，并且需要 ManiSkill。`--total-iters` 的上游默认值是 1000000；上面的 1000 只是一次短训练。
+
+Predictor 训练每隔 `--log-freq` 步记录训练损失、每隔 `--eval-freq` 步在固定验证窗口上评估（训练最后一步也会验证）。结果保存在 `runs/predictor/train_log.csv`、`summary.json` 和 `checkpoints/best_val.pt` / `checkpoints/last.pt`。最佳模型按归一化 MSE 选择，测试场景不参与训练和模型选择。`--steps 40` 可用于快速冒烟测试，默认正式训练为 10000 步。
