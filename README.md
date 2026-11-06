@@ -364,3 +364,45 @@ python scripts/eval_dp.py --dataset demos/dense_random --checkpoint runs/vanilla
 第一次训练会在数据集目录写入 `split.json`。评估只回放其中的 test scenes，并且需要 ManiSkill。`--total-iters` 的上游默认值是 1000000；上面的 1000 只是一次短训练。
 
 Predictor 训练每隔 `--log-freq` 步记录训练损失、每隔 `--eval-freq` 步在固定验证窗口上评估（训练最后一步也会验证）。结果保存在 `runs/predictor/train_log.csv`、`summary.json` 和 `checkpoints/best_val.pt` / `checkpoints/last.pt`。最佳模型按归一化 MSE 选择，测试场景不参与训练和模型选择。`--steps 40` 可用于快速冒烟测试，默认正式训练为 10000 步。
+
+### Predictor P1: lazy data, event classification and held-out evaluation
+
+The Predictor remains independent from Vanilla DP and data collection. The shared src/candid/data/
+modules are unchanged. Default horizons: observation 2, action 8.
+
+- DR mean/max: normalized MSE regression; Topple/Fall: masked, class-weighted BCE logits.
+- An event is newly triggered inside the chunk (false-to-true); it is not an episode safety decision.
+- Predictor-only lazy HDF5/NPZ reads and trajectory-local shuffled batches reduce peak memory.
+- Missing disturbance event flags fail by default. Pass --allow-missing-event-labels to
+  mask unknown event labels while retaining each window's DR regression target.
+- Checkpoint version 2 uses separate regression/event heads; earlier predictor checkpoints
+  must be retrained. Inference returns dr_mean, dr_max, topple_prob and fall_prob.
+
+Train with a fresh output directory:
+
+```bash
+python scripts/train_predictor.py \
+  --dataset demos/dense_random \
+  --output-dir runs/predictor_p1 \
+  --action-horizon 8 \
+  --steps 10000 \
+  --device cpu
+```
+
+Evaluate frozen held-out test scenes (does not start ManiSkill):
+
+```bash
+python scripts/eval_predictor.py \
+  --dataset demos/dense_random \
+  --checkpoint runs/predictor_p1/checkpoints/best_val.pt \
+  --output-dir runs/predictor_p1_eval \
+  --device cpu
+```
+
+The evaluator tunes event thresholds using validation scenes only. Outputs: summary.json,
+predictions.csv, scene_metrics.csv and DR scatter plots when matplotlib is installed.
+Missing positive/negative classes yield unavailable AUROC/AUPRC (null).
+
+```bash
+python -m pytest tests/test_predictor_p0.py tests/test_predictor_p1.py tests/test_train_pilot.py -q
+```
