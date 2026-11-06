@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from candid.data.splits import load_or_create_scene_split
+from candid.data.splits import validate_scene_split
 from model.predictor.checkpoint import load_predictor
 from model.predictor.dataset import PredictorWindowDataset
 from model.predictor.inference import predict
@@ -169,7 +169,13 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
     if batch_size < 1 or high_dr_threshold < 0:
         raise ValueError("Invalid evaluation batch size or high-DR threshold")
     model, normalizer = load_predictor(checkpoint, device=device)
-    split = load_or_create_scene_split(dataset_root)
+    split_path = dataset_root / "split.json"
+    if not split_path.is_file():
+        raise FileNotFoundError(
+            f"Predictor evaluation requires the frozen training split: {split_path}"
+        )
+    split = json.loads(split_path.read_text(encoding="utf-8"))
+    validate_scene_split(split, dataset_root)
     test_set = PredictorWindowDataset(
         dataset_root, split["test"], model.obs_horizon, model.action_horizon,
         allow_missing_event_labels=allow_missing_event_labels,
