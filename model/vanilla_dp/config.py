@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 
 MANISKILL_COMMIT = "62ff3a5896b4d5b4cf0ac4c8d79afe600c9404a3"
@@ -29,6 +30,10 @@ class DPConfig:
     eval_freq: int = 500
     val_max_windows: int = 4096
     val_batch_size: int = 256
+    delta_loss_weight: float = 0.0
+    overlap_loss_weight: float = 0.0
+    overlap_stride: int = 4
+    regularization_max_timestep: int = 20
 
     def __post_init__(self):
         self.unet_dims = tuple(int(value) for value in self.unet_dims)
@@ -52,3 +57,12 @@ class DPConfig:
             raise ValueError("Invalid split ratios")
         if self.val_ratio + self.test_ratio >= 1:
             raise ValueError("Validation and test ratios must sum to less than 1")
+        if any(not math.isfinite(w) or w < 0 for w in (self.delta_loss_weight, self.overlap_loss_weight)):
+            raise ValueError("Temporal loss weights must be finite and nonnegative")
+        if self.overlap_stride < 1:
+            raise ValueError("overlap_stride must be positive")
+        if self.delta_loss_weight > 0 or self.overlap_loss_weight > 0:
+            if self.overlap_stride >= self.act_horizon:
+                raise ValueError("overlap_stride must be smaller than act_horizon")
+        if not 0 <= self.regularization_max_timestep < self.num_diffusion_iters:
+            raise ValueError("regularization_max_timestep is outside diffusion schedule")
