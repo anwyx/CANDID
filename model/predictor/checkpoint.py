@@ -17,6 +17,7 @@ def save_checkpoint(path, model, normalizer: PredictorNormalizer, config: Predic
         {
             "kind": "disturbance_predictor",
             "model": model.state_dict(),
+            "format_version": 2,
             "config": {
                 "obs_horizon": config.obs_horizon,
                 "action_horizon": config.action_horizon,
@@ -31,6 +32,7 @@ def save_checkpoint(path, model, normalizer: PredictorNormalizer, config: Predic
             "action_std": normalizer.action_std.detach().cpu(),
             "target_mean": normalizer.target_mean.detach().cpu(),
             "target_std": normalizer.target_std.detach().cpu(),
+            "event_pos_weight": normalizer.event_pos_weight.detach().cpu(),
         },
         path,
     )
@@ -41,6 +43,8 @@ def load_predictor(path, device="cpu"):
     payload = torch.load(path, map_location=device, weights_only=False)
     if payload.get("kind") != "disturbance_predictor":
         raise ValueError(f"Expected a disturbance_predictor checkpoint, found {payload.get('kind')}")
+    if payload.get("format_version") != 2:
+        raise ValueError("Legacy predictor checkpoint uses count regression; retrain with the new dual-head predictor")
     model = DisturbancePredictor(
         obs_dim=payload["obs_dim"],
         action_dim=payload["action_dim"],
@@ -58,5 +62,6 @@ def load_predictor(path, device="cpu"):
         payload["action_std"],
         payload["target_mean"],
         payload["target_std"],
+        payload["event_pos_weight"],
     ).to(device)
     return model, normalizer
