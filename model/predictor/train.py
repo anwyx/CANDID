@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Subset
 from candid.data.splits import load_or_create_scene_split
 from model.predictor.checkpoint import save_checkpoint
 from model.predictor.config import PredictorConfig
-from model.predictor.dataset import PredictorWindowDataset
+from model.predictor.dataset import PredictorWindowDataset, TrajectoryBatchSampler
 from model.predictor.network import DisturbancePredictor
 from model.predictor.normalizer import fit_predictor_normalizer
 
@@ -103,12 +103,12 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
         config.hidden,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    generator = torch.Generator().manual_seed(config.seed)
     loader = DataLoader(
         train_set,
-        batch_size=min(config.batch_size, len(train_set)),
-        shuffle=True,
-        generator=generator,
+        batch_sampler=TrajectoryBatchSampler(
+            train_set, min(config.batch_size, len(train_set)), seed=config.seed
+        ),
+        num_workers=0,
     )
 
     checkpoint_dir = output_dir / "checkpoints"
