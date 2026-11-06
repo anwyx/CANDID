@@ -21,6 +21,7 @@ class PredictorConfig:
     eval_freq: int = 500
     val_max_windows: int = 4096
     val_batch_size: int = 256
+    allow_missing_event_labels: bool = False
 
     def __post_init__(self):
         if self.obs_horizon < 1 or self.action_horizon < 1:
