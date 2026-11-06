@@ -82,3 +82,31 @@ def test_predictor_eval_only_uses_test_scenes(tmp_path):
     assert len(rows) == summary["test_windows"]
     assert {row["scene_id"] for row in rows} == set(result["test_scenes"])
     assert (output / "scene_metrics.csv").is_file()
+
+
+def test_trajectory_batch_sampler_covers_each_window_once(tmp_path):
+    from model.predictor.dataset import TrajectoryBatchSampler
+    from candid.data.splits import load_or_create_scene_split
+    root = write_synthetic_dataset(tmp_path / "data", num_scenes=4)
+    split = load_or_create_scene_split(root)
+    dataset = PredictorWindowDataset(root, split["train"])
+    sampler = TrajectoryBatchSampler(dataset, batch_size=3, seed=5)
+    batches = list(sampler)
+    assert len(batches) == len(sampler)
+    assert sorted(index for batch in batches for index in batch) == list(range(len(dataset)))
+    assert all(len({dataset.metadata(index)[1] for index in batch}) == 1 for batch in batches)
+
+
+def test_predictor_eval_requires_frozen_split(tmp_path):
+    root = write_synthetic_dataset(tmp_path / "data", num_scenes=3)
+    from model.predictor.network import DisturbancePredictor
+    from model.predictor.normalizer import PredictorNormalizer
+    from model.predictor.checkpoint import save_checkpoint
+    model = DisturbancePredictor(obs_dim=12, action_dim=7)
+    normalizer = PredictorNormalizer(
+        np.zeros(12), np.ones(12), np.zeros(7), np.ones(7),
+        np.zeros(2), np.ones(2),
+    )
+    path = save_checkpoint(tmp_path / "sample.pt", model, normalizer, PredictorConfig())
+    with pytest.raises(FileNotFoundError, match="frozen training split"):
+        evaluate_predictor(root, path, tmp_path / "eval")
