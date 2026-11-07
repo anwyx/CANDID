@@ -35,3 +35,28 @@ def fit_action_normalizer(actions) -> ActionRangeNormalizer:
         torch.from_numpy(values.min(axis=0).copy()),
         torch.from_numpy(values.max(axis=0).copy()),
     )
+
+
+class ObservationNormalizer:
+    """Z-score observations and clip outliers; near-constant features keep unit scale."""
+
+    def __init__(self, mean, std, clip: float = 5.0):
+        import numpy as np
+
+        self.mean = np.asarray(mean, dtype=np.float32)
+        self.std = np.asarray(std, dtype=np.float32)
+        self.clip = float(clip)
+
+    @classmethod
+    def fit(cls, observations):
+        import numpy as np
+
+        values = np.asarray(observations, dtype=np.float32)
+        std = values.std(axis=0)
+        return cls(values.mean(axis=0), np.where(std < 1e-4, 1.0, std))
+
+    def apply(self, observations):
+        import numpy as np
+
+        scaled = (np.asarray(observations, dtype=np.float32) - self.mean) / self.std
+        return np.clip(scaled, -self.clip, self.clip).astype(np.float32)

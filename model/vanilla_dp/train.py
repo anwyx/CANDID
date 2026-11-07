@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from model.vanilla_dp.dataset import DiffusionWindowDataset
 from model.vanilla_dp.paired_dataset import PairedDiffusionWindowDataset
 from model.vanilla_dp.temporal_loss import compute_temporal_losses
 from model.vanilla_dp.ema import EMAModel
-from model.vanilla_dp.normalizer import fit_action_normalizer
+from model.vanilla_dp.normalizer import ObservationNormalizer, fit_action_normalizer
 from model.vanilla_dp.policy import Agent
 from model.vanilla_dp.validation import (compute_validation_loss, make_validation_loader,
                                           plot_loss_history)
@@ -74,6 +75,25 @@ def _describe_device(device: torch.device) -> str:
     return "cpu"
 
 
+def _select_trajectories(trajectories, dataset_root, config: DPConfig):
+    """Apply the optional route and joint-range filters used by diagnostics."""
+    if config.routes is None and config.max_abs_joint is None:
+        return trajectories
+    with (Path(dataset_root) / "trajectories.jsonl").open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
+    routes = {row["trajectory_id"]: row["planner_config"].get("route_intent") for row in rows}
+    selected = []
+    for trajectory in trajectories:
+        if config.routes is not None and routes[trajectory.trajectory_id] not in config.routes:
+            continue
+        if (config.max_abs_joint is not None
+                and np.abs(trajectory.actions[:, [0, 3, 5]]).max() > config.max_abs_joint):
+            continue
+        selected.append(trajectory)
+    print(f"trajectory filter: kept {len(selected)}/{len(trajectories)}", flush=True)
+    return selected
+
+
 def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -> dict:
     config = DPConfig() if config is None else config
     dataset_root = Path(dataset_root)
@@ -91,13 +111,18 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
         val_ratio=config.val_ratio,
         test_ratio=config.test_ratio,
     )
-    trajectories = load_trajectories(dataset_root)
+    trajectories = _select_trajectories(load_trajectories(dataset_root), dataset_root, config)
     dataset = DiffusionWindowDataset(
         trajectories, split["train"], config.obs_horizon, config.pred_horizon
     )
     validation_dataset = DiffusionWindowDataset(
         trajectories, split["validation"], config.obs_horizon, config.pred_horizon
     )
+    obs_normalizer = None
+    if config.normalize_obs:
+        obs_normalizer = ObservationNormalizer.fit(dataset.training_observations())
+        dataset.obs_normalizer = obs_normalizer
+        validation_dataset.obs_normalizer = obs_normalizer
     regularized = (config.delta_loss_weight > 0 or config.overlap_loss_weight > 0)
     if regularized:
         optimization_dataset = PairedDiffusionWindowDataset(
@@ -208,7 +233,7 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_iteration = step
-                save_checkpoint(best_checkpoint, agent, ema_agent, config, normalizer)
+                save_checkpoint(best_checkpoint, agent, ema_agent, config, normalizer, obs_normalizer)
                 print(f"new best: iteration {step}, validation={val_loss:.6f}", flush=True)
             train_loss_sum = 0.0
             train_sample_count = 0
@@ -228,6 +253,7 @@ def train_vanilla_dp(dataset_root, output_dir, config: DPConfig | None = None) -
         ema_agent,
         config,
         normalizer,
+        obs_normalizer,
     )
     plot_loss_history(history, loss_png)
     return {
@@ -274,6 +300,11 @@ def main(argv=None):
     parser.add_argument("--overlap-loss-weight", type=float, default=0.0)
     parser.add_argument("--overlap-stride", type=int, default=4)
     parser.add_argument("--regularization-max-timestep", type=int, default=20)
+    parser.add_argument("--normalize-obs", action="store_true")
+    parser.add_argument("--max-abs-joint", type=float, default=None,
+                        help="Drop trajectories whose joints 1, 4 or 6 command exceeds this (rad)")
+    parser.add_argument("--routes", nargs="+", default=None,
+                        help="Train only on these route intents")
     args = parser.parse_args(argv)
     config = DPConfig(
         obs_horizon=args.obs_horizon,
@@ -295,6 +326,9 @@ def main(argv=None):
         overlap_loss_weight=args.overlap_loss_weight,
         overlap_stride=args.overlap_stride,
         regularization_max_timestep=args.regularization_max_timestep,
+        normalize_obs=args.normalize_obs,
+        max_abs_joint=args.max_abs_joint,
+        routes=None if args.routes is None else tuple(args.routes),
     )
     result = train_vanilla_dp(args.dataset, args.output_dir, config)
     print(f"checkpoint: {result['checkpoint']}")

@@ -359,6 +359,6 @@ python scripts/train_predictor.py --dataset demos/dense_random --output-dir runs
 python scripts/eval_dp.py --dataset demos/dense_random --checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt --output-dir runs/vanilla_dp_eval --safe-dr-mean-max 0.2 --no-video
 ```
 
-三处都会在当前 Python 能看到 CUDA 时使用 GPU，否则使用 CPU。强制 CPU：DP 训练加 `--no-cuda`，Predictor 和评估加 `--device cpu`。物理回放仍由 ManiSkill 执行；评估时 GPU 只运行策略网络。
+三处默认都使用 GPU。Predictor 和评估在 GPU 不可用时直接报错；DP 训练会退回 CPU，并在日志中打印实际设备。强制 CPU：DP 训练加 `--no-cuda`，Predictor 和评估加 `--device cpu`。物理回放仍由 ManiSkill 执行；评估时 GPU 只运行策略网络。
 
 第一次训练会在数据集目录写入 `split.json`。评估只回放其中的 test scenes，并且需要 ManiSkill。`--total-iters` 的上游默认值是 1000000；上面的 1000 只是一次短训练。

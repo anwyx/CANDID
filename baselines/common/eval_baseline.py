@@ -183,7 +183,7 @@ def main(argv=None):
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--eval-seed", type=int, default=2026)
     parser.add_argument("--exec-horizon", type=int, default=None)
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--no-stop-on-success", action="store_true")
     args = parser.parse_args(argv)

@@ -24,3 +24,21 @@ venv/
 .env.*
 !.env.example
 .DS_Store
+
+# Training and evaluation outputs
+runs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.log
+nohup.out
+
+# Dataset archives
+*.zip
+
+# Editors and notebooks
+.vscode/
+.idea/
+.ipynb_checkpoints/

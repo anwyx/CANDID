@@ -260,6 +260,7 @@ def evaluate_dataset(
     eval_seed: int = 2026,
     save_video: bool = True,
     stop_on_success: bool = True,
+    scene_split: str = "test",
 ) -> dict:
     dataset = Path(dataset_root)
     output = Path(output_dir)
@@ -273,10 +274,12 @@ def evaluate_dataset(
         raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
     split = json.loads(split_path.read_text(encoding="utf-8"))
     validate_scene_split(split, dataset)
-    test_ids = split["test"]
+    if scene_split not in ("train", "validation", "test"):
+        raise ValueError(f"Unknown scene split: {scene_split}")
+    test_ids = split[scene_split]
     if scene_id is not None:
         if scene_id not in test_ids:
-            raise ValueError(f"Requested scene is not in the held-out TEST set: {scene_id}")
+            raise ValueError(f"Requested scene is not in the {scene_split} set: {scene_id}")
         test_ids = [scene_id]
     if max_scenes is not None:
         test_ids = test_ids[:max_scenes]
@@ -332,7 +335,7 @@ def evaluate_dataset(
     }
     report.update({
         "dataset": str(dataset), "checkpoint": None if checkpoint is None else str(checkpoint),
-        "split_file": str(split_path), "test_scene_ids": test_ids,
+        "split_file": str(split_path), "scene_split": scene_split, "test_scene_ids": test_ids,
         "episodes_per_scene": episodes_per_scene, "exec_horizon": exec_horizon,
         "max_steps": max_steps, "eval_seed": eval_seed,
         "stop_on_success": stop_on_success,

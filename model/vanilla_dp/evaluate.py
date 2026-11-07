@@ -64,9 +64,10 @@ def main(argv=None):
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--exec-horizon", type=int, default=8)
     parser.add_argument("--eval-seed", type=int, default=2026)
-    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--device", default="cuda", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--no-stop-on-success", action="store_true")
+    parser.add_argument("--scene-split", default="test", choices=("train", "validation", "test"))
     args = parser.parse_args(argv)
     limits = SafetyLimits(
         args.safe_dr_mean_max,
@@ -88,6 +89,7 @@ def main(argv=None):
         eval_seed=args.eval_seed,
         save_video=not args.no_video,
         stop_on_success=not args.no_stop_on_success,
+        scene_split=args.scene_split,
     )
     print("CANDID Vanilla DP evaluation")
     for key in (

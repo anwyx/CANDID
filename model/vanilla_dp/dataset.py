@@ -30,6 +30,7 @@ class DiffusionWindowDataset(Dataset):
     def __init__(self, trajectories, scene_ids, obs_horizon: int, pred_horizon: int):
         allowed = set(scene_ids)
         self.obs_horizon = int(obs_horizon)
+        self.obs_normalizer = None
         self.pred_horizon = int(pred_horizon)
         self.sequences = []
         for trajectory in trajectories:
@@ -78,10 +79,15 @@ class DiffusionWindowDataset(Dataset):
             )
         if obs_seq.shape[0] != self.obs_horizon or act_seq.shape[0] != self.pred_horizon:
             raise RuntimeError("Diffusion window padding did not reach the required horizon")
+        if self.obs_normalizer is not None:
+            obs_seq = self.obs_normalizer.apply(obs_seq)
         return {
             "observations": torch.from_numpy(np.ascontiguousarray(obs_seq)),
             "actions": torch.from_numpy(np.ascontiguousarray(act_seq)),
         }
+
+    def training_observations(self) -> np.ndarray:
+        return np.concatenate([observations for observations, _ in self.sequences], axis=0)
 
     def training_actions(self) -> np.ndarray:
         return np.concatenate([actions for _, actions in self.sequences], axis=0)
