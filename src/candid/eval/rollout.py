@@ -171,6 +171,8 @@ def _rollout_single(
         current = _canonical_live(raw_obs, num_distractors)
         if current.shape[-1] != policy.obs_dim:
             raise ValueError(f"Policy expects obs_dim={policy.obs_dim}, got {current.shape[-1]}")
+        if hasattr(policy, "set_action_space"):
+            policy.set_action_space(env.action_space)
         if hasattr(policy, "begin_episode"):
             policy.begin_episode(eval_seed)
         history = deque([current.copy() for _ in range(policy.obs_horizon)], maxlen=policy.obs_horizon)
@@ -239,6 +241,13 @@ def _rollout_single(
             "video_files": videos,
             "trajectory_file": str(episode_npz),
         }
+        if hasattr(policy, "get_diagnostics"):
+            diagnostic = policy.get_diagnostics()
+            (episode_dir / "policy_diagnostics.json").write_text(
+                json.dumps(diagnostic, indent=2), encoding="utf-8"
+            )
+            row["policy_diagnostics_file"] = str(episode_dir / "policy_diagnostics.json")
+            row["candidate_changed_count"] = diagnostic.get("candidate_changed_count", 0)
         (episode_dir / "result.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
         return row
     finally:
