@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -55,9 +56,23 @@ def evaluate_dp_predictor(
         "execution_horizon": exec_horizon,
         "risk_definition": "local_chunk_score_not_episode_safety",
     }
+    episodes = _read_episode_results(Path(output_dir))
     report["candidate_changed_count"] = sum(
-        int(row.get("candidate_changed_count", 0))
-        for row in _read_episode_results(Path(output_dir))
+        int(row.get("candidate_changed_count", 0)) for row in episodes
+    )
+    candidate_reasons = Counter()
+    for episode in episodes:
+        diagnostic_path = episode.get("policy_diagnostics_file")
+        if diagnostic_path:
+            diagnostics = json.loads(Path(diagnostic_path).read_text(encoding="utf-8"))
+            candidate_reasons.update(diagnostics.get("candidate_reason_counts", {}))
+    report["candidate_reason_counts"] = dict(candidate_reasons)
+    report["candidate_change_rate"] = (
+        report["candidate_changed_count"] / sum(
+            int(row.get("num_replans", 0)) for row in episodes
+        )
+        if episodes and sum(int(row.get("num_replans", 0)) for row in episodes)
+        else 0.0
     )
     (Path(output_dir) / "summary.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n",
