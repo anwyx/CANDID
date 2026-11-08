@@ -406,3 +406,51 @@ Missing positive/negative classes yield unavailable AUROC/AUPRC (null).
 ```bash
 python -m pytest tests/test_predictor_p0.py tests/test_predictor_p1.py tests/test_train_pilot.py -q
 ```
+
+### Frozen DP + Predictor integration (Shadow / Rerank)
+
+The new integration wrapper is in model/integration/. It does not import into,
+train, or change either model. The shared rollout gets only optional hooks for
+action bounds and per-episode diagnostics; plain Vanilla DP evaluation is unchanged.
+
+Shadow mode samples one chunk and never changes the selected DP actions:
+
+```bash
+python scripts/eval_dp_predictor.py \
+  --dataset demos/dense_random \
+  --dp-checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt \
+  --predictor-checkpoint runs/predictor_p1/checkpoints/best_val.pt \
+  --output-dir runs/dp_predictor_shadow \
+  --mode shadow --num-candidates 1 --exec-horizon 8 \
+  --safe-dr-mean-max 0.2 --device cpu --no-video
+```
+
+Rerank mode evaluates four separately sampled DP action chunks:
+
+```bash
+python scripts/eval_dp_predictor.py \
+  --dataset demos/dense_random \
+  --dp-checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt \
+  --predictor-checkpoint runs/predictor_p1/checkpoints/best_val.pt \
+  --output-dir runs/dp_predictor_rerank \
+  --mode rerank --num-candidates 4 --exec-horizon 8 \
+  --min-improvement 0.01 --max-joint-deviation 0.15 \
+  --safe-dr-mean-max 0.2 --device cpu --no-video
+```
+
+These commands assume the named checkpoint files already exist; adjust paths.
+Each episode writes policy_diagnostics.json with raw candidate risk estimates,
+the chosen action index, and any action clipping. The summary retains the same
+Success/Safety/Safe Success metrics as the original rollout.
+
+Risk scoring is local to an 8-step chunk, not an episode safety guarantee.
+Topple logits are treated as uncalibrated ranking scores. Fall is disabled by
+default because current held-out data has no Fall positives. Action candidates
+are reranked only when predicted risk improvement and max joint deviation
+pass the configured conservative gates. Candidate 0 is always retained as
+fallback. Executing fewer than eight steps scores a longer horizon than is
+actually executed; the first validation should use --exec-horizon 8.
+
+```bash
+python -m pytest tests/test_dp_predictor_integration.py tests/test_train_pilot.py -q
+```
