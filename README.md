@@ -454,3 +454,32 @@ actually executed; the first validation should use --exec-horizon 8.
 ```bash
 python -m pytest tests/test_dp_predictor_integration.py tests/test_train_pilot.py -q
 ```
+
+#### Rerank reproducibility and gate diagnostics
+
+Additional candidate samples now run inside a forked PyTorch CPU/CUDA RNG context.
+The first candidate consumes exactly one DP sample as before, so when reranking
+never changes candidate 0, the sequence of subsequent DP baseline candidates
+remains identical to Vanilla DP (assuming identical state histories).
+Candidate diagnostics in each episode's policy_diagnostics.json now include
+risk_improvement, max_joint_deviation, passes_improvement, passes_deviation,
+eligible, and reason for every candidate. The run-level summary.json adds
+candidate_reason_counts and candidate_change_rate.
+
+To test the 4-candidate RNG invariant without allowing selection:
+
+```bash
+python scripts/eval_dp_predictor.py \
+  --dataset demos/scene1 \
+  --dp-checkpoint ckpt/scene1/best_val.pt \
+  --predictor-checkpoint runs/scene1_predictor_smoke/checkpoints/best_val.pt \
+  --output-dir runs/scene1_rerank_noop_rng \
+  --mode rerank --num-candidates 4 \
+  --min-improvement 1000000 --max-joint-deviation 0.15 \
+  --max-scenes 18 --device cpu --max-steps 300 --exec-horizon 4 \
+  --eval-seed 2026 --safe-dr-mean-max 0.2
+```
+
+Expect candidate_changed_count=0 and episode results matching the original
+Vanilla DP run under identical seed, environment, and rollout settings.
+Never reuse a nonempty output directory.
