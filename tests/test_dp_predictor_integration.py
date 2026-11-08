@@ -164,3 +164,109 @@ def test_real_dp_shadow_preserves_rng_sequence_without_predictor_sampling():
     guided.begin_episode(42)
     actual = guided.act(obs)
     assert np.array_equal(expected, actual)
+
+
+class RandomTorchDP(StubDP):
+    """Sample actions from the same global torch RNG used by Vanilla DP."""
+
+    def begin_episode(self, seed):
+        super().begin_episode(seed)
+        torch.manual_seed(int(seed))
+
+    def act(self, observation_window):
+        self.calls += 1
+        return (torch.randn(8, 2) * 0.1).numpy().astype(np.float32)
+
+
+def test_rerank_no_selection_preserves_multiple_replans_and_torch_rng():
+    obs = np.zeros((2, 3), dtype=np.float32)
+    seed = 2026
+    baseline = RandomTorchDP()
+    baseline.begin_episode(seed)
+    expected = [baseline.act(obs) for _ in range(7)]
+    expected_rng_state = torch.get_rng_state().clone()
+
+    dp = RandomTorchDP()
+    guided = _policy(
+        dp=dp, mode="rerank", num_candidates=4,
+        min_improvement=1e6, max_joint_deviation=1.0,
+    )
+    guided.set_action_space(StubActionSpace())
+    guided.begin_episode(seed)
+    actual = [guided.act(obs) for _ in range(7)]
+    for vanilla, selected in zip(expected, actual):
+        assert np.array_equal(vanilla, selected)
+    assert torch.equal(expected_rng_state, torch.get_rng_state())
+    assert dp.calls == 7 * 4
+    report = guided.get_diagnostics()
+    assert report["num_replans"] == 7
+    assert report["candidate_changed_count"] == 0
+    assert len(report["decisions"]) == 7
+
+
+def test_candidate_rejection_reasons_identify_each_gate():
+    guided = _policy(
+        dp=StubDP(values=(0.5, 0.1, 0.49)),
+        mode="rerank", num_candidates=3,
+        min_improvement=0.05,
+        max_joint_deviation=0.15,
+    )
+    guided.set_action_space(StubActionSpace())
+    result = guided.act(np.zeros((2, 3), dtype=np.float32))
+    assert np.allclose(result, 0.5)
+    report = guided.get_diagnostics()
+    decision = report["decisions"][0]
+    reasons = [item["reason"] for item in decision["candidate_diagnostics"]]
+    assert reasons == [
+        "baseline",
+        "excessive_joint_deviation",
+        "insufficient_improvement",
+    ]
+    assert decision["candidate_diagnostics"][1]["risk_improvement"] > 0.05
+    assert decision["candidate_diagnostics"][1]["max_joint_deviation"] > 0.15
+    assert decision["candidate_diagnostics"][2]["risk_improvement"] < 0.05
+    assert decision["candidate_diagnostics"][2]["max_joint_deviation"] < 0.15
+    assert report["candidate_reason_counts"] == {
+        "excessive_joint_deviation": 1,
+        "insufficient_improvement": 1,
+    }
+
+
+def test_selected_candidate_diagnostics_are_consistent():
+    guided = _policy(
+        dp=StubDP(values=(0.5, 0.1)),
+        mode="rerank", num_candidates=2,
+        min_improvement=0.05, max_joint_deviation=0.5,
+    )
+    guided.set_action_space(StubActionSpace())
+    guided.act(np.zeros((2, 3), dtype=np.float32))
+    decision = guided.get_diagnostics()["decisions"][0]
+    item = decision["candidate_diagnostics"][1]
+    assert item["eligible"] is True
+    assert item["passes_improvement"] is True
+    assert item["passes_deviation"] is True
+    assert item["reason"] == "selected"
+    assert decision["selected"] == 1
+
+
+def test_rerank_only_uses_extra_rng_state_inside_fork(monkeypatch):
+    """Extra DP samples are isolated even if they raise during generation."""
+    class ExplodingDP(RandomTorchDP):
+        def act(self, observation_window):
+            out = super().act(observation_window)
+            if self.calls == 3:
+                raise RuntimeError("forced sampling failure")
+            return out
+
+    obs = np.zeros((2, 3), dtype=np.float32)
+    expected = ExplodingDP()
+    expected.begin_episode(21)
+    expected.act(obs)
+    expected_state = torch.get_rng_state().clone()
+
+    guided = _policy(dp=ExplodingDP(), mode="rerank", num_candidates=4)
+    guided.set_action_space(StubActionSpace())
+    guided.begin_episode(21)
+    with pytest.raises(RuntimeError, match="forced sampling failure"):
+        guided.act(obs)
+    assert torch.equal(expected_state, torch.get_rng_state())
