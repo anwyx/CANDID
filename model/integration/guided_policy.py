@@ -5,6 +5,8 @@ rollout still sees a ChunkPolicy that returns unnormalized environment actions.
 """
 from __future__ import annotations
 
+from collections import Counter
+
 import numpy as np
 import torch
 
@@ -102,14 +104,35 @@ class PredictorGuidedPolicy:
             raise ValueError("DP returned nonfinite actions")
         return chunk
 
+    def _dp_cuda_rng_devices(self):
+        """Return the CUDA generator used by VanillaDPPolicy, if any."""
+        agent = getattr(self.dp_policy, "agent", None)
+        if agent is None:
+            return []
+        try:
+            device = next(agent.parameters()).device
+        except StopIteration:
+            return []
+        if device.type != "cuda":
+            return []
+        return [device.index if device.index is not None else torch.cuda.current_device()]
+
     def act(self, observation_window):
         obs = np.asarray(observation_window, dtype=np.float32)
         if obs.shape != (self.obs_horizon, self.obs_dim) or not np.isfinite(obs).all():
             raise ValueError(f"Invalid observation history shape/values: {obs.shape}")
         if self.mode == "rerank" and self._bounds is None:
             raise RuntimeError("Rerank mode requires environment bounds via set_action_space")
-        # K=1 Shadow calls DP exactly once, preserving its random-number sequence.
-        chunks = np.stack([self._sample(obs) for _ in range(self.num_candidates)])
+
+        # Candidate 0 advances the ordinary DP RNG exactly once, as in Vanilla DP.
+        # Additional candidates are sampled with forked CPU/CUDA RNG state so the
+        # *next* replan's candidate 0 is unaffected if no action was replaced.
+        baseline = self._sample(obs)
+        extras = []
+        if self.num_candidates > 1:
+            with torch.random.fork_rng(devices=self._dp_cuda_rng_devices()):
+                extras = [self._sample(obs) for _ in range(self.num_candidates - 1)]
+        chunks = np.stack([baseline, *extras])
         scored_chunks = chunks
         if self._bounds is not None:
             scored_chunks = np.clip(chunks, *self._bounds).astype(np.float32)
@@ -130,17 +153,45 @@ class PredictorGuidedPolicy:
         matrix[:, :2] = np.maximum(matrix[:, :2], 0)
         matrix[:, 1] = np.maximum(matrix[:, 1], matrix[:, 0])
         risk = matrix @ self.weights
+        candidate_diagnostics = []
+        for i in range(self.num_candidates):
+            improvement = float(risk[0] - risk[i])
+            joint_delta = float(np.max(np.abs(scored_chunks[i] - scored_chunks[0])))
+            passes_improvement = improvement > 0 and improvement >= self.min_improvement
+            passes_deviation = joint_delta <= self.max_joint_deviation
+            if i == 0:
+                reason = "baseline"
+            elif not passes_improvement and not passes_deviation:
+                reason = "insufficient_improvement_and_excessive_joint_deviation"
+            elif not passes_improvement:
+                reason = "insufficient_improvement"
+            elif not passes_deviation:
+                reason = "excessive_joint_deviation"
+            else:
+                reason = "eligible"
+            candidate_diagnostics.append({
+                "candidate_index": i,
+                "risk_improvement": improvement,
+                "max_joint_deviation": joint_delta,
+                "passes_improvement": bool(passes_improvement),
+                "passes_deviation": bool(passes_deviation),
+                "eligible": bool(i != 0 and passes_improvement and passes_deviation),
+                "reason": reason,
+            })
+
         selected = 0
         if self.mode == "rerank":
-            for idx in np.argsort(risk, kind="stable"):
-                idx = int(idx)
-                if idx == 0:
-                    break
-                improvement = risk[0] - risk[idx]
-                joint_delta = float(np.max(np.abs(scored_chunks[idx] - scored_chunks[0])))
-                if improvement >= self.min_improvement and joint_delta <= self.max_joint_deviation:
-                    selected = idx
-                    break
+            eligible = [
+                item["candidate_index"] for item in candidate_diagnostics
+                if item["eligible"]
+            ]
+            if eligible:
+                selected = min(eligible, key=lambda i: (risk[i], i))
+        for candidate in candidate_diagnostics:
+            if candidate["candidate_index"] == selected and selected != 0:
+                candidate["reason"] = "selected"
+            elif candidate["eligible"]:
+                candidate["reason"] = "eligible_not_selected"
         self.decisions.append({
             "replan_index": len(self.decisions),
             "mode": self.mode,
@@ -148,6 +199,7 @@ class PredictorGuidedPolicy:
             "selected": selected,
             "changed_from_baseline": selected != 0,
             "predicted_risk": risk.tolist(),
+            "candidate_diagnostics": candidate_diagnostics,
             "predictions": [
                 {key: float(matrix[i, j]) for j, key in enumerate(keys)}
                 for i in range(self.num_candidates)
@@ -162,10 +214,17 @@ class PredictorGuidedPolicy:
         return chunks[selected].copy()
 
     def get_diagnostics(self):
+        reasons = Counter(
+            item["reason"]
+            for decision in self.decisions
+            for item in decision["candidate_diagnostics"]
+            if item["candidate_index"] != 0
+        )
         return {
             "mode": self.mode,
             "num_candidates": self.num_candidates,
             "num_replans": len(self.decisions),
             "candidate_changed_count": sum(x["changed_from_baseline"] for x in self.decisions),
+            "candidate_reason_counts": dict(reasons),
             "decisions": self.decisions,
         }
