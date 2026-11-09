@@ -116,7 +116,7 @@ def _choose_threshold(rows, event):
     return max(scored)[2]
 
 
-def _summarize(rows, thresholds, high_dr_threshold=0.1):
+def _summarize(rows, thresholds, high_dr_threshold=0.1, dr_thresholds=()):
     metrics = {}
     for name in ("dr_mean", "dr_max"):
         metrics[name] = _regression_metrics(
@@ -138,7 +138,7 @@ def _summarize(rows, thresholds, high_dr_threshold=0.1):
             metrics["ordinal_thresholds"][kind] = []
             for j in range(len(ordinal_columns)):
                 key = f"p_{kind}_gt_{j}"
-                cutoff = _summarize.dr_thresholds[j]
+                cutoff = dr_thresholds[j]
                 truth = np.asarray([r[f"true_{kind}"] > cutoff for r in rows], dtype=int)
                 scores = np.asarray([r[key] for r in rows], dtype=float)
                 metrics["ordinal_thresholds"][kind].append({
@@ -209,7 +209,7 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
             allow_missing_event_labels=allow_missing_event_labels,
         ) if split["validation"] else None
     )
-    _summarize.dr_thresholds = (
+    ordinal_thresholds = (
         model.dr_thresholds.detach().cpu().tolist()
         if getattr(model, "dr_objective", "regression") == "ordinal" else []
     )
@@ -218,12 +218,12 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
         event: _choose_threshold(validation_rows, event) for event in ("topple", "fall")
     }
     test_rows = _score_dataset(test_set, model, normalizer, batch_size)
-    summary = _summarize(test_rows, thresholds, high_dr_threshold)
+    summary = _summarize(test_rows, thresholds, high_dr_threshold, ordinal_thresholds)
     scene_groups = defaultdict(list)
     for row in test_rows:
         scene_groups[row["scene_id"]].append(row)
     scenes = {
-        scene_id: _summarize(group, thresholds, high_dr_threshold)
+        scene_id: _summarize(group, thresholds, high_dr_threshold, ordinal_thresholds)
         for scene_id, group in scene_groups.items()
     }
     summary.update({
@@ -234,7 +234,7 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
         "validation_windows_for_threshold": len(validation_rows),
         "threshold_source": "validation" if validation_rows else "default_0.5",
         "dr_objective": getattr(model, "dr_objective", "regression"),
-        "dr_thresholds": _summarize.dr_thresholds,
+        "dr_thresholds": ordinal_thresholds,
         "scene_metrics": scenes,
         "test_missing_event_windows": test_set.missing_event_windows,
     })
