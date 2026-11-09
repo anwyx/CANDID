@@ -24,6 +24,7 @@ from candid.data.splits import validate_scene_split
 from candid.data.storage import freeze_state, load_state_npz
 from candid.data.validate import validate_dataset
 from candid.eval.replay_env import resolve_scene_environment
+from candid.eval.local_dr_repeat import compare_repeat
 from candid.eval.rollout import (
     _canonical_live, _check_initial_scene, _clamp_action, _is_true, _read_jsonl,
 )
@@ -96,6 +97,14 @@ def _signature(trace):
         "poses": np.stack(
             [as_numpy(actor.pose.raw_pose).reshape(-1, 7)[0] for actor in all_objects]
         ),
+        "linear_velocities": np.stack([
+            as_numpy(actor.get_linear_velocity()).reshape(-1, 3)[0]
+            for actor in all_objects
+        ]),
+        "angular_velocities": np.stack([
+            as_numpy(actor.get_angular_velocity()).reshape(-1, 3)[0]
+            for actor in all_objects
+        ]),
     }
 
 
@@ -186,7 +195,7 @@ def _predict_pair(window, actions, predictor, normalizer, config):
 
 
 def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
-              config, probes, max_steps, eval_seed, check_repeat):
+              config, probes, max_steps, eval_seed, check_repeat, diagnostics_dir):
     env_id, source = resolve_scene_environment(scene)
     reference = make_env(scene, max_steps, env_id)
     branch = None
@@ -245,13 +254,39 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                     repeat, poses_repeat = _physical_outcomes(
                         branch, scene, state, candidates[0], signature
                     )
-                    if repeat != physical_v or not np.allclose(
-                        poses_repeat, poses_v, atol=1e-5, rtol=0
-                    ):
-                        raise RuntimeError(
-                            "Baseline replay is not repeatable from the saved "
-                            "state; cannot trust paired physics comparison"
+                    repeat_check = compare_repeat(
+                        physical_v, repeat, poses_v, poses_repeat,
+                        pose_atol=1e-5, dr_atol=1e-4,
+                    )
+                    if not repeat_check["passed"]:
+                        failure_path = (
+                            diagnostics_dir
+                            / f"replay_mismatch_{test_index:03d}_step_{current_step}.json"
                         )
+                        failure_path.write_text(
+                            json.dumps({
+                                "scene_id": scene["scene_id"],
+                                "probe_step": current_step,
+                                "check": repeat_check,
+                                "first": physical_v,
+                                "repeat": repeat,
+                            }, indent=2, ensure_ascii=False) + "\\n",
+                            encoding="utf-8",
+                        )
+                        raise RuntimeError(
+                            "Baseline replay mismatch: "
+                            f"max_pose_abs={repeat_check['max_pose_abs']:.8g}, "
+                            f"max_dr_abs={repeat_check['max_dr_abs']:.8g}, "
+                            f"events_equal={repeat_check['events_equal']}; "
+                            f"details: {failure_path}. "
+                            "Do not use --no-repeat-check for scientific comparison."
+                        )
+                    print(
+                        f"Replay repeat PASS: scene={scene['scene_id']} step={current_step} "
+                        f"max_pose_abs={repeat_check['max_pose_abs']:.3g} "
+                        f"max_dr_abs={repeat_check['max_dr_abs']:.3g}",
+                        flush=True,
+                    )
                 physical_g, _ = _physical_outcomes(
                     branch, scene, state, candidates[1], signature
                 )
@@ -362,6 +397,7 @@ def main(argv=None):
             args.dataset, scene, index, dp, guidance, predictor, normalizer,
             config, probes, args.max_steps, args.eval_seed,
             check_repeat=not args.no_repeat_check,
+            diagnostics_dir=folder,
         )
         results.extend(rows)
         with output_path.open("a", encoding="utf-8") as handle:
