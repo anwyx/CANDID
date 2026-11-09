@@ -10,6 +10,7 @@ import torch
 
 from model.predictor.dataset import PredictorWindowDataset
 from model.predictor.network import DisturbancePredictor
+from model.predictor.mixed_sampler import MixedTrajectoryBatchSampler
 from model.predictor.policy_rollout_dataset import PolicyRolloutWindowDataset
 
 
@@ -89,3 +90,23 @@ def test_predictor_local_label_responds_to_first_four_actions():
     grad = torch.autograd.grad(result, actions)[0]
     assert torch.all(grad[:, 4:] == 0)
     assert torch.isfinite(grad[:, :4]).all()
+
+
+def test_mixed_sampler_is_balanced_and_trajectory_local():
+    class Expert:
+        indices = np.asarray([[0, 1], [0, 2], [0, 3], [1, 1], [1, 2], [1, 3]], dtype=np.int32)
+        def __len__(self):
+            return len(self.indices)
+
+    class Policy:
+        indices = [(0, 1), (0, 2), (1, 1), (1, 2)]
+        def __len__(self):
+            return len(self.indices)
+
+    sampler = MixedTrajectoryBatchSampler(Expert(), Policy(), batch_size=6, seed=7)
+    for batch in sampler:
+        expert = [i for i in batch if i < 6]
+        policy = [i for i in batch if i >= 6]
+        assert len(expert) == len(policy) == 3
+        assert len({0 if i < 3 else 1 for i in expert}) == 1
+        assert len({0 if i < 8 else 1 for i in policy}) == 1
