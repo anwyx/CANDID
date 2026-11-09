@@ -82,7 +82,7 @@ def _score_dataset(dataset, model, normalizer, batch_size):
         masks = batch["event_mask"].numpy()
         for i in range(size):
             scene_id, trajectory_id, t = dataset.metadata(offset + i)
-            rows.append({
+            row = {
                 "scene_id": scene_id, "trajectory_id": trajectory_id, "t": int(t),
                 "true_dr_mean": float(truth[i, 0]),
                 "pred_dr_mean": float(values["dr_mean"][i]),
@@ -92,7 +92,14 @@ def _score_dataset(dataset, model, normalizer, batch_size):
                 "topple_prob": float(values["topple_prob"][i]),
                 "true_fall": int(truth[i, 3]) if masks[i, 1] else None,
                 "fall_prob": float(values["fall_prob"][i]),
-            })
+            }
+            if "dr_mean_exceed_prob" in values:
+                for j, threshold in enumerate(model.dr_thresholds.tolist()):
+                    for kind in ("dr_mean", "dr_max"):
+                        row[f"p_{kind}_gt_{j}"] = float(
+                            values[f"{kind}_exceed_prob"][i, j]
+                        )
+            rows.append(row)
         offset += size
     return rows
 
@@ -124,6 +131,22 @@ def _summarize(rows, thresholds, high_dr_threshold=0.1):
             [row["pred_dr_mean"] for row in high],
         ),
     }
+    ordinal_columns = [key for key in rows[0] if key.startswith("p_dr_mean_gt_")] if rows else []
+    if ordinal_columns:
+        metrics["ordinal_thresholds"] = {}
+        for kind in ("dr_mean", "dr_max"):
+            metrics["ordinal_thresholds"][kind] = []
+            for j in range(len(ordinal_columns)):
+                key = f"p_{kind}_gt_{j}"
+                cutoff = _summarize.dr_thresholds[j]
+                truth = np.asarray([r[f"true_{kind}"] > cutoff for r in rows], dtype=int)
+                scores = np.asarray([r[key] for r in rows], dtype=float)
+                metrics["ordinal_thresholds"][kind].append({
+                    "threshold": cutoff,
+                    "positive_rate": float(truth.mean()),
+                    "brier": float(np.mean((scores - truth) ** 2)),
+                    **_event_metrics(truth, scores, 0.5),
+                })
     for event in ("topple", "fall"):
         known = [row for row in rows if row[f"true_{event}"] is not None]
         metrics[event] = {
@@ -186,6 +209,10 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
             allow_missing_event_labels=allow_missing_event_labels,
         ) if split["validation"] else None
     )
+    _summarize.dr_thresholds = (
+        model.dr_thresholds.detach().cpu().tolist()
+        if getattr(model, "dr_objective", "regression") == "ordinal" else []
+    )
     validation_rows = _score_dataset(val_set, model, normalizer, batch_size) if val_set else []
     thresholds = {
         event: _choose_threshold(validation_rows, event) for event in ("topple", "fall")
@@ -206,6 +233,8 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
         "test_windows": len(test_rows),
         "validation_windows_for_threshold": len(validation_rows),
         "threshold_source": "validation" if validation_rows else "default_0.5",
+        "dr_objective": getattr(model, "dr_objective", "regression"),
+        "dr_thresholds": _summarize.dr_thresholds,
         "scene_metrics": scenes,
         "test_missing_event_windows": test_set.missing_event_windows,
     })
