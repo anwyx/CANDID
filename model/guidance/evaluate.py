@@ -16,6 +16,7 @@ from model.vanilla_dp.checkpoint import load_policy
 
 def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, limits, *,
                       config=None, device="cpu", max_scenes=None, scene_id=None,
+                      scene_substrings=None, diagnose=False, profile_timing=False,
                       episodes_per_scene=1, max_steps=300, exec_horizon=8,
                       eval_seed=2026, save_video=False, stop_on_success=True):
     if device == "auto":
@@ -25,10 +26,14 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
     settings = config if config is not None else GuidanceConfig()
     dp = load_policy(dp_checkpoint, device=device)
     predictor, normalizer = load_predictor(predictor_checkpoint, device=device)
-    policy = ConsequenceGuidedPolicy(dp, predictor, normalizer, settings)
+    policy = ConsequenceGuidedPolicy(
+        dp, predictor, normalizer, settings,
+        diagnose=diagnose, profile_timing=profile_timing,
+    )
     report = evaluate_dataset(
         dataset, policy, output_dir, limits, checkpoint=dp_checkpoint,
         max_scenes=max_scenes, scene_id=scene_id,
+        scene_substrings=scene_substrings,
         episodes_per_scene=episodes_per_scene, max_steps=max_steps,
         exec_horizon=exec_horizon, eval_seed=eval_seed,
         save_video=save_video, stop_on_success=stop_on_success,
@@ -48,6 +53,8 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
         "scoring_horizon": policy.action_horizon,
         "execution_horizon": exec_horizon,
         "risk_definition": "predicted_local_chunk_risk_not_episode_safety",
+        "paired_diagnostics": diagnose,
+        "profile_timing": profile_timing,
     }
     output = Path(output_dir)
     (output / "summary.json").write_text(
@@ -68,6 +75,12 @@ def main(argv=None):
     parser.add_argument("--safe-dr-max-max", type=float, default=None)
     parser.add_argument("--device", choices=("cpu", "cuda", "auto"), default="cpu")
     parser.add_argument("--scene-id", default=None)
+    parser.add_argument("--scene-substrings", default=None,
+                        help="Comma-separated unique substrings of held-out scene IDs; keeps original eval seeds")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Same-noise Vanilla vs Guidance chunk risk and action deviation")
+    parser.add_argument("--profile-timing", action="store_true",
+                        help="Optional DP/gradient/DDPM timing; CUDA event GPU times")
     parser.add_argument("--max-scenes", type=int, default=None)
     parser.add_argument("--episodes-per-scene", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=300)
@@ -98,6 +111,11 @@ def main(argv=None):
         args.dataset, args.dp_checkpoint, args.predictor_checkpoint,
         args.output_dir, limits, config=settings, device=args.device,
         max_scenes=args.max_scenes, scene_id=args.scene_id,
+        scene_substrings=(
+            [word.strip() for word in args.scene_substrings.split(",") if word.strip()]
+            if args.scene_substrings is not None else None
+        ),
+        diagnose=args.diagnose, profile_timing=args.profile_timing,
         episodes_per_scene=args.episodes_per_scene,
         max_steps=args.max_steps, exec_horizon=args.exec_horizon,
         eval_seed=args.eval_seed, save_video=not args.no_video,
