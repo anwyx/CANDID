@@ -140,7 +140,8 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
                 loss = model.loss(
                     normalizer.normalize_obs(batch["obs"]),
                     normalizer.normalize_action(batch["action"]),
-                    normalizer.normalize_target(batch["target"]),
+                    (batch["target"] if config.dr_objective == "ordinal"
+                     else normalizer.normalize_target(batch["target"])),
                     batch["event_mask"],
                     normalizer.event_pos_weight,
                 )
