@@ -23,7 +23,7 @@ def risk_from_predictions(outputs, predictor_normalizer, config):
     )
 
 
-def chunk_risk(obs, absolute_actions, predictor, predictor_normalizer, config):
+def chunk_risk(obs, absolute_actions, predictor, predictor_normalizer, config, *, check_finite=True):
     """Score [B,H_obs,O] and [B,H_act,A]; preserve gradients to actions."""
     if obs.ndim != 3 or absolute_actions.ndim != 3:
         raise ValueError("Risk inputs must be batched observation and action windows")
@@ -34,6 +34,8 @@ def chunk_risk(obs, absolute_actions, predictor, predictor_normalizer, config):
         predictor_normalizer.normalize_action(absolute_actions),
     )
     risk = risk_from_predictions(outputs, predictor_normalizer, config)
-    if risk.shape != (obs.shape[0],) or not torch.isfinite(risk).all():
+    if risk.shape != (obs.shape[0],):
+        raise ValueError("Predictor produced a risk tensor with wrong shape")
+    if check_finite and not torch.isfinite(risk).all():
         raise FloatingPointError("Predictor produced nonfinite chunk risk")
     return risk

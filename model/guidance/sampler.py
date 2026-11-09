@@ -80,6 +80,7 @@ class ConsequenceGuidedSampler:
         # synchronize CUDA tens of thousands of times in a scene1 evaluation.
         largest_gradient = torch.zeros((), device=obs.device, dtype=obs.dtype)
         largest_update = torch.zeros((), device=obs.device, dtype=obs.dtype)
+        all_gradients_finite = torch.ones((), device=obs.device, dtype=torch.bool)
 
         # Both scheduler noise draws and the unconditional strength=0 path
         # match the original Vanilla DP exactly.
@@ -115,14 +116,17 @@ class ConsequenceGuidedSampler:
                     risk = chunk_risk(
                         obs, candidate, self.predictor,
                         self.predictor_normalizer, self.config,
+                        check_finite=False,
                     )
                     gradient = torch.autograd.grad(
                         risk.sum(), variable, allow_unused=True
                     )[0]
                 if gradient is None:
                     raise RuntimeError("Risk is not differentiable with respect to the action chunk")
-                if not torch.isfinite(gradient).all():
-                    raise FloatingPointError("Guidance gradient contains NaN/Inf")
+                all_gradients_finite = (
+                    all_gradients_finite & torch.isfinite(risk).all()
+                    & torch.isfinite(gradient).all()
+                )
                 mask = torch.zeros_like(gradient)
                 mask[:, self.start:self.stop] = 1
                 gradient = gradient * mask
@@ -151,6 +155,8 @@ class ConsequenceGuidedSampler:
             timer.stop("ddpm_update", stamp)
 
         result = noisy[:, self.start:self.stop]
+        if not all_gradients_finite.item():
+            raise FloatingPointError("Predictor risk or guidance gradient contains NaN/Inf")
         if not torch.isfinite(result).all():
             raise FloatingPointError("Guided diffusion generated NaN/Inf actions")
         timing = timer.finish()
