@@ -270,6 +270,7 @@ def evaluate_dataset(
     limits: SafetyLimits,
     *,
     checkpoint=None,
+    split_name: str = "test",
     max_scenes: int | None = None,
     scene_id: str | None = None,
     scene_substrings: list[str] | None = None,
@@ -292,7 +293,9 @@ def evaluate_dataset(
         raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
     split = json.loads(split_path.read_text(encoding="utf-8"))
     validate_scene_split(split, dataset)
-    full_test_ids = list(split["test"])
+    if split_name not in ("train", "validation", "test"):
+        raise ValueError("split_name must be train, validation, or test")
+    full_test_ids = list(split[split_name])
     if scene_id is not None and scene_substrings is not None:
         raise ValueError("Use either scene_id or scene_substrings, not both")
     if scene_substrings is not None:
@@ -303,7 +306,7 @@ def evaluate_dataset(
             found = [sid for sid in full_test_ids if key in sid]
             if len(found) != 1:
                 raise ValueError(
-                    f"Scene substring {key!r} matched {len(found)} held-out scenes; "
+                    f"Scene substring {key!r} matched {len(found)} {split_name} scenes; "
                     "provide a unique substring"
                 )
             matches.append(found[0])
@@ -313,7 +316,7 @@ def evaluate_dataset(
         test_ids = [sid for sid in full_test_ids if sid in selected]
     elif scene_id is not None:
         if scene_id not in full_test_ids:
-            raise ValueError(f"Requested scene is not in the held-out TEST set: {scene_id}")
+            raise ValueError(f"Requested scene is not in the {split_name} split: {scene_id}")
         test_ids = [scene_id]
     else:
         test_ids = full_test_ids
@@ -374,7 +377,9 @@ def evaluate_dataset(
     }
     report.update({
         "dataset": str(dataset), "checkpoint": None if checkpoint is None else str(checkpoint),
-        "split_file": str(split_path), "test_scene_ids": test_ids,
+        "split_file": str(split_path), "split_name": split_name,
+        "selected_scene_ids": test_ids,
+        "test_scene_ids": test_ids if split_name == "test" else [],
         "episodes_per_scene": episodes_per_scene, "exec_horizon": exec_horizon,
         "max_steps": max_steps, "eval_seed": eval_seed,
         "stop_on_success": stop_on_success,
