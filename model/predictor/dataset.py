@@ -27,12 +27,15 @@ class PredictorWindowDataset(Dataset):
 
     def __init__(
         self, trajectories, scene_ids, obs_horizon=2, action_horizon=8,
-        allow_missing_event_labels=False, cache_size=2,
+        allow_missing_event_labels=False, cache_size=2, label_horizon=None,
     ):
         if obs_horizon < 1 or action_horizon < 1 or cache_size < 1:
             raise ValueError("Horizons and cache size must be positive")
         self.observation_horizon = int(obs_horizon)
         self.action_horizon = int(action_horizon)
+        self.label_horizon = self.action_horizon if label_horizon is None else int(label_horizon)
+        if not 1 <= self.label_horizon <= self.action_horizon:
+            raise ValueError("label_horizon must be in [1, action_horizon]")
         self.allow_missing_event_labels = bool(allow_missing_event_labels)
         self.cache_size = int(cache_size)
         self._cache = OrderedDict()
@@ -160,7 +163,7 @@ class PredictorWindowDataset(Dataset):
         trace = entry["trace"]
         labels = disturbance_from_poses(
             trace["distractor_poses"], trace["object_sizes_m"],
-            start=t, stop=t + horizon,
+            start=t, stop=t + self.label_horizon,
             topple_flags=trace.get(EVENT_KEYS[0]),
             fall_flags=trace.get(EVENT_KEYS[1]),
         )
