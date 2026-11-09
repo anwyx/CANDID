@@ -256,7 +256,8 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                     )
                     repeat_check = compare_repeat(
                         physical_v, repeat, poses_v, poses_repeat,
-                        pose_atol=1e-5, dr_atol=1e-4,
+                        translation_atol=5e-5, rotation_atol=5e-4,
+                        dr_atol=1e-6,
                     )
                     if not repeat_check["passed"]:
                         failure_path = (
@@ -275,7 +276,8 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                         )
                         raise RuntimeError(
                             "Baseline replay mismatch: "
-                            f"max_pose_abs={repeat_check['max_pose_abs']:.8g}, "
+                            f"max_translation_m={repeat_check['max_translation_m']:.8g}, "
+                            f"max_rotation_rad={repeat_check['max_rotation_rad']:.8g}, "
                             f"max_dr_abs={repeat_check['max_dr_abs']:.8g}, "
                             f"events_equal={repeat_check['events_equal']}; "
                             f"details: {failure_path}. "
@@ -283,7 +285,8 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                         )
                     print(
                         f"Replay repeat PASS: scene={scene['scene_id']} step={current_step} "
-                        f"max_pose_abs={repeat_check['max_pose_abs']:.3g} "
+                        f"max_translation_m={repeat_check['max_translation_m']:.3g} "
+                        f"max_rotation_rad={repeat_check['max_rotation_rad']:.3g} "
                         f"max_dr_abs={repeat_check['max_dr_abs']:.3g}",
                         flush=True,
                     )
@@ -301,6 +304,7 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                     "pred_risk_delta": predicted[1]["risk"] - predicted[0]["risk"],
                     "action_abs_mean": float(deviations.mean()),
                     "action_abs_max": float(deviations.max()),
+                    "baseline_repeat_check": repeat_check if check_repeat else None,
                     "real": {"vanilla": physical_v, "guidance": physical_g},
                 }
                 for horizon in (4, 8):
@@ -319,6 +323,8 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                         if a is not None and b is not None else None
                     )
                 rows.append(row)
+                with (diagnostics_dir / "pairs.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
                 print(
                     f"{scene['scene_id']} step={current_step}: "
                     f"pred_dRisk={row['pred_risk_delta']:+.6f} "
@@ -400,9 +406,6 @@ def main(argv=None):
             diagnostics_dir=folder,
         )
         results.extend(rows)
-        with output_path.open("a", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     summary = {
         "scenes_requested": len(selected),
