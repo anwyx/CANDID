@@ -129,6 +129,8 @@ def _rollout_single(
     if scene.get("obs_mode", "state_dict") != "state_dict":
         raise ValueError("Only state_dict scenes can be replayed")
     env_id, environment_source = resolve_scene_environment(scene)
+    if scene.get("generated_eval_suite") and environment_source != "original_env_module":
+        raise RuntimeError("Random evaluation requires original env module; no SceneSpec fallback")
     episode_dir.mkdir(parents=True, exist_ok=False)
     raw_env = gym.make(
         env_id,
@@ -392,7 +394,8 @@ def evaluate_dataset(
         "disturbance": "CANDID weighted, size-normalized peak displacement/rotation from initial scene",
     }
     report.update({
-        "dataset": str(dataset), "checkpoint": None if checkpoint is None else str(checkpoint),
+        "dataset": str(dataset) if dataset is not None else None,
+        "checkpoint": None if checkpoint is None else str(checkpoint),
         "split_file": str(split_path) if split_path is not None else None,
         "evaluation_source": evaluation_source,
         "eval_suite": str(snapshot_root) if suite_meta is not None else None,
