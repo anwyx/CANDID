@@ -104,6 +104,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.dataset is None and args.eval_suite is None:
         parser.error("Either --dataset (fixed tests) or --eval-suite is required")
+    if args.dataset is not None and args.eval_suite is not None:
+        parser.error("--dataset and --eval-suite are mutually exclusive")
     settings = GuidanceConfig(
         strength=args.strength, start_timestep=args.start_timestep,
         dr_mean_weight=args.dr_mean_weight, dr_max_weight=args.dr_max_weight,

@@ -73,6 +73,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.dataset is None and args.eval_suite is None:
         parser.error("Either --dataset (fixed tests) or --eval-suite is required")
+    if args.dataset is not None and args.eval_suite is not None:
+        parser.error("--dataset and --eval-suite are mutually exclusive")
     limits = SafetyLimits(
         args.safe_dr_mean_max,
         args.safe_dr_max_max,
