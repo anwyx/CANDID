@@ -26,6 +26,8 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
     settings = config if config is not None else GuidanceConfig()
     dp = load_policy(dp_checkpoint, device=device)
     predictor, normalizer = load_predictor(predictor_checkpoint, device=device)
+    if settings.guided_action_horizon is not None and settings.guided_action_horizon != exec_horizon:
+        raise ValueError("guided_action_horizon must match exec_horizon for executed-prefix guidance")
     policy = ConsequenceGuidedPolicy(
         dp, predictor, normalizer, settings,
         diagnose=diagnose, profile_timing=profile_timing,
@@ -52,6 +54,8 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
         "max_step_norm": settings.max_step_norm,
         "scoring_horizon": policy.action_horizon,
         "execution_horizon": exec_horizon,
+        "guided_action_horizon": settings.guided_action_horizon,
+        "predictor_label_horizon": getattr(predictor, "label_horizon", predictor.action_horizon),
         "risk_definition": "predicted_local_chunk_risk_not_episode_safety",
         "paired_diagnostics": diagnose,
         "profile_timing": profile_timing,
@@ -90,6 +94,8 @@ def main(argv=None):
     parser.add_argument("--no-stop-on-success", action="store_true")
     parser.add_argument("--strength", type=float, default=0.005)
     parser.add_argument("--start-timestep", type=int, default=30)
+    parser.add_argument("--guided-action-horizon", type=int, default=None,
+                        help="Only apply guidance corrections to the first N output actions; typically 4")
     parser.add_argument("--dr-mean-weight", type=float, default=1.0)
     parser.add_argument("--dr-max-weight", type=float, default=0.25)
     parser.add_argument("--topple-weight", type=float, default=0.1)
@@ -99,6 +105,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     settings = GuidanceConfig(
         strength=args.strength, start_timestep=args.start_timestep,
+        guided_action_horizon=args.guided_action_horizon,
         dr_mean_weight=args.dr_mean_weight, dr_max_weight=args.dr_max_weight,
         topple_weight=args.topple_weight, fall_weight=args.fall_weight,
         max_grad_norm=args.max_grad_norm, max_step_norm=args.max_step_norm,
