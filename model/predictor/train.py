@@ -8,7 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset, ConcatDataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 
 from candid.data.splits import load_or_create_scene_split
 from model.predictor.checkpoint import save_checkpoint
@@ -16,6 +16,7 @@ from model.predictor.config import PredictorConfig
 from model.predictor.dataset import PredictorWindowDataset, TrajectoryBatchSampler
 from model.predictor.network import DisturbancePredictor
 from model.predictor.policy_rollout_dataset import PolicyRolloutWindowDataset
+from model.predictor.mixed_sampler import MixedTrajectoryBatchSampler
 from model.predictor.normalizer import fit_predictor_normalizer
 
 
@@ -122,20 +123,12 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     if policy_set:
-        # Each stream gets half the SGD probability regardless of its length.
-        # This prevents the larger expert dataset from drowning out states
-        # encountered by the learned DP. No validation or test rollouts used.
-        weights = torch.cat((
-            torch.full((len(train_set),), 0.5 / len(train_set)),
-            torch.full((len(policy_set),), 0.5 / len(policy_set)),
-        )).double()
-        sampler = WeightedRandomSampler(
-            weights, num_samples=max(len(train_set), len(policy_set)),
-            replacement=True,
-            generator=torch.Generator().manual_seed(config.seed),
-        )
         loader = DataLoader(
-            mixed_set, batch_size=config.batch_size, sampler=sampler,
+            mixed_set,
+            batch_sampler=MixedTrajectoryBatchSampler(
+                train_set, policy_set, batch_size=config.batch_size,
+                seed=config.seed,
+            ),
             num_workers=0,
         )
     else:
