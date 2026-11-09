@@ -10,7 +10,6 @@ class GuidanceConfig:
     # rho=0 is an exact vanilla DP sampling control (including RNG use).
     strength: float = 0.005
     start_timestep: int = 30  # guide at t <= 30; negative values are invalid
-    guided_action_horizon: int | None = None  # optional executed-prefix-only gradient
     dr_mean_weight: float = 1.0
     dr_max_weight: float = 0.25
     topple_weight: float = 0.1
@@ -26,11 +25,6 @@ class GuidanceConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
-        if self.guided_action_horizon is not None and (
-            not isinstance(self.guided_action_horizon, int)
-            or self.guided_action_horizon < 1
-        ):
-            raise ValueError("guided_action_horizon must be a positive integer or None")
         if not isinstance(self.start_timestep, int) or self.start_timestep < 0:
             raise ValueError("start_timestep must be a nonnegative integer")
         if self.strength > 0 and (self.max_grad_norm == 0 or self.max_step_norm == 0):

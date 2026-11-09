@@ -181,9 +181,6 @@ def _rollout_single(
             policy.begin_episode(eval_seed)
         history = deque([current.copy() for _ in range(policy.obs_horizon)], maxlen=policy.obs_horizon)
         frames = [_frame_record(raw_obs)]
-        # Canonical live states are essential for supervised Predictor
-        # training on the *actual* DP action distribution (T+1 alignment).
-        obs_vectors = [current.copy()]
         actions: list[np.ndarray] = []
         clipped_actions = 0
         success_once = _is_true(info.get("success", False))
@@ -204,7 +201,6 @@ def _rollout_single(
                 clipped_actions += int(was_clipped)
                 current = _canonical_live(raw_obs, num_distractors)
                 history.append(current)
-                obs_vectors.append(current.copy())
                 current_success = _is_true(info.get("success", False))
                 success_once |= current_success
                 terminated = _is_true(terminated_raw)
@@ -222,7 +218,6 @@ def _rollout_single(
         np.savez_compressed(
             episode_npz,
             actions=np.stack(actions).astype(np.float32) if actions else np.zeros((0, policy.action_dim), dtype=np.float32),
-            observations=np.stack(obs_vectors).astype(np.float32),
             **{key: np.stack([frame[key] for frame in frames]) for key in frames[0]},
             **arrays,
         )
@@ -270,7 +265,6 @@ def evaluate_dataset(
     limits: SafetyLimits,
     *,
     checkpoint=None,
-    split_name: str = "test",
     max_scenes: int | None = None,
     scene_id: str | None = None,
     scene_substrings: list[str] | None = None,
@@ -293,9 +287,7 @@ def evaluate_dataset(
         raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
     split = json.loads(split_path.read_text(encoding="utf-8"))
     validate_scene_split(split, dataset)
-    if split_name not in ("train", "validation", "test"):
-        raise ValueError("split_name must be train, validation, or test")
-    full_test_ids = list(split[split_name])
+    full_test_ids = list(split["test"])
     if scene_id is not None and scene_substrings is not None:
         raise ValueError("Use either scene_id or scene_substrings, not both")
     if scene_substrings is not None:
@@ -306,7 +298,7 @@ def evaluate_dataset(
             found = [sid for sid in full_test_ids if key in sid]
             if len(found) != 1:
                 raise ValueError(
-                    f"Scene substring {key!r} matched {len(found)} {split_name} scenes; "
+                    f"Scene substring {key!r} matched {len(found)} held-out scenes; "
                     "provide a unique substring"
                 )
             matches.append(found[0])
@@ -316,7 +308,7 @@ def evaluate_dataset(
         test_ids = [sid for sid in full_test_ids if sid in selected]
     elif scene_id is not None:
         if scene_id not in full_test_ids:
-            raise ValueError(f"Requested scene is not in the {split_name} split: {scene_id}")
+            raise ValueError(f"Requested scene is not in the held-out TEST set: {scene_id}")
         test_ids = [scene_id]
     else:
         test_ids = full_test_ids
@@ -377,9 +369,7 @@ def evaluate_dataset(
     }
     report.update({
         "dataset": str(dataset), "checkpoint": None if checkpoint is None else str(checkpoint),
-        "split_file": str(split_path), "split_name": split_name,
-        "selected_scene_ids": test_ids,
-        "test_scene_ids": test_ids if split_name == "test" else [],
+        "split_file": str(split_path), "test_scene_ids": test_ids,
         "episodes_per_scene": episodes_per_scene, "exec_horizon": exec_horizon,
         "max_steps": max_steps, "eval_seed": eval_seed,
         "stop_on_success": stop_on_success,

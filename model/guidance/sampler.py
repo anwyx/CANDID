@@ -23,8 +23,6 @@ class ConsequenceGuidedSampler:
         self.config = config
         self.start = self.agent.obs_horizon - 1
         self.stop = self.start + self.agent.act_horizon
-        if self.config.guided_action_horizon is not None and self.config.guided_action_horizon > self.agent.act_horizon:
-            raise ValueError("guided_action_horizon exceeds DP action_horizon")
         if self.stop > self.agent.pred_horizon:
             raise ValueError("DP execution window exceeds its prediction horizon")
         if (self.agent.obs_horizon, self.agent.obs_dim) != (predictor.obs_horizon, predictor.obs_dim):
@@ -130,11 +128,7 @@ class ConsequenceGuidedSampler:
                     & torch.isfinite(gradient).all()
                 )
                 mask = torch.zeros_like(gradient)
-                guided_stop = (
-                    self.stop if self.config.guided_action_horizon is None
-                    else self.start + self.config.guided_action_horizon
-                )
-                mask[:, self.start:guided_stop] = 1
+                mask[:, self.start:self.stop] = 1
                 gradient = gradient * mask
                 largest_gradient = torch.maximum(
                     largest_gradient,

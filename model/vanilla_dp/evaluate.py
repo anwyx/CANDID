@@ -59,7 +59,6 @@ def main(argv=None):
     parser.add_argument("--safe-dr-max-min", type=float, default=0.0)
     parser.add_argument("--safe-dr-max-max", type=float, default=None)
     parser.add_argument("--scene-id", default=None)
-    parser.add_argument("--split", choices=("train", "validation", "test"), default="test")
     parser.add_argument("--max-scenes", type=int, default=None)
     parser.add_argument("--episodes-per-scene", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=300)
@@ -81,7 +80,6 @@ def main(argv=None):
         args.output_dir,
         limits,
         device=args.device,
-        split_name=args.split,
         max_scenes=args.max_scenes,
         scene_id=args.scene_id,
         episodes_per_scene=args.episodes_per_scene,

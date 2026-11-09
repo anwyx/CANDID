@@ -8,15 +8,13 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, Subset, ConcatDataset
+from torch.utils.data import DataLoader, Subset
 
 from candid.data.splits import load_or_create_scene_split
 from model.predictor.checkpoint import save_checkpoint
 from model.predictor.config import PredictorConfig
 from model.predictor.dataset import PredictorWindowDataset, TrajectoryBatchSampler
 from model.predictor.network import DisturbancePredictor
-from model.predictor.policy_rollout_dataset import PolicyRolloutWindowDataset
-from model.predictor.mixed_sampler import MixedTrajectoryBatchSampler
 from model.predictor.normalizer import fit_predictor_normalizer
 
 
@@ -68,8 +66,7 @@ def _validation_subset(dataset, max_windows, seed):
     return Subset(dataset, sorted(indices))
 
 
-def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = None,
-                    policy_rollouts=None) -> dict:
+def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = None) -> dict:
     config = PredictorConfig() if config is None else config
     dataset_root = Path(dataset_root)
     output_dir = Path(output_dir)
@@ -86,32 +83,17 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
     train_set = PredictorWindowDataset(
         dataset_root, split["train"], config.obs_horizon, config.action_horizon,
         allow_missing_event_labels=config.allow_missing_event_labels,
-        label_horizon=config.label_horizon,
     )
     val_set = (
         PredictorWindowDataset(
             dataset_root, split["validation"], config.obs_horizon, config.action_horizon,
             allow_missing_event_labels=config.allow_missing_event_labels,
-            label_horizon=config.label_horizon,
         )
         if split["validation"]
         else None
     )
     fixed_val_set = _validation_subset(val_set, config.val_max_windows, config.seed)
-    policy_set = None
-    if policy_rollouts is not None:
-        policy_set = PolicyRolloutWindowDataset(
-            policy_rollouts, split["train"],
-            obs_horizon=config.obs_horizon,
-            action_horizon=config.action_horizon,
-            label_horizon=config.label_horizon,
-        )
-        if (policy_set.obs_dim, policy_set.action_dim) != (
-            train_set.obs_dim, train_set.action_dim
-        ):
-            raise ValueError("Expert and policy rollout feature dimensions disagree")
-    mixed_set = ConcatDataset([train_set, policy_set]) if policy_set else train_set
-    normalizer = fit_predictor_normalizer(mixed_set).to(device)
+    normalizer = fit_predictor_normalizer(train_set).to(device)
     model = DisturbancePredictor(
         train_set.obs_dim,
         train_set.action_dim,
@@ -119,26 +101,15 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
         config.obs_horizon,
         config.action_horizon,
         config.hidden,
-        label_horizon=config.label_horizon,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
-    if policy_set:
-        loader = DataLoader(
-            mixed_set,
-            batch_sampler=MixedTrajectoryBatchSampler(
-                train_set, policy_set, batch_size=config.batch_size,
-                seed=config.seed,
-            ),
-            num_workers=0,
-        )
-    else:
-        loader = DataLoader(
-            train_set,
-            batch_sampler=TrajectoryBatchSampler(
-                train_set, min(config.batch_size, len(train_set)), seed=config.seed
-            ),
-            num_workers=0,
-        )
+    loader = DataLoader(
+        train_set,
+        batch_sampler=TrajectoryBatchSampler(
+            train_set, min(config.batch_size, len(train_set)), seed=config.seed
+        ),
+        num_workers=0,
+    )
 
     checkpoint_dir = output_dir / "checkpoints"
     best_path = checkpoint_dir / "best_val.pt"
@@ -218,9 +189,6 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
         "test_scenes": split["test"],
         "split_file": str(dataset_root / "split.json"),
         "train_windows": len(train_set),
-        "policy_train_windows": len(policy_set) if policy_set else 0,
-        "policy_rollouts": str(policy_rollouts) if policy_rollouts else None,
-        "label_horizon": config.label_horizon,
         "train_missing_event_trajectories": train_set.missing_event_trajectories,
         "train_missing_event_windows": train_set.missing_event_windows,
         "train_skipped_short_trajectories": train_set.skipped_short,
@@ -250,9 +218,6 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--obs-horizon", type=int, default=defaults.obs_horizon)
     parser.add_argument("--action-horizon", type=int, default=defaults.action_horizon)
-    parser.add_argument("--label-horizon", type=int, default=defaults.label_horizon)
-    parser.add_argument("--policy-rollouts", type=Path, default=None,
-                        help="Train-split Vanilla DP rollout directory with canonical observations")
     parser.add_argument("--steps", type=int, default=defaults.steps)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--lr", type=float, default=defaults.lr)
@@ -270,7 +235,6 @@ def main(argv=None):
     config = PredictorConfig(
         obs_horizon=args.obs_horizon,
         action_horizon=args.action_horizon,
-        label_horizon=args.label_horizon,
         lr=args.lr,
         batch_size=args.batch_size,
         steps=args.steps,
@@ -285,8 +249,7 @@ def main(argv=None):
         val_batch_size=args.val_batch_size,
         allow_missing_event_labels=args.allow_missing_event_labels,
     )
-    result = train_predictor(args.dataset, args.output_dir, config,
-                             policy_rollouts=args.policy_rollouts)
+    result = train_predictor(args.dataset, args.output_dir, config)
     print(f"checkpoint: {result['checkpoint']}")
     print(f"last checkpoint: {result['last_checkpoint']}")
     print(f"best step: {result['best_step']}")
