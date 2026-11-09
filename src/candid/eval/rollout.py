@@ -76,6 +76,23 @@ def _is_true(value) -> bool:
 def _check_initial_scene(scene: dict, base, trace) -> None:
     """Fail instead of silently evaluating in the wrong physical scene."""
     from candid.data.monitor import as_numpy
+    from candid.data.storage import json_safe
+
+    # A frozen state contains object poses, but cannot by itself establish
+    # whether an untracked env module changed object geometry, thresholds,
+    # or other SceneSpec parameters between suite generation and evaluation.
+    if scene.get("generated_eval_suite"):
+        saved_spec = scene.get("scene_spec")
+        current_spec = getattr(base, "SCENE", None)
+        if saved_spec is None or current_spec is None:
+            raise RuntimeError("Random evaluation needs an archived and live SceneSpec")
+        actual_spec = json_safe(current_spec.to_dict())
+        if actual_spec != saved_spec:
+            raise RuntimeError(
+                f"Environment SceneSpec changed since suite generation: "
+                f"{scene['scene_id']}. Keep the original env implementation "
+                "or generate a new suite."
+            )
 
     if scene.get("distractor_ids") is not None and list(scene["distractor_ids"]) != list(trace.names):
         raise RuntimeError(f"Distractor order mismatch for {scene['scene_id']}")
@@ -172,6 +189,15 @@ def _rollout_single(
         if getattr(env.unwrapped, "num_envs", 1) != 1:
             raise ValueError("CANDID Evaluation requires one CPU environment")
         _check_initial_scene(scene, env.unwrapped, trace)
+        if scene.get("generated_eval_suite"):
+            # Fresh pick-and-place evaluations must not start with the task
+            # already completed. Check both reset info and live physics.
+            physical_initial_success = _is_true(env.unwrapped.evaluate()["success"])
+            if physical_initial_success or _is_true(info.get("success", False)):
+                raise RuntimeError(
+                    f"Random evaluation scene {scene['scene_id']} begins in "
+                    "a successful terminal state; refuse inflated results"
+                )
         if int(np.prod(env.action_space.shape)) != policy.action_dim:
             raise ValueError("Policy action dimension does not match environment")
         num_distractors = len(trace.names)
