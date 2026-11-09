@@ -53,6 +53,7 @@ def load_predictor(path, device="cpu"):
         obs_horizon=payload["config"]["obs_horizon"],
         action_horizon=payload["config"]["action_horizon"],
         hidden=payload["config"]["hidden"],
+        label_horizon=payload["config"].get("label_horizon", payload["config"]["action_horizon"]),
     ).to(device)
     model.load_state_dict(payload["model"])
     model.label_horizon = payload["config"].get("label_horizon", model.action_horizon)
