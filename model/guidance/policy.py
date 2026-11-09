@@ -1,7 +1,6 @@
 """Plug-and-play ChunkPolicy with opt-in paired, same-noise diagnostics."""
 from __future__ import annotations
 
-from contextlib import nullcontext
 from time import perf_counter
 
 import numpy as np
@@ -55,51 +54,6 @@ class ConsequenceGuidedPolicy:
             return action
         low, high = (bound.to(action.device) for bound in self.bounds)
         return torch.maximum(torch.minimum(action, high), low)
-
-    def _paired_diagnostics(self, history, guided):
-        """Sample baseline from the same RNG state without advancing real rollout RNG.
-
-        fork_rng restores the CPU and model CUDA RNG states. Consequently the
-        following guided sample uses the exact noise sequence the baseline used.
-        Comparisons are at the *same live observation* rather than comparing
-        independently rolled-out trajectories (which diverge after actions).
-        """
-        device = history.device
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        begun = perf_counter()
-        with torch.random.fork_rng(devices=self._cuda_rng_devices()):
-            with torch.no_grad():
-                baseline_normalized = self.sampler.agent.get_action(history)
-                baseline = self.dp_policy.normalizer.denormalize(baseline_normalized)
-                baseline_scored = self._clip(baseline)
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        baseline_ms = (perf_counter() - begun) * 1000
-
-        with torch.no_grad():
-            guided_scored = self._clip(guided)
-            obs_pair = history.expand(2, -1, -1)
-            actions_pair = torch.cat([baseline_scored, guided_scored], dim=0)
-            risks = chunk_risk(
-                obs_pair, actions_pair, self.sampler.predictor,
-                self.sampler.predictor_normalizer, self.config,
-            )
-            diff = guided_scored - baseline_scored
-            abs_diff = diff.abs()
-            # Use exactly the actions that will reach the environment.
-            report = {
-                "risk_before": float(risks[0].item()),
-                "risk_after": float(risks[1].item()),
-                "risk_delta": float((risks[1] - risks[0]).item()),
-                "action_abs_mean": float(abs_diff.mean().item()),
-                "action_abs_max": float(abs_diff.max().item()),
-                "action_l2": float(diff.flatten(start_dim=1).norm(dim=1).max().item()),
-                "baseline_action_clipped": bool(torch.any(baseline != baseline_scored).item()),
-                "paired_comparison": "same_obs_same_sampling_rng_independent_baseline",
-                "baseline_sampling_wall_ms": baseline_ms,
-            }
-        return report
 
     def act(self, observation_window):
         obs = np.asarray(observation_window, dtype=np.float32)
