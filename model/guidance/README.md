@@ -57,3 +57,50 @@ Do not claim safety improvements without checking real disturbance,
 topple/fall, success and safe success in closed-loop rollouts.
 
 Tests: `python -m pytest tests/test_guidance.py -q`.
+
+## Diagnostic rerun: five informative scene1 cases
+
+These are the exact held-out scenes from the previous 18-scene run, identified
+by unique substrings. The subset retains each scene's **original index-based
+evaluation seed**, so the new rollout can be paired with the earlier full
+evaluation. The same-noise counterfactual Vanilla action is evaluated at each
+Guidance observation; only Guidance actions are sent to the simulator.
+
+```bash
+mkdir -p logs
+set -o pipefail
+/usr/bin/time -f '\nElapsed time: %e seconds\nPeak memory: %M KB' \
+python scripts/eval_dp_guidance.py \
+  --dataset demos/scene1 \
+  --dp-checkpoint ckpt/scene1/best_val.pt \
+  --predictor-checkpoint ckpt_file/best_val.pt \
+  --output-dir runs/scene1_guidance_diag5 \
+  --scene-substrings 145921,162144,153215,172333,155446 \
+  --max-steps 300 --exec-horizon 4 --eval-seed 2026 \
+  --safe-dr-mean-max 0.2 --strength 0.005 --start-timestep 30 \
+  --device cuda --diagnose --profile-timing --no-video \
+  2>&1 | tee logs/scene1_guidance_diag5.log
+```
+
+Then summarize and compare the true closed-loop outcomes from the original
+18-scene `strength=0` run:
+
+```bash
+python scripts/analyze_guidance_diagnostics.py \
+  runs/scene1_guidance_diag5 \
+  --baseline-run runs/scene1_guidance_zero
+```
+
+Interpretation:
+- `paired.risk_before` vs `risk_after` scores different chunks under the
+  **same live observation** using the exact same diffusion sampling RNG.
+- `paired.action_abs_mean/max` measure differences in clipped absolute
+  environment joint targets, not normalized latent tensors.
+- `timing_ms.denoiser_ms`, `predictor_gradient_ms`, `ddpm_update_ms`
+  are CUDA-event GPU stream times, while `sampling_wall_ms` and
+  `baseline_sampling_wall_ms` are wall-clock time. They do not sum exactly.
+- Additional counterfactual sampling and timing both add overhead, so do
+  **not** compare diagnostic-run wall time directly to the previous 18-scene
+  runtime as a throughput benchmark.
+- The gradient step still optimizes predicted local chunk risk, which may
+  disagree with actual environment safety.
