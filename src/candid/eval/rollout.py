@@ -181,6 +181,9 @@ def _rollout_single(
             policy.begin_episode(eval_seed)
         history = deque([current.copy() for _ in range(policy.obs_horizon)], maxlen=policy.obs_horizon)
         frames = [_frame_record(raw_obs)]
+        # Canonical live states are essential for supervised Predictor
+        # training on the *actual* DP action distribution (T+1 alignment).
+        obs_vectors = [current.copy()]
         actions: list[np.ndarray] = []
         clipped_actions = 0
         success_once = _is_true(info.get("success", False))
@@ -201,6 +204,7 @@ def _rollout_single(
                 clipped_actions += int(was_clipped)
                 current = _canonical_live(raw_obs, num_distractors)
                 history.append(current)
+                obs_vectors.append(current.copy())
                 current_success = _is_true(info.get("success", False))
                 success_once |= current_success
                 terminated = _is_true(terminated_raw)
@@ -218,6 +222,7 @@ def _rollout_single(
         np.savez_compressed(
             episode_npz,
             actions=np.stack(actions).astype(np.float32) if actions else np.zeros((0, policy.action_dim), dtype=np.float32),
+            observations=np.stack(obs_vectors).astype(np.float32),
             **{key: np.stack([frame[key] for frame in frames]) for key in frames[0]},
             **arrays,
         )
