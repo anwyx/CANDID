@@ -19,3 +19,10 @@ def test_guidance_diagnostic_source_is_syntactically_valid():
                  "model/guidance/policy.py", "model/guidance/evaluate.py",
                  "scripts/analyze_guidance_diagnostics.py"):
         ast.parse((root / path).read_text())
+
+
+def test_headless_state_dict_rollout_disables_renderer():
+    source = (Path(__file__).resolve().parents[1] / "src/candid/eval/rollout.py").read_text()
+    ast.parse(source)
+    assert 'render_backend="gpu" if save_video else "none"' in source
+    assert 'sim_backend="cpu"' in source
