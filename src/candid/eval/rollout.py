@@ -80,6 +80,7 @@ def _check_initial_scene(scene: dict, base, trace) -> None:
     if scene.get("distractor_ids") is not None and list(scene["distractor_ids"]) != list(trace.names):
         raise RuntimeError(f"Distractor order mismatch for {scene['scene_id']}")
     expected = (
+        ("stable_initial_goal_pos", as_numpy(base.goal_site.pose.p).reshape(1, -1)[0]),
         ("stable_initial_distractor_poses", trace.arrays()["distractor_poses"][0]),
         ("stable_initial_target_pose", as_numpy(base.cube.pose.raw_pose).reshape(-1, 7)[0]),
         ("stable_initial_robot_qpos", as_numpy(base.agent.robot.get_qpos()).reshape(1, -1)[0]),
@@ -265,6 +266,7 @@ def evaluate_dataset(
     limits: SafetyLimits,
     *,
     checkpoint=None,
+    eval_suite: str | Path | None = None,
     max_scenes: int | None = None,
     scene_id: str | None = None,
     scene_substrings: list[str] | None = None,
@@ -281,13 +283,34 @@ def evaluate_dataset(
         raise ValueError("max_steps and episodes_per_scene must be positive")
     if max_scenes is not None and max_scenes < 1:
         raise ValueError("max_scenes must be positive")
-    validate_dataset(dataset)
-    split_path = dataset / "split.json"
-    if not split_path.is_file():
-        raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
-    split = json.loads(split_path.read_text(encoding="utf-8"))
-    validate_scene_split(split, dataset)
-    full_test_ids = list(split["test"])
+    # The old frozen test split remains the default for historical results.
+    # Random-suite mode reads an immutable, separately generated set of
+    # scene states; all policies receive these same physical initial states.
+    suite_meta = None
+    split_path = None
+    if eval_suite is None:
+        validate_dataset(dataset)
+        split_path = dataset / "split.json"
+        if not split_path.is_file():
+            raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
+        split = json.loads(split_path.read_text(encoding="utf-8"))
+        validate_scene_split(split, dataset)
+        full_test_ids = list(split["test"])
+        scenes = {row["scene_id"]: row for row in _read_jsonl(dataset / "scenes.jsonl")}
+        snapshot_root = dataset
+        evaluation_source = "frozen_test_split"
+    else:
+        from candid.eval.scene_suite import load_suite
+        snapshot_root = Path(eval_suite)
+        suite_meta, suite_rows = load_suite(snapshot_root)
+        full_test_ids = [row["scene_id"] for row in suite_rows]
+        scenes = {row["scene_id"]: row for row in suite_rows}
+        evaluation_source = "random_frozen_suite"
+        if max_steps > suite_meta["max_episode_steps"]:
+            raise ValueError(
+                f"max_steps={max_steps} exceeds suite generation "
+                f"max_episode_steps={suite_meta['max_episode_steps']}"
+            )
     if scene_id is not None and scene_substrings is not None:
         raise ValueError("Use either scene_id or scene_substrings, not both")
     if scene_substrings is not None:
@@ -319,7 +342,6 @@ def evaluate_dataset(
     # Preserve each scene's original evaluation seed when selecting a subset,
     # so targeted reruns are paired with the original full-scene evaluation.
     original_test_index = {sid: index for index, sid in enumerate(full_test_ids)}
-    scenes = {row["scene_id"]: row for row in _read_jsonl(dataset / "scenes.jsonl")}
     if exec_horizon < 1 or exec_horizon > policy.action_horizon:
         raise ValueError(f"exec_horizon must be in [1, {policy.action_horizon}]")
     if output.exists() and any(output.iterdir()):
@@ -333,7 +355,7 @@ def evaluate_dataset(
             np.random.seed(seed % (2**32))
             name = f"{index:03d}_{_safe_file_stem(selected_id)}_rep{repetition:02d}"
             row = _rollout_single(
-                scene, dataset, policy, output / name, limits,
+                scene, snapshot_root, policy, output / name, limits,
                 max_steps=max_steps, exec_horizon=exec_horizon,
                 eval_seed=seed, save_video=save_video,
                 stop_on_success=stop_on_success,
@@ -369,7 +391,12 @@ def evaluate_dataset(
     }
     report.update({
         "dataset": str(dataset), "checkpoint": None if checkpoint is None else str(checkpoint),
-        "split_file": str(split_path), "test_scene_ids": test_ids,
+        "split_file": str(split_path) if split_path is not None else None,
+        "evaluation_source": evaluation_source,
+        "eval_suite": str(snapshot_root) if suite_meta is not None else None,
+        "eval_suite_sha256": suite_meta["suite_content_sha256"] if suite_meta else None,
+        "eval_suite_seed": suite_meta["seed"] if suite_meta else None,
+        "test_scene_ids": test_ids,
         "episodes_per_scene": episodes_per_scene, "exec_horizon": exec_horizon,
         "max_steps": max_steps, "eval_seed": eval_seed,
         "stop_on_success": stop_on_success,
