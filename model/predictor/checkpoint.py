@@ -21,6 +21,7 @@ def save_checkpoint(path, model, normalizer: PredictorNormalizer, config: Predic
             "config": {
                 "obs_horizon": config.obs_horizon,
                 "action_horizon": config.action_horizon,
+                "label_horizon": config.label_horizon,
                 "hidden": config.hidden,
             },
             "obs_dim": model.obs_dim,
@@ -54,6 +55,7 @@ def load_predictor(path, device="cpu"):
         hidden=payload["config"]["hidden"],
     ).to(device)
     model.load_state_dict(payload["model"])
+    model.label_horizon = payload["config"].get("label_horizon", model.action_horizon)
     model.eval()
     normalizer = PredictorNormalizer(
         payload["obs_mean"],
