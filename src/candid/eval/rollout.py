@@ -263,6 +263,7 @@ def evaluate_dataset(
     checkpoint=None,
     max_scenes: int | None = None,
     scene_id: str | None = None,
+    scene_substrings: list[str] | None = None,
     episodes_per_scene: int = 1,
     max_steps: int = 300,
     exec_horizon: int = 8,
@@ -282,15 +283,38 @@ def evaluate_dataset(
         raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
     split = json.loads(split_path.read_text(encoding="utf-8"))
     validate_scene_split(split, dataset)
-    test_ids = split["test"]
-    if scene_id is not None:
-        if scene_id not in test_ids:
+    full_test_ids = list(split["test"])
+    if scene_id is not None and scene_substrings is not None:
+        raise ValueError("Use either scene_id or scene_substrings, not both")
+    if scene_substrings is not None:
+        if not scene_substrings or any(not key for key in scene_substrings):
+            raise ValueError("scene_substrings must contain nonempty entries")
+        matches = []
+        for key in scene_substrings:
+            found = [sid for sid in full_test_ids if key in sid]
+            if len(found) != 1:
+                raise ValueError(
+                    f"Scene substring {key!r} matched {len(found)} held-out scenes; "
+                    "provide a unique substring"
+                )
+            matches.append(found[0])
+        if len(set(matches)) != len(matches):
+            raise ValueError("scene_substrings resolved to duplicate scene IDs")
+        selected = set(matches)
+        test_ids = [sid for sid in full_test_ids if sid in selected]
+    elif scene_id is not None:
+        if scene_id not in full_test_ids:
             raise ValueError(f"Requested scene is not in the held-out TEST set: {scene_id}")
         test_ids = [scene_id]
+    else:
+        test_ids = full_test_ids
     if max_scenes is not None:
         test_ids = test_ids[:max_scenes]
     if not test_ids:
         raise ValueError("No test scenes available")
+    # Preserve each scene's original evaluation seed when selecting a subset,
+    # so targeted reruns are paired with the original full-scene evaluation.
+    original_test_index = {sid: index for index, sid in enumerate(full_test_ids)}
     scenes = {row["scene_id"]: row for row in _read_jsonl(dataset / "scenes.jsonl")}
     if exec_horizon < 1 or exec_horizon > policy.action_horizon:
         raise ValueError(f"exec_horizon must be in [1, {policy.action_horizon}]")
@@ -301,7 +325,7 @@ def evaluate_dataset(
     for index, selected_id in enumerate(test_ids):
         scene = scenes[selected_id]
         for repetition in range(episodes_per_scene):
-            seed = eval_seed + index * 100000 + repetition
+            seed = eval_seed + original_test_index[selected_id] * 100000 + repetition
             np.random.seed(seed % (2**32))
             name = f"{index:03d}_{_safe_file_stem(selected_id)}_rep{repetition:02d}"
             row = _rollout_single(
