@@ -118,6 +118,7 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
         config.obs_horizon,
         config.action_horizon,
         config.hidden,
+        label_horizon=config.label_horizon,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     if policy_set:
