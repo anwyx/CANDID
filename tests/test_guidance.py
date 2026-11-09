@@ -203,3 +203,51 @@ def test_risk_is_differentiable_wrt_physical_actions():
                       IdentityNormalizer(), GuidanceConfig(start_timestep=1))
     gradient = torch.autograd.grad(risk.sum(), actions)[0]
     assert torch.isfinite(gradient).all() and torch.any(gradient != 0)
+
+
+def test_paired_diagnostics_do_not_change_actions_or_future_rng():
+    obs = np.zeros((2, 3), np.float32)
+    plain, _ = make_policy(GuidanceConfig(strength=0.05, start_timestep=1))
+    paired, _ = make_policy(GuidanceConfig(strength=0.05, start_timestep=1))
+    paired.diagnose = True
+    plain.begin_episode(77)
+    expected = [plain.act(obs) for _ in range(4)]
+    expected_rng = torch.get_rng_state().clone()
+    paired.begin_episode(77)
+    actual = [paired.act(obs) for _ in range(4)]
+    assert all(np.array_equal(a, b) for a, b in zip(actual, expected))
+    assert torch.equal(expected_rng, torch.get_rng_state())
+    diagnostic = paired.get_diagnostics()
+    assert diagnostic["paired_count"] == 4
+    assert diagnostic["paired_risk_decreased_count"] == 4
+    assert diagnostic["paired_risk_delta_mean"] < 0
+    assert diagnostic["paired_action_abs_mean"] > 0
+    for row in diagnostic["decisions"]:
+        assert row["paired"]["risk_after"] < row["paired"]["risk_before"]
+        assert row["paired"]["action_abs_max"] > 0
+
+
+def test_paired_zero_strength_is_noop():
+    obs = np.zeros((2, 3), np.float32)
+    paired, _ = make_policy(GuidanceConfig(strength=0, start_timestep=1))
+    paired.diagnose = True
+    paired.begin_episode(41)
+    paired.act(obs)
+    diagnostic = paired.get_diagnostics()
+    assert diagnostic["paired_count"] == 1
+    assert diagnostic["decisions"][0]["paired"]["action_abs_max"] == 0
+    assert abs(diagnostic["decisions"][0]["paired"]["risk_delta"]) < 1e-7
+
+
+def test_cpu_profiler_reports_nonnegative_phase_durations():
+    policy, _ = make_policy(GuidanceConfig(strength=0.05, start_timestep=1))
+    policy.profile_timing = True
+    policy.begin_episode(17)
+    policy.act(np.zeros((2, 3), np.float32))
+    row = policy.get_diagnostics()["decisions"][0]["timing_ms"]
+    assert row["phase_time_source"] == "cpu_wall"
+    assert row["sampling_wall_ms"] > 0
+    for key in ("denoiser_ms", "predictor_gradient_ms", "ddpm_update_ms"):
+        assert row[key] >= 0
+    totals = policy.get_diagnostics()["timing_totals_ms"]
+    assert totals["sampling_wall_ms"] == row["sampling_wall_ms"]
