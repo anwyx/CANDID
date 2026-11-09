@@ -277,8 +277,10 @@ def evaluate_dataset(
     save_video: bool = True,
     stop_on_success: bool = True,
 ) -> dict:
-    dataset = Path(dataset_root)
+    dataset = Path(dataset_root) if dataset_root is not None else None
     output = Path(output_dir)
+    if dataset is None and eval_suite is None:
+        raise ValueError("dataset_root or eval_suite must be supplied")
     if max_steps < 1 or episodes_per_scene < 1:
         raise ValueError("max_steps and episodes_per_scene must be positive")
     if max_scenes is not None and max_scenes < 1:
