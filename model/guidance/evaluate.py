@@ -18,6 +18,7 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
                       config=None, device="cpu", max_scenes=None, scene_id=None,
                       scene_substrings=None, diagnose=False, profile_timing=False,
                       episodes_per_scene=1, max_steps=300, exec_horizon=8,
+                      eval_suite=None,
                       eval_seed=2026, save_video=False, stop_on_success=True):
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -32,6 +33,7 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
     )
     report = evaluate_dataset(
         dataset, policy, output_dir, limits, checkpoint=dp_checkpoint,
+        eval_suite=eval_suite,
         max_scenes=max_scenes, scene_id=scene_id,
         scene_substrings=scene_substrings,
         episodes_per_scene=episodes_per_scene, max_steps=max_steps,
@@ -65,7 +67,10 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="CANDID gradient-guided DP closed-loop evaluation")
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, default=None,
+                        help="Existing dataset for fixed-test mode; optional with --eval-suite")
+    parser.add_argument("--eval-suite", type=Path, default=None,
+                        help="Frozen random suite created by generate_eval_scenes.py")
     parser.add_argument("--dp-checkpoint", type=Path, required=True)
     parser.add_argument("--predictor-checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -97,6 +102,8 @@ def main(argv=None):
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--max-step-norm", type=float, default=0.02)
     args = parser.parse_args(argv)
+    if args.dataset is None and args.eval_suite is None:
+        parser.error("Either --dataset (fixed tests) or --eval-suite is required")
     settings = GuidanceConfig(
         strength=args.strength, start_timestep=args.start_timestep,
         dr_mean_weight=args.dr_mean_weight, dr_max_weight=args.dr_max_weight,
@@ -110,6 +117,7 @@ def main(argv=None):
     report = evaluate_guidance(
         args.dataset, args.dp_checkpoint, args.predictor_checkpoint,
         args.output_dir, limits, config=settings, device=args.device,
+        eval_suite=args.eval_suite,
         max_scenes=args.max_scenes, scene_id=args.scene_id,
         scene_substrings=(
             [word.strip() for word in args.scene_substrings.split(",") if word.strip()]

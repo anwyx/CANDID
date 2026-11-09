@@ -22,6 +22,7 @@ def evaluate_dp_predictor(
     dataset, dp_checkpoint, predictor_checkpoint, output_dir, limits, *,
     mode="shadow", num_candidates=1, device="cpu", max_scenes=None,
     scene_id=None, episodes_per_scene=1, max_steps=300, exec_horizon=8,
+    eval_suite=None,
     eval_seed=2026, save_video=False, stop_on_success=True,
     dr_mean_weight=1.0, dr_max_weight=0.25, topple_weight=0.1,
     fall_weight=0.0, min_improvement=0.01, max_joint_deviation=0.15,
@@ -40,6 +41,7 @@ def evaluate_dp_predictor(
     )
     report = evaluate_dataset(
         dataset, policy, output_dir, limits, checkpoint=dp_checkpoint,
+        eval_suite=eval_suite,
         max_scenes=max_scenes, scene_id=scene_id,
         episodes_per_scene=episodes_per_scene, max_steps=max_steps,
         exec_horizon=exec_horizon, eval_seed=eval_seed,
@@ -93,7 +95,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Closed-loop shadow/rerank evaluation of frozen DP and Predictor"
     )
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, default=None,
+                        help="Existing dataset for fixed-test mode; optional with --eval-suite")
+    parser.add_argument("--eval-suite", type=Path, default=None,
+                        help="Frozen random suite created by generate_eval_scenes.py")
     parser.add_argument("--dp-checkpoint", type=Path, required=True)
     parser.add_argument("--predictor-checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -119,6 +124,8 @@ def main(argv=None):
     parser.add_argument("--min-improvement", type=float, default=0.01)
     parser.add_argument("--max-joint-deviation", type=float, default=0.15)
     args = parser.parse_args(argv)
+    if args.dataset is None and args.eval_suite is None:
+        parser.error("Either --dataset (fixed tests) or --eval-suite is required")
     limits = SafetyLimits(
         args.safe_dr_mean_max, args.safe_dr_max_max,
         args.safe_dr_mean_min, args.safe_dr_max_min,
@@ -127,6 +134,7 @@ def main(argv=None):
         args.dataset, args.dp_checkpoint, args.predictor_checkpoint,
         args.output_dir, limits, mode=args.mode,
         num_candidates=args.num_candidates, device=args.device,
+        eval_suite=args.eval_suite,
         max_scenes=args.max_scenes, scene_id=args.scene_id,
         episodes_per_scene=args.episodes_per_scene, max_steps=args.max_steps,
         exec_horizon=args.exec_horizon, eval_seed=args.eval_seed,

@@ -51,7 +51,10 @@ def evaluate_vanilla_dp(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate trained Vanilla DP on frozen TEST scenes")
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, default=None,
+                        help="Existing dataset for fixed-test mode; optional with --eval-suite")
+    parser.add_argument("--eval-suite", type=Path, default=None,
+                        help="Frozen random suite created by generate_eval_scenes.py")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--safe-dr-mean-max", type=float, required=True)
@@ -68,6 +71,8 @@ def main(argv=None):
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--no-stop-on-success", action="store_true")
     args = parser.parse_args(argv)
+    if args.dataset is None and args.eval_suite is None:
+        parser.error("Either --dataset (fixed tests) or --eval-suite is required")
     limits = SafetyLimits(
         args.safe_dr_mean_max,
         args.safe_dr_max_max,
@@ -80,6 +85,7 @@ def main(argv=None):
         args.output_dir,
         limits,
         device=args.device,
+        eval_suite=args.eval_suite,
         max_scenes=args.max_scenes,
         scene_id=args.scene_id,
         episodes_per_scene=args.episodes_per_scene,
