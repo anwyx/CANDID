@@ -134,6 +134,10 @@ def _rollout_single(
         obs_mode="state_dict",
         control_mode="pd_joint_pos",
         render_mode="rgb_array" if save_video else None,
+        # Keep PhysX CPU simulation and PyTorch GPU inference independent of
+        # SAPIEN/Vulkan rendering. Headless state_dict evaluation requires no
+        # renderer; the default "gpu" renderer can fail on compute servers.
+        render_backend="gpu" if save_video else "none",
         robot_uids="xarm6_robotiq",
         reward_mode="dense",
         sim_backend="cpu",
