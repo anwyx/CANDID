@@ -200,7 +200,14 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
         )
         _check_initial_scene(scene, reference.unwrapped, reference)
         branch = make_env(scene, max_steps, env_id)
-        branch.reset(seed=int(scene["seed"]))
+        branch.reset(
+            seed=int(scene["seed"]),
+            options={"reset_to_env_states": {
+                "env_states": load_state_npz(
+                    dataset / scene["initial_state"], device="cpu"
+                )
+            }},
+        )
         if int(np.prod(reference.action_space.shape)) != dp.action_dim:
             raise ValueError("Action dimension mismatch")
         guidance.set_action_space(reference.action_space)
