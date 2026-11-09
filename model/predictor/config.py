@@ -8,6 +8,7 @@ from dataclasses import dataclass
 class PredictorConfig:
     obs_horizon: int = 2
     action_horizon: int = 8
+    label_horizon: int = 8  # prefix length used for actual physical-risk labels
     hidden: int = 256
     lr: float = 1e-3
     batch_size: int = 64
@@ -24,7 +25,7 @@ class PredictorConfig:
     allow_missing_event_labels: bool = False
 
     def __post_init__(self):
-        if self.obs_horizon < 1 or self.action_horizon < 1:
+        if self.obs_horizon < 1 or self.action_horizon < 1 or not (1 <= self.label_horizon <= self.action_horizon):
             raise ValueError("Horizons must be positive")
         if self.steps < 1 or self.batch_size < 1:
             raise ValueError("Steps and batch size must be positive")
