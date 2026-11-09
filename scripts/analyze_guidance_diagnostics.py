@@ -34,9 +34,10 @@ def main():
             raise ValueError("Missing per-episode policy diagnostics; enable --diagnose")
         path = Path(diag_path)
         if not path.is_file():
-            # Support moving the entire result directory after evaluation.
-            path = next(args.run_dir.rglob(path.name), None)
-            if path is None:
+            # Preserve the row's episode directory when results were moved;
+            # searching by filename alone could load another episode's log.
+            path = args.run_dir / Path(diag_path).parent.name / Path(diag_path).name
+            if not path.is_file():
                 raise FileNotFoundError(diag_path)
         diag = json.loads(path.read_text(encoding="utf-8"))
         if not diag.get("paired_count"):
