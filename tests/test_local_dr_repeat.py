@@ -53,3 +53,39 @@ def test_timeline_disagreement_is_never_tolerated():
     result = compare_repeat(a, b, poses, poses)
     assert not result["passed"]
     assert not result["timeline_equal"]
+
+
+def test_quaternion_sign_flip_is_same_rotation():
+    poses = np.zeros((9, 2, 7))
+    poses[..., 3] = 1.0
+    flipped = poses.copy()
+    flipped[..., 3:] *= -1
+    result = compare_repeat(_metrics(), _metrics(), poses, flipped)
+    assert result["passed"]
+    assert result["max_rotation_rad"] == 0.0
+
+
+def test_small_quaternion_component_difference_is_under_angle_tolerance():
+    poses = np.zeros((9, 2, 7))
+    poses[..., 3] = 1.0
+    shifted = poses.copy()
+    shifted[..., 4] = 1.3275938e-5
+    result = compare_repeat(_metrics(), _metrics(), poses, shifted)
+    assert result["passed"]
+    assert result["max_rotation_rad"] < 5e-4
+
+
+def test_large_orientation_change_fails():
+    poses = np.zeros((9, 2, 7))
+    poses[..., 3] = 1.0
+    shifted = poses.copy()
+    shifted[..., 4] = 0.01
+    result = compare_repeat(_metrics(), _metrics(), poses, shifted)
+    assert not result["passed"]
+
+
+def test_substantive_dr_difference_fails():
+    poses = np.zeros((9, 2, 7))
+    poses[..., 3] = 1.0
+    result = compare_repeat(_metrics(), _metrics(value=0.101), poses, poses)
+    assert not result["passed"]
