@@ -16,11 +16,17 @@ def predict(model, normalizer, obs, actions):
             normalizer.normalize_obs(obs),
             normalizer.normalize_action(actions),
         )
-        dr = normalizer.denormalize_target(outputs["dr"])
+        dr = (outputs["dr"] if "ordinal_logits" in outputs
+              else normalizer.denormalize_target(outputs["dr"]))
         events = torch.sigmoid(outputs["event_logits"])
-        return {
+        result = {
             "dr_mean": dr[:, 0],
             "dr_max": dr[:, 1],
             "topple_prob": events[:, 0],
             "fall_prob": events[:, 1],
         }
+        if "ordinal_logits" in outputs:
+            probs = torch.sigmoid(outputs["ordinal_logits"])
+            result["dr_mean_exceed_prob"] = probs[:, 0]
+            result["dr_max_exceed_prob"] = probs[:, 1]
+        return result

@@ -14,7 +14,7 @@ from candid.data.splits import load_or_create_scene_split
 from model.predictor.checkpoint import save_checkpoint
 from model.predictor.config import PredictorConfig
 from model.predictor.dataset import PredictorWindowDataset, TrajectoryBatchSampler
-from model.predictor.network import DisturbancePredictor
+from model.predictor.network import DisturbancePredictor, OrdinalDisturbancePredictor
 from model.predictor.normalizer import fit_predictor_normalizer
 
 
@@ -49,7 +49,8 @@ def _mean_loss(model, normalizer, dataset, device, batch_size=256) -> float | No
             loss = model.loss(
                 normalizer.normalize_obs(batch["obs"]),
                 normalizer.normalize_action(batch["action"]),
-                normalizer.normalize_target(batch["target"]),
+                (batch["target"] if getattr(model, 'dr_objective', 'regression') == 'ordinal'
+                 else normalizer.normalize_target(batch["target"])),
                 batch["event_mask"],
                 normalizer.event_pos_weight,
             )
@@ -94,13 +95,19 @@ def train_predictor(dataset_root, output_dir, config: PredictorConfig | None = N
     )
     fixed_val_set = _validation_subset(val_set, config.val_max_windows, config.seed)
     normalizer = fit_predictor_normalizer(train_set).to(device)
-    model = DisturbancePredictor(
+    predictor_cls = (OrdinalDisturbancePredictor if config.dr_objective == 'ordinal'
+                     else DisturbancePredictor)
+    ordinal_kwargs = ({'dr_thresholds': config.dr_thresholds,
+                       'ordinal_pos_weight': config.ordinal_pos_weight}
+                      if config.dr_objective == 'ordinal' else {})
+    model = predictor_cls(
         train_set.obs_dim,
         train_set.action_dim,
         train_set.target_dim,
         config.obs_horizon,
         config.action_horizon,
         config.hidden,
+        **ordinal_kwargs,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
     loader = DataLoader(
@@ -218,6 +225,9 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--obs-horizon", type=int, default=defaults.obs_horizon)
     parser.add_argument("--action-horizon", type=int, default=defaults.action_horizon)
+    parser.add_argument("--dr-objective", choices=('regression','ordinal'), default='regression')
+    parser.add_argument("--dr-thresholds", default=','.join(str(x) for x in defaults.dr_thresholds))
+    parser.add_argument("--ordinal-pos-weight", type=float, default=5.0)
     parser.add_argument("--steps", type=int, default=defaults.steps)
     parser.add_argument("--batch-size", type=int, default=defaults.batch_size)
     parser.add_argument("--lr", type=float, default=defaults.lr)
@@ -233,6 +243,9 @@ def main(argv=None):
     parser.add_argument("--allow-missing-event-labels", action="store_true")
     args = parser.parse_args(argv)
     config = PredictorConfig(
+        dr_objective=args.dr_objective,
+        dr_thresholds=tuple(float(x) for x in args.dr_thresholds.split(',')),
+        ordinal_pos_weight=args.ordinal_pos_weight,
         obs_horizon=args.obs_horizon,
         action_horizon=args.action_horizon,
         lr=args.lr,

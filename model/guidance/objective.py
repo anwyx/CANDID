@@ -11,7 +11,8 @@ def risk_from_predictions(outputs, predictor_normalizer, config):
     dr_max >= dr_mean, prevents nonphysical outputs from being rewarded.
     Sigmoid logits are scores, not calibrated episode event probabilities.
     """
-    dr = predictor_normalizer.denormalize_target(outputs["dr"])
+    dr = (outputs["dr"] if "ordinal_logits" in outputs
+          else predictor_normalizer.denormalize_target(outputs["dr"]))
     probabilities = torch.sigmoid(outputs["event_logits"])
     mean = dr[:, 0].clamp_min(0.0)
     maximum = torch.maximum(dr[:, 1].clamp_min(0.0), mean)
