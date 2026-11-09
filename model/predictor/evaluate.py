@@ -179,11 +179,13 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
     test_set = PredictorWindowDataset(
         dataset_root, split["test"], model.obs_horizon, model.action_horizon,
         allow_missing_event_labels=allow_missing_event_labels,
+        label_horizon=model.label_horizon,
     )
     val_set = (
         PredictorWindowDataset(
             dataset_root, split["validation"], model.obs_horizon, model.action_horizon,
             allow_missing_event_labels=allow_missing_event_labels,
+            label_horizon=model.label_horizon,
         ) if split["validation"] else None
     )
     validation_rows = _score_dataset(val_set, model, normalizer, batch_size) if val_set else []
@@ -204,6 +206,7 @@ def evaluate_predictor(dataset_root, checkpoint, output_dir, device="cpu", batch
         "dataset": str(dataset_root),
         "test_scenes": split["test"],
         "test_windows": len(test_rows),
+        "label_horizon": model.label_horizon,
         "validation_windows_for_threshold": len(validation_rows),
         "threshold_source": "validation" if validation_rows else "default_0.5",
         "scene_metrics": scenes,
