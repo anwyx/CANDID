@@ -26,26 +26,34 @@ actual physical disturbance, topple and fall under identical replay splits.
 `--strength 0` is an exact Vanilla DP sampling and RNG control (and skips
 Predictor evaluation). Do not infer effectiveness without closed-loop tests.
 
-## Evaluation
+## Evaluation (the same scene1 protocol as Vanilla DP / Rerank)
+
+Use `demos/scene1`, the 18 held-out test scenes, max 300 environment
+steps, execution horizon 4 (the Predictor still scores 8-step chunks),
+eval seed 2026, and DR-mean safety cutoff 0.2.  The DP and Predictor
+checkpoints are independent.
 
 ```bash
 python scripts/eval_dp_guidance.py \
-  --dataset demos/dense_random_120_no_collision_aware \
-  --dp-checkpoint /path/to/your_dp.pt \
-  --predictor-checkpoint /path/to/your_predictor.pt \
-  --output-dir runs/guidance_eval_18 \
-  --safe-dr-mean-max 0.1 --max-scenes 18 --max-steps 700 \
-  --exec-horizon 8 --strength 0.005 --start-timestep 30 --no-video
+  --dataset demos/scene1 \
+  --dp-checkpoint ckpt/scene1/best_val.pt \
+  --predictor-checkpoint ckpt_file/best_val.pt \
+  --output-dir runs/scene1_guidance_0005 \
+  --max-scenes 18 --max-steps 300 --exec-horizon 4 \
+  --eval-seed 2026 --safe-dr-mean-max 0.2 \
+  --strength 0.005 --start-timestep 30 --device cpu --no-video
 ```
 
-Checkpoint locations and the disturbance safety threshold above are
-examples: replace them with actual file paths and evaluation threshold.
-The dataset must have a valid `split.json` with held-out test scenes.
-For a no-op control, repeat with `--strength 0` and a different output dir.
-Use the *same* dataset, test scenes, seed, execution horizon, and DR safety
-threshold as the Vanilla and Rerank comparisons. For an initial sweep,
-try strengths 0.001, 0.005, 0.01; measure both disturbance and task success.
-Reports include ordinary episode metrics and per-episode
-`policy_diagnostics.json` with guided-step counts and correction norms.
+For the exact sampling control use the same command with
+`--strength 0 --output-dir runs/scene1_guidance_zero`.
+Output directories must not already contain results. Compare with
+`runs/scene1` (Vanilla), `runs/scene1_shadow` and the scene1 Rerank
+run using the same dataset split, seed, DR cutoff and execution horizon.
+
+Suggested guidance ablation: strengths 0, 0.001, 0.005, 0.01
+with separate output directories. Inspect `summary.json`,
+`episodes.jsonl`, and per-episode `policy_diagnostics.json`.
+Do not claim safety improvements without checking real disturbance,
+topple/fall, success and safe success in closed-loop rollouts.
 
 Tests: `python -m pytest tests/test_guidance.py -q`.
