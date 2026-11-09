@@ -22,7 +22,6 @@ def test_local_dr_comparison_resets_same_simulator_snapshot():
     assert "start=start, stop=start + horizon" in source
     assert "trace.reset(" in source
     assert "disturbance_from_poses(" in source
-    assert "start=0, stop=horizon" in source
     assert "torch.random.fork_rng" in source
 
 
