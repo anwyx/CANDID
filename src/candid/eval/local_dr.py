@@ -1,10 +1,13 @@
 """Paired fixed-state physical DR checks for Vanilla DP versus Guidance.
 
 Follow a Vanilla DP *reference* rollout. At selected replanning boundaries,
-capture the complete ManiSkill state and observation history. For that same
-live state and identical Torch sampling RNG, sample a Vanilla and a Guided
-8-step chunk. Replay both chunks separately from the captured state, and
-calculate actual physics DR over prefixes of length 4 and 8.
+record the action prefix and observation history. From three FRESH simulator
+instances, replay the SAME initial scene snapshot and the SAME full Vanilla
+action prefix to reconstruct the contact state; only then branch to Vanilla,
+repeated Vanilla, or Guidance 8-step candidate chunks.
+
+Do NOT restore a middle-of-trajectory state_dict and assume it reproduces
+the PhysX contact solver's unrecorded internal state.
 
 No counterfactual action is ever applied to the reference rollout. This
 experiment checks local disturbance; it is NOT an end-to-end success eval.
@@ -117,40 +120,66 @@ def _check_signature(expected, actual, atol=1e-5):
             raise RuntimeError(f"Restore changed {key} (maximum absolute error={error:.7g})")
 
 
-def _physical_outcomes(trace, scene, state, actions, expected):
-    """Start a fresh branch and execute the same eight PD joint targets."""
-    trace.reset(
-        seed=int(scene["seed"]),
-        options={"reset_to_env_states": {"env_states": freeze_state(state)}},
-    )
-    _check_signature(expected, _signature(trace))
-    for command in actions:
-        bounded, _ = _clamp_action(command, trace.action_space)
-        _, _, terminated, truncated, _ = trace.step(bounded)
-        if _is_true(terminated) or _is_true(truncated):
-            break
+def _physical_outcomes(scene, env_id, initial_state, prefix_actions,
+                       candidate_actions, expected_signature, max_steps):
+    """Replay from the SAME INITIAL snapshot with a FRESH PhysX scene.
 
-    arrays = trace.arrays()
-    steps = trace.steps
-    results = {"executed_steps": steps}
-    for horizon in (4, 8):
-        label = f"h{horizon}"
-        if steps < horizon:
-            results[label] = None
-            continue
-        physical = disturbance_from_poses(
-            arrays["distractor_poses"], arrays["object_sizes_m"],
-            start=0, stop=horizon,
-            topple_flags=arrays["distractor_toppled"],
-            fall_flags=arrays["distractor_fallen"],
+    Intermediate get_state_dict() snapshots omit some invisible simulator
+    state (e.g. contact warm-start data); restoring those snapshots after
+    running contact-rich actions may give nonrepeatable local consequences.
+    Instead each candidate gets a clean environment, identical initialization
+    and the full preceding Vanilla action history.
+    """
+    trace = make_env(scene, max_steps, env_id)
+    try:
+        trace.reset(
+            seed=int(scene["seed"]),
+            options={"reset_to_env_states": {
+                "env_states": freeze_state(initial_state),
+            }},
         )
-        results[label] = {
-            "dr_mean": physical["dr_mean"],
-            "dr_max": physical["dr_max"],
-            "topple_count": physical["topple_count"],
-            "fall_count": physical["fall_count"],
-        }
-    return results, arrays["distractor_poses"]
+        for index, command in enumerate(prefix_actions):
+            command, _ = _clamp_action(command, trace.action_space)
+            _, _, terminated, truncated, _ = trace.step(command)
+            if _is_true(terminated) or _is_true(truncated):
+                raise RuntimeError(
+                    f"Fresh reference-prefix replay terminated at {index+1}/"
+                    f"{len(prefix_actions)} steps; comparison is invalid"
+                )
+        if trace.steps != len(prefix_actions):
+            raise RuntimeError("Fresh replay prefix has unexpected length")
+        _check_signature(expected_signature, _signature(trace), atol=1e-4)
+
+        start = trace.steps  # Absolute trajectory index of the probe state.
+        for command in candidate_actions:
+            command, _ = _clamp_action(command, trace.action_space)
+            _, _, terminated, truncated, _ = trace.step(command)
+            if _is_true(terminated) or _is_true(truncated):
+                break
+
+        arrays = trace.arrays()
+        executed = trace.steps - start
+        results = {"executed_steps": executed}
+        for horizon in (4, 8):
+            key = f"h{horizon}"
+            if executed < horizon:
+                results[key] = None
+                continue
+            physical = disturbance_from_poses(
+                arrays["distractor_poses"], arrays["object_sizes_m"],
+                start=start, stop=start + horizon,
+                topple_flags=arrays["distractor_toppled"],
+                fall_flags=arrays["distractor_fallen"],
+            )
+            results[key] = {
+                "dr_mean": physical["dr_mean"],
+                "dr_max": physical["dr_max"],
+                "topple_count": physical["topple_count"],
+                "fall_count": physical["fall_count"],
+            }
+        return results, arrays["distractor_poses"][start:trace.steps+1].copy()
+    finally:
+        trace.close()
 
 
 def _same_noise_chunks(dp, guidance, window):
@@ -198,25 +227,19 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
               config, probes, max_steps, eval_seed, check_repeat, diagnostics_dir):
     env_id, source = resolve_scene_environment(scene)
     reference = make_env(scene, max_steps, env_id)
-    branch = None
     rows = []
+    reference_actions = []
     try:
+        initial_state = load_state_npz(
+            dataset / scene["initial_state"], device="cpu"
+        )
         raw, _ = reference.reset(
             seed=int(scene["seed"]),
             options={"reset_to_env_states": {
-                "env_states": load_state_npz(dataset / scene["initial_state"], device="cpu")
+                "env_states": freeze_state(initial_state)
             }},
         )
         _check_initial_scene(scene, reference.unwrapped, reference)
-        branch = make_env(scene, max_steps, env_id)
-        branch.reset(
-            seed=int(scene["seed"]),
-            options={"reset_to_env_states": {
-                "env_states": load_state_npz(
-                    dataset / scene["initial_state"], device="cpu"
-                )
-            }},
-        )
         if int(np.prod(reference.action_space.shape)) != dp.action_dim:
             raise ValueError("Action dimension mismatch")
         guidance.set_action_space(reference.action_space)
@@ -235,8 +258,9 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
             if current_step in probes:
                 if current_step + 8 > max_steps:
                     raise ValueError("Probe must allow 8 subsequent physical steps")
-                state = freeze_state(reference.unwrapped.get_state_dict())
                 signature = _signature(reference)
+                if len(reference_actions) != current_step:
+                    raise RuntimeError("Prefix action count does not match probe index")
                 vanilla, guided = _same_noise_chunks(dp, guidance, window)
                 low = np.asarray(reference.action_space.low, dtype=np.float32).reshape(-1)
                 high = np.asarray(reference.action_space.high, dtype=np.float32).reshape(-1)
@@ -248,11 +272,13 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                     window, candidates, predictor, normalizer, config
                 )
                 physical_v, poses_v = _physical_outcomes(
-                    branch, scene, state, candidates[0], signature
+                    scene, env_id, initial_state, reference_actions,
+                    candidates[0], signature, max_steps
                 )
                 if check_repeat:
                     repeat, poses_repeat = _physical_outcomes(
-                        branch, scene, state, candidates[0], signature
+                        scene, env_id, initial_state, reference_actions,
+                        candidates[0], signature, max_steps
                     )
                     repeat_check = compare_repeat(
                         physical_v, repeat, poses_v, poses_repeat,
@@ -291,7 +317,8 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                         flush=True,
                     )
                 physical_g, _ = _physical_outcomes(
-                    branch, scene, state, candidates[1], signature
+                    scene, env_id, initial_state, reference_actions,
+                    candidates[1], signature, max_steps
                 )
                 deviations = np.abs(candidates[1] - candidates[0])
                 row = {
@@ -300,6 +327,8 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
                     "reference_seed": seed,
                     "probe_step": current_step,
                     "environment_source": source,
+                    "replay_method": "fresh_scene_initial_snapshot_plus_full_action_prefix",
+                    "reference_prefix_length": len(reference_actions),
                     "predicted": {"vanilla": predicted[0], "guidance": predicted[1]},
                     "pred_risk_delta": predicted[1]["risk"] - predicted[0]["risk"],
                     "action_abs_mean": float(deviations.mean()),
@@ -337,6 +366,7 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
             for action in chunk[:4]:
                 cmd, _ = _clamp_action(action, reference.action_space)
                 raw, _, terminated, truncated, info = reference.step(cmd)
+                reference_actions.append(cmd.copy())
                 current_step += 1
                 history.append(_canonical_live(raw, len(reference.names)).copy())
                 if _is_true(terminated) or _is_true(truncated) or _is_true(
@@ -349,8 +379,6 @@ def run_scene(dataset, scene, test_index, dp, guidance, predictor, normalizer,
         return rows
     finally:
         reference.close()
-        if branch is not None:
-            branch.close()
 
 
 def main(argv=None):
@@ -367,7 +395,7 @@ def main(argv=None):
     parser.add_argument("--start-timestep", type=int, default=30)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cuda")
     parser.add_argument("--no-repeat-check", action="store_true",
-                        help="Skip duplicated Vanilla replay determinism check")
+                        help="Skip duplicate Vanilla replay (not recommended)")
     args = parser.parse_args(argv)
     probes = parse_steps(args.probe_steps)
     if max(probes) + 8 > args.max_steps:
@@ -414,7 +442,7 @@ def main(argv=None):
         "strength": args.strength,
         "device": args.device,
         "reference_policy": "vanilla_dp_h4_closed_loop",
-        "comparison": "same_live_state_same_diffusion_rng_separate_8step_physics_replays",
+        "comparison": "fresh_initial_scene_replay_of_identical_action_prefix_same_rng_candidate_chunks",
         "physical_dr_reference": "state_at_probe_step",
         "predictor_label_horizon": 8,
         "physical_prefix_horizons": [4, 8],

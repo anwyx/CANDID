@@ -17,8 +17,9 @@ def test_sources_parse():
 
 def test_local_dr_comparison_resets_same_simulator_snapshot():
     source = SOURCE.read_text(encoding="utf-8")
-    assert "get_state_dict()" in source
-    assert "freeze_state(state)" in source
+    assert "freeze_state(initial_state)" in source
+    assert "reference_actions.append(cmd.copy())" in source
+    assert "start=start, stop=start + horizon" in source
     assert "trace.reset(" in source
     assert "disturbance_from_poses(" in source
     assert "start=0, stop=horizon" in source
@@ -38,3 +39,11 @@ def test_probe_step_validation_without_simulator():
         namespace["parse_steps"]("3,12")
     with pytest.raises(ValueError):
         namespace["parse_steps"]("-4")
+
+
+def test_local_dr_replays_prefix_in_fresh_scene():
+    source = SOURCE.read_text(encoding="utf-8")
+    assert 'trace = make_env(scene, max_steps, env_id)' in source
+    assert 'for index, command in enumerate(prefix_actions):' in source
+    assert 'reference_actions.append(cmd.copy())' in source
+    assert 'fresh_scene_initial_snapshot_plus_full_action_prefix' in source
