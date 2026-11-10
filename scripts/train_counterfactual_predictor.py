@@ -113,9 +113,6 @@ def train(args):
     split = load_or_create_scene_split(
         dataset_root, seed=args.split_seed, val_ratio=args.val_ratio,
         test_ratio=args.test_ratio)
-    train_set = PredictorWindowDataset(
-        dataset_root, split["train"], obs_horizon=2, action_horizon=8,
-        allow_missing_event_labels=False, cache_size=8)
     val_set = (PredictorWindowDataset(
         dataset_root, split["validation"], obs_horizon=2, action_horizon=8,
         allow_missing_event_labels=False)
@@ -123,8 +120,7 @@ def train(args):
     fixed_val = _validation_subset(val_set, args.val_max_windows, args.seed)
     cf = CounterfactualStateDataset(
         args.counterfactual_dataset, dataset_root, split,
-        obs_horizon=2, action_horizon=8,
-        obs_dim=train_set.obs_dim, action_dim=train_set.action_dim)
+        obs_horizon=2, action_horizon=8)
 
     cf_scenes = sorted({row["scene_id"] for row in cf.rows})
     permutation = torch.randperm(
@@ -141,9 +137,30 @@ def train(args):
     cf_val = Subset(cf, cf_val_indices) if cf_val_indices else None
     if not cf_train_indices:
         raise ValueError("No counterfactual training states after scene holdout")
+    # A scene held out for counterfactual ranking validation must also be
+    # excluded from the expert branch. Otherwise the model has already seen
+    # its expert action windows during training, overstating generalization.
+    expert_train_scene_ids = [
+        sid for sid in split["train"] if sid not in cf_val_scene_ids
+    ]
+    if not expert_train_scene_ids:
+        raise ValueError("Counterfactual holdout exhausted the expert training split")
+    train_set = PredictorWindowDataset(
+        dataset_root, expert_train_scene_ids, obs_horizon=2, action_horizon=8,
+        allow_missing_event_labels=False, cache_size=8)
+    cf_first = cf[0]
+    if (train_set.obs_dim != cf_first["obs"].shape[-1]
+            or train_set.action_dim != cf_first["actions"].shape[-1]):
+        raise ValueError("Counterfactual and expert action/observation dimensions differ")
     print(f"counterfactual train={len(cf_train)} states / "
           f"validation={len(cf_val_indices)} states "
-          f"({len(cf_val_scene_ids)} scenes)", flush=True)
+          f"({len(cf_val_scene_ids)} held-out scenes)", flush=True)
+    print(f"expert train={len(expert_train_scene_ids)} scenes "
+          f"excluding CF held-out scenes", flush=True)
+    if args.init_checkpoint and cf_val_scene_ids:
+        print("NOTE: pretrained checkpoint may have seen these CF validation "
+              "scenes previously; strict unseen-scene validation requires "
+              "training from scratch.", flush=True)
     if args.init_checkpoint:
         model, normalizer = load_predictor(args.init_checkpoint, device=device)
         if not isinstance(model, OrdinalDisturbancePredictor):
@@ -301,7 +318,9 @@ def train(args):
         "validation_expert_windows": len(fixed_val) if fixed_val else 0,
         "last_expert_validation_loss": last_val,
         "last_cf_validation": last_cf_validation,
-        "train_scene_ids": split["train"], "validation_scene_ids": split["validation"],
+        "train_scene_ids": expert_train_scene_ids,
+        "counterfactual_heldout_train_scene_ids": sorted(cf_val_scene_ids),
+        "validation_scene_ids": split["validation"],
         "test_scene_ids": split["test"], "weights": {
             "expert": args.expert_weight, "counterfactual": args.cf_weight,
             "ranking": args.rank_weight},
@@ -334,7 +353,7 @@ def main(argv=None):
     p.add_argument("--val-ratio", type=float, default=.15)
     p.add_argument("--test-ratio", type=float, default=.15)
     p.add_argument("--hidden", type=int, default=256)
-    p.add_argument("--dr-thresholds", default="0.0001,0.0005,0.001,0.005,0.01")
+    p.add_argument("--dr-thresholds", default="0.0001,0.0005,0.001,0.005,0.01,0.05,0.1,0.2,0.5,1.0")
     p.add_argument("--ordinal-pos-weight", type=float, default=5.0)
     p.add_argument("--expert-weight", type=float, default=1.0)
     p.add_argument("--cf-weight", type=float, default=0.3)
