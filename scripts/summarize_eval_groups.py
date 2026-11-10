@@ -5,6 +5,12 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
+import sys
+
+_ROOT = Path(__file__).resolve().parents[1]
+for _entry in (_ROOT, _ROOT / "src"):
+    if str(_entry) not in sys.path:
+        sys.path.insert(0, str(_entry))
 
 
 def summarize_groups(suite_dir, results_dir):
