@@ -83,3 +83,42 @@ suite**, with identical budgets, action horizons, and safety thresholds.
 
 **Current status:** code added, not yet run on the user's GPU server and
 not yet physically benchmarked. No safety improvement is claimed.
+
+
+## Incomplete 64-state collection: retain successful samples and add reserves
+
+If the run reports 35/64 valid groups, 45 skipped probes, 245 physically
+labeled candidates, continue the **same output directory** and sampling
+configuration, changing only the optional reserve pool size:
+
+```bash
+PYTHONPATH=src:. python scripts/generate_counterfactuals.py \
+  --dataset demos/scene1 \
+  --output-dir runs/counterfactual_train_64_v1 \
+  --states 64 --candidates 7 --max-per-scene 8 \
+  --candidate-mode multiscale --sigma-levels 0.02,0.06,0.12 \
+  --max-prefix-steps 160 --seed 2026 \
+  --reserve-probes 200 --resume
+```
+
+The increased `--reserve-probes` is **not** a changed data distribution
+or perturbed-label validity threshold: it draws from the same original
+training-only scene split and the same deterministic pool. The 35 saved
+counterfactual groups are reused. `skipped_probes.jsonl` remains available
+to audit historical HDF5 vs replay observation mismatch. Never increase
+`--obs-atol` merely to suppress that mismatch. If the sample pool is
+exhausted, the report honestly remains `complete=false`; do not train a
+partially collected dataset with this entrypoint.
+
+## Scratch model rather than fine-tuning
+
+For a clean first main experiment, omit `--init-checkpoint`. The default
+scratch DR threshold grid now includes 0.05/0.1/0.2/0.5/1.0, rather than
+stopping at 0.01 and saturating pseudo-DR on high-risk contrasts. This is
+a NEW Ordinal Predictor, and must not be mistaken for the old checkpoint.
+
+The counterfactual scene holdout is **also excluded from all expert
+training windows**, so the same source scene cannot be used in the
+expert branch while supplying held-out counterfactual validation pairs.
+A fine-tuned previously trained checkpoint cannot make this claim if
+its pretraining saw the held-out scenes.
