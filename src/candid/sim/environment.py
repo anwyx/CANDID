@@ -39,6 +39,7 @@ class CANDIDTabletopEnv(BaseEnv):
                  idle_translation_m=0.0010, idle_rotation_deg=1.5,
                  max_initial_xy_shift_mm=10.0,
                  max_initial_tilt_deg=15.0,
+                 skip_constructor_settling=False,
                  **kwargs):
         if self.SCENE is None:
             raise ValueError("Subclass must declare SCENE: SceneSpec")
@@ -78,7 +79,16 @@ class CANDIDTabletopEnv(BaseEnv):
 
         if not np.isfinite(self.max_initial_tilt_deg) or not 0 < self.max_initial_tilt_deg <= 180:
             raise ValueError("max_initial_tilt_deg must be in (0, 180]")
-        super().__init__(*args, robot_uids=robot_uids, **kwargs)
+        # ManiSkill BaseEnv.__init__ performs an implicit seed-2022 reset.
+        # Evaluation-suite creation later performs an EXPLICIT seeded reset
+        # and fully validates settling. An unlucky bootstrap layout must not
+        # prevent that rejection-sampling loop from starting.
+        self._skip_constructor_settling = bool(skip_constructor_settling)
+        self._in_constructor = True
+        try:
+            super().__init__(*args, robot_uids=robot_uids, **kwargs)
+        finally:
+            self._in_constructor = False
 
     @property
     def _default_sensor_configs(self):
@@ -175,6 +185,12 @@ class CANDIDTabletopEnv(BaseEnv):
         obs, original_info = super().reset(seed=seed, options=options)
 
         if options and "reset_to_env_states" in options:
+            return obs, original_info
+
+        if self._in_constructor and self._skip_constructor_settling:
+            # Only ManiSkill's throwaway bootstrap reset is skipped. All
+            # explicitly requested random candidate resets still run the
+            # complete settling/pose-displacement gates below.
             return obs, original_info
 
         if self.num_envs != 1:
