@@ -28,16 +28,18 @@ from model.predictor.normalizer import fit_predictor_normalizer
 from model.predictor.train import _mean_loss, _validation_subset, _select_device
 
 
-def _supervised(model, normalizer, obs, actions, targets, event_mask):
+def _supervised(model, normalizer, obs, actions, targets, event_mask,
+                event_pos_weight=None):
     return model.loss(
         normalizer.normalize_obs(obs), normalizer.normalize_action(actions),
-        targets, event_mask, normalizer.event_pos_weight,
+        targets, event_mask,
+        normalizer.event_pos_weight if event_pos_weight is None else event_pos_weight,
     )
 
 
 def _counterfactual_losses(model, normalizer, batch, *, temperature,
                            topple_weight, fall_weight, dr_max_weight,
-                           min_risk_gap):
+                           min_risk_gap, cf_pos_weight_cap=None):
     obs = batch["obs"]
     actions = batch["actions"]
     labels = batch["targets"]
@@ -46,9 +48,13 @@ def _counterfactual_losses(model, normalizer, batch, *, temperature,
     flat_obs = histories.reshape(n*k, obs.shape[1], obs.shape[2])
     flat_act = actions.reshape(n*k, h, a)
     flat_targets = labels.reshape(n*k, 4)
+    pos_weight = (normalizer.event_pos_weight
+                  if cf_pos_weight_cap is None else
+                  normalizer.event_pos_weight.clamp(max=cf_pos_weight_cap))
     supervised = _supervised(
         model, normalizer, flat_obs, flat_act, flat_targets,
-        torch.ones((n*k, 2), device=obs.device, dtype=obs.dtype))
+        torch.ones((n*k, 2), device=obs.device, dtype=obs.dtype),
+        event_pos_weight=pos_weight)
     out = model(
         normalizer.normalize_obs(flat_obs), normalizer.normalize_action(flat_act))
     grouped = {
@@ -80,7 +86,8 @@ def _cf_validation(model, normalizer, loader, device, args):
             topple_weight=args.topple_weight,
             fall_weight=args.fall_weight,
             dr_max_weight=args.dr_max_weight,
-            min_risk_gap=args.min_risk_gap)
+            min_risk_gap=args.min_risk_gap,
+            cf_pos_weight_cap=args.cf_pos_weight_cap)
         groups = batch["obs"].shape[0]
         total_groups += groups
         total_cf += float(supervised) * groups
@@ -100,6 +107,9 @@ def _cf_validation(model, normalizer, loader, device, args):
 def train(args):
     if not 0 <= args.cf_val_ratio < 1:
         raise ValueError("--cf-val-ratio must be in [0,1)")
+    if (args.cf_update_every < 1 or args.weight_decay < 0
+            or args.cf_pos_weight_cap < 1 or args.early_stop_patience < 0):
+        raise ValueError("Invalid CF cadence, positive-weight cap, weight decay, or patience")
     if (min(args.steps, args.batch_size, args.cf_batch_size, args.eval_freq) < 1
             or min(args.expert_weight, args.cf_weight, args.rank_weight) < 0
             or args.expert_weight + args.cf_weight + args.rank_weight <= 0):
@@ -202,13 +212,17 @@ def train(args):
         shuffle=False, num_workers=0) if cf_val is not None else None)
     expert_iter = iter(expert_loader)
     cf_iter = iter(cf_loader)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     outdir.mkdir(parents=True, exist_ok=True)
     checkpoints = outdir/"checkpoints"
     best_val = float("inf")
     best_step = None
     last_val = None
     last_cf_validation = None
+    best_expert_validation = None
+    best_cf_validation = None
+    epochs_without_improvement = 0
     log_path = outdir/"train_log.csv"
     with log_path.open("w", encoding="utf-8", newline="") as log:
         writer = csv.DictWriter(log, fieldnames=(
@@ -223,24 +237,32 @@ def train(args):
             except StopIteration:
                 expert_iter = iter(expert_loader)
                 expert = next(expert_iter)
-            try:
-                replay = next(cf_iter)
-            except StopIteration:
-                cf_iter = iter(cf_loader)
-                replay = next(cf_iter)
+            use_cf = (step % args.cf_update_every == 0)
+            if use_cf:
+                try:
+                    replay = next(cf_iter)
+                except StopIteration:
+                    cf_iter = iter(cf_loader)
+                    replay = next(cf_iter)
+                replay = {key: val.to(device) for key, val in replay.items()}
             expert = {key: val.to(device) for key, val in expert.items()}
-            replay = {key: val.to(device) for key, val in replay.items()}
             model.train()
             expert_loss = _supervised(
                 model, normalizer, expert["obs"], expert["action"],
                 expert["target"], expert["event_mask"])
-            cf_loss, ranking, ranking_stats = _counterfactual_losses(
-                model, normalizer, replay,
-                temperature=args.rank_temperature,
-                topple_weight=args.topple_weight,
-                fall_weight=args.fall_weight,
-                dr_max_weight=args.dr_max_weight,
-                min_risk_gap=args.min_risk_gap)
+            if use_cf:
+                cf_loss, ranking, ranking_stats = _counterfactual_losses(
+                    model, normalizer, replay,
+                    temperature=args.rank_temperature,
+                    topple_weight=args.topple_weight,
+                    fall_weight=args.fall_weight,
+                    dr_max_weight=args.dr_max_weight,
+                    min_risk_gap=args.min_risk_gap,
+                    cf_pos_weight_cap=args.cf_pos_weight_cap)
+            else:
+                cf_loss = expert_loss.new_zeros(())
+                ranking = expert_loss.new_zeros(())
+                ranking_stats = {"pairs": 0, "accuracy": None}
             loss = (args.expert_weight*expert_loss
                     + args.cf_weight*cf_loss + args.rank_weight*ranking)
             optimizer.zero_grad(set_to_none=True)
@@ -263,12 +285,20 @@ def train(args):
                                    if last_val is not None else 0.0)
                 if last_cf_validation is not None:
                     selection_score += (
-                        args.cf_weight*last_cf_validation["cf_loss"]
-                        + args.rank_weight*last_cf_validation["ranking_loss"])
+                        (args.cf_weight / args.cf_update_every)
+                        * last_cf_validation["cf_loss"]
+                        + (args.rank_weight / args.cf_update_every)
+                        * last_cf_validation["ranking_loss"])
                 if selection_score < best_val:
                     best_val = selection_score
                     best_step = step
+                    best_expert_validation = last_val
+                    best_cf_validation = (dict(last_cf_validation)
+                                          if last_cf_validation is not None else None)
+                    epochs_without_improvement = 0
                     save_checkpoint(checkpoints/"best_val.pt", model, normalizer, config)
+                else:
+                    epochs_without_improvement += 1
             if evaluate or step % args.log_freq == 0 or step == 1:
                 writer.writerow({
                     "step": step,
@@ -302,12 +332,20 @@ def train(args):
                     f"val_expert={last_val if evaluate else 'NA'} "
                     f"val_rank_acc={last_cf_validation['ranking_accuracy'] if evaluate and last_cf_validation else 'NA'}",
                     flush=True)
+            if (args.early_stop_patience > 0 and evaluate
+                    and epochs_without_improvement >= args.early_stop_patience):
+                print(f"Early stop after {epochs_without_improvement} "
+                      f"validation checks without improvement at step {step}.",
+                      flush=True)
+                break
     save_checkpoint(checkpoints/"last.pt", model, normalizer, config)
     summary = {
         "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
         "best_checkpoint": str(checkpoints/"best_val.pt"),
         "last_checkpoint": str(checkpoints/"last.pt"),
         "best_step": best_step, "best_validation_selection_score": best_val,
+        "best_expert_validation_loss": best_expert_validation,
+        "best_cf_validation": best_cf_validation,
         "training_expert_windows": len(train_set),
         "counterfactual_states": len(cf),
         "counterfactual_training_states": len(cf_train),
@@ -328,7 +366,12 @@ def train(args):
             "temperature": args.rank_temperature, "topple_weight": args.topple_weight,
             "fall_weight": args.fall_weight, "dr_max_weight": args.dr_max_weight,
             "min_risk_gap": args.min_risk_gap},
-        "config": asdict(config), "steps_completed": args.steps,
+        "optimizer": {"name": "AdamW", "weight_decay": args.weight_decay},
+        "training_controls": {
+            "cf_update_every": args.cf_update_every,
+            "cf_pos_weight_cap": args.cf_pos_weight_cap,
+            "early_stop_patience": args.early_stop_patience},
+        "config": asdict(config), "steps_completed": step,
     }
     (outdir/"summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
@@ -346,8 +389,15 @@ def main(argv=None):
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--expert-trajectories-per-batch", type=int, default=4)
     p.add_argument("--cf-batch-size", type=int, default=8)
+    p.add_argument("--cf-update-every", type=int, default=1,
+                   help="Use a physical CF batch every N expert training steps")
+    p.add_argument("--cf-pos-weight-cap", type=float, default=50.0,
+                   help="Maximum event positive class weight for CF supervision")
     p.add_argument("--cf-val-ratio", type=float, default=.2)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--early-stop-patience", type=int, default=0,
+                   help="Number of validation checks without improvement; 0 disables")
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--split-seed", type=int, default=0)
     p.add_argument("--val-ratio", type=float, default=.15)
