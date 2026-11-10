@@ -228,12 +228,10 @@ class TrajectoryBatchSampler:
 
 
 class MixedTrajectoryBatchSampler:
-    """Shuffle trajectory-local microbatches into mixed-trajectory batches.
+    """Mix trajectory-local HDF5 microbatches without random per-window I/O.
 
-    Reduces strong within-batch correlation of the old one-trajectory sampler
-    without shuffling every HDF5 window individually. With batch_size=64 and
-    trajectories_per_batch=4, batches usually contain four 16-window chunks
-    from distinct expert trajectories. Each window is sampled once per epoch.
+    Window coverage is exactly once per epoch, and __len__ is exact.
+    Batches typically contain several independent expert trajectories.
     """
 
     def __init__(self, dataset, batch_size, seed=0, trajectories_per_batch=4):
@@ -242,32 +240,28 @@ class MixedTrajectoryBatchSampler:
         self.dataset = dataset
         self.batch_size = int(batch_size)
         self.trajectories_per_batch = int(trajectories_per_batch)
+        self.micro = max(1, self.batch_size // self.trajectories_per_batch)
+        self.chunks_per_batch = min(
+            self.trajectories_per_batch, self.batch_size // self.micro)
         self.generator = torch.Generator().manual_seed(int(seed))
         indices = dataset.indices[:, 0]
         _, starts, counts = np.unique(indices, return_index=True, return_counts=True)
         self.groups = [np.arange(start, start+count) for start, count in zip(starts, counts)]
 
     def __len__(self):
-        # Exact bound for full batch construction can vary with trailing
-        # microbatch sizes; this is a conservative count for progress bars.
-        micro = max(1, self.batch_size // self.trajectories_per_batch)
-        return sum((len(group)+micro-1)//micro for group in self.groups)
+        chunks = sum((len(group)+self.micro-1)//self.micro for group in self.groups)
+        return (chunks+self.chunks_per_batch-1)//self.chunks_per_batch
 
     def __iter__(self):
-        micro = max(1, self.batch_size // self.trajectories_per_batch)
         chunks = []
         for group in self.groups:
             order = torch.randperm(len(group), generator=self.generator).numpy()
             shuffled = group[order]
-            for start in range(0, len(shuffled), micro):
-                chunks.append(shuffled[start:start+micro].tolist())
-        permutation = torch.randperm(len(chunks), generator=self.generator)
-        batch = []
-        for j in permutation.tolist():
-            chunk = chunks[j]
-            if batch and len(batch)+len(chunk) > self.batch_size:
-                yield batch
-                batch = []
-            batch.extend(chunk)
-        if batch:
-            yield batch
+            for start in range(0, len(shuffled), self.micro):
+                chunks.append(shuffled[start:start+self.micro].tolist())
+        permutation = torch.randperm(len(chunks), generator=self.generator).tolist()
+        for start in range(0, len(permutation), self.chunks_per_batch):
+            result = []
+            for j in permutation[start:start+self.chunks_per_batch]:
+                result.extend(chunks[j])
+            yield result
