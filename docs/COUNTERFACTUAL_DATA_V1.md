@@ -76,3 +76,38 @@ Build a combined Predictor dataset loader, mixed-scene BatchSampler and a
 pairwise-ranking-loss ablation. Do not train on the existing held-out 50-scene
 evaluation results. The current schema is intentionally separate from the
 legacy HDF5 trajectory contract.
+
+
+## V1.1: Multi-scale counterfactual candidate coverage
+
+The original `make_candidates` and default `--candidate-mode legacy` remain
+unchanged for backward compatibility. For more contrast among physically
+labeled candidate outcomes use:
+
+```bash
+PYTHONPATH=src:. python scripts/generate_counterfactuals.py \
+  --dataset demos/scene1 \
+  --output-dir runs/counterfactual_multiscale_smoke_v1 \
+  --states 6 --candidates 7 --max-per-scene 1 \
+  --candidate-mode multiscale --sigma-levels 0.02,0.06,0.12 \
+  --max-prefix-steps 160 --seed 2026
+```
+
+This executes 42 physical 8-step continuations, each with its own full
+expert-prefix replay. Actions 1/2, 3/4 and 5/6 are smooth +/- pairs
+at progressively larger amplitudes. All are bounded by the real environment
+action space; the gripper dimension is unchanged by default.
+
+The output also records `nominal_sigmas`, per-candidate actual L2 deviations,
+`dr_mean_range`, and whether the same-state Topple labels differ. The
+`summary.json` includes counts of states with DR range >0.01 / >0.05,
+and states with at least one Topple label disagreement.
+
+An all-unsafe state is a legitimate physical result, not a failed replay.
+Do not discard all-safe or all-unsafe groups just to make benchmark numbers
+look better. If no group contains diverse outcomes, improve state selection
+around the event boundary rather than assuming the Predictor can learn
+action-conditioned risk from these samples.
+
+Note: V1.1 still collects data only, without fitting any Predictor or
+claiming an improvement in safety.
