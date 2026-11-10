@@ -122,3 +122,52 @@ training windows**, so the same source scene cannot be used in the
 expert branch while supplying held-out counterfactual validation pairs.
 A fine-tuned previously trained checkpoint cannot make this claim if
 its pretraining saw the held-out scenes.
+
+
+## After scratch-v1: distinguish memorization from generalization
+
+Observed scratch-v1 after 10,000 steps (64 physically verified states; 49
+training states and 15 scene-held-out CF validation states):
+training ranking accuracy 99-100% near the end, but last CF-validation
+ranking accuracy 56.36% over 275 pairs, CF-validation loss ~28.38, and
+best checkpoint selected at step 500. This is strong evidence of
+**poor cross-scene generalization** and likely overfitting. The
+reported last validation results do NOT describe the best checkpoint.
+
+**New opt-in training controls** leave existing defaults backward-compatible:
+
+- `--cf-update-every 8`: include the small CF set only once every eight
+  expert updates, while expert loss runs every step. Prevents repeated
+  presentation of all 49 states every few steps.
+- `--cf-pos-weight-cap 3`: cap the rare-event positive weight specifically
+  for CF supervised BCE; expert event weighting is unchanged.
+- `--weight-decay 0.01`: AdamW regularization.
+- `--early-stop-patience 4`: stop after four consecutive validation
+  checks without improving the joint validation selection score.
+
+A controlled follow-up from random initialization (same exact 64-state
+dataset, new output directory, no checkpoint):
+
+```bash
+PYTHONPATH=src:. python scripts/train_counterfactual_predictor.py \
+  --dataset demos/scene1 \
+  --counterfactual-dataset runs/counterfactual_train_64_v1 \
+  --output-dir runs/predictor_ordinal_joint_regularized_v2 \
+  --device cuda --steps 4000 --batch-size 64 --cf-batch-size 8 \
+  --expert-weight 1.0 --cf-weight 0.3 --rank-weight 0.5 \
+  --cf-update-every 8 --cf-pos-weight-cap 3 \
+  --weight-decay 0.01 --early-stop-patience 4 \
+  --cf-val-ratio 0.2 --eval-freq 250 --seed 2026
+```
+
+Training loss on steps without CF uses zero CF/ranking terms; its
+per-step magnitude is not comparable with the previous always-CF run.
+Checkpoint selection scales the CF-validation terms by update frequency
+to match average training contributions. Inspect `best_cf_validation`
+and `best_expert_validation_loss` in `summary.json`, rather than just
+`last_cf_validation`. This small-data ablation is **not** evidence of
+a safety improvement by itself.
+
+**Research next step:** Increase genuinely distinct physically verified
+training states and scenes (ideally hundreds), preserve held-out scenes,
+and test ranking generalization before deploying any guidance/rerank.
