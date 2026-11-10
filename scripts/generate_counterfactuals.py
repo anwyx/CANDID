@@ -176,18 +176,20 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
         finally:
             env.close()
-        actions_to_compare = make_candidates(
-            expert, low, high, count=candidates,
-            seed=stable_seed(seed, probe.trajectory_id, t), sigma=sigma,
-            freeze_last_dimension=not perturb_gripper)
         if candidate_mode == "multiscale":
             actions_to_compare, candidate_sigmas = make_multiscale_candidates(
                 expert, low, high, count=candidates,
                 seed=stable_seed(seed, probe.trajectory_id, t),
                 sigma_levels=sigma_levels,
                 freeze_last_dimension=not perturb_gripper)
-        else:
+        elif candidate_mode == "legacy":
+            actions_to_compare = make_candidates(
+                expert, low, high, count=candidates,
+                seed=stable_seed(seed, probe.trajectory_id, t), sigma=sigma,
+                freeze_last_dimension=not perturb_gripper)
             candidate_sigmas = np.r_[0., np.repeat(sigma, candidates - 1)].astype(np.float32)
+        else:
+            raise ValueError(f"Unknown candidate mode: {candidate_mode}")
         actual = [_simulate(
             scene, snapshot, prefix, actions_to_compare[0],
             source_pose=truth["distractor_poses"][t],
