@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 
 class CounterfactualStateDataset(Dataset):
     def __init__(self, root, dataset_root, split, *, obs_horizon=2,
-                 action_horizon=8, obs_dim=None, action_dim=None):
+                 action_horizon=8, obs_dim=None, action_dim=None, allowed_scenes=None):
         self.root = Path(root)
         summary = json.loads((self.root / "summary.json").read_text(encoding="utf-8"))
         if (summary.get("complete") is not True or summary.get("labels_from_simulation") is not True
@@ -36,6 +36,11 @@ class CounterfactualStateDataset(Dataset):
         if any(row.get("source_split") != "train" or row["scene_id"] not in allowed
                for row in self.rows):
             raise ValueError("Counterfactual data include non-training scenes")
+        if allowed_scenes is not None:
+            allowed_subset = set(allowed_scenes)
+            if not allowed_subset.issubset(allowed):
+                raise ValueError("Requested counterfactual scene outside train split")
+            self.rows = [row for row in self.rows if row["scene_id"] in allowed_subset]
         ids = [row["state_id"] for row in self.rows]
         if len(ids) != len(set(ids)):
             raise ValueError("Duplicate counterfactual state IDs")
