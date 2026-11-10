@@ -173,7 +173,11 @@ def load_baseline(method, checkpoint, device="cpu"):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--method", choices=("act", "bc", "ppo", "sac"), required=True)
-    parser.add_argument("--dataset", type=Path, required=True)
+    scenes = parser.add_mutually_exclusive_group(required=True)
+    scenes.add_argument("--dataset", type=Path, default=None,
+                        help="Existing dataset's frozen TEST split")
+    scenes.add_argument("--eval-suite", type=Path, default=None,
+                        help="Frozen random suite (including multi-environment combined suites)")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--safe-dr-mean-max", type=float, required=True)
@@ -197,6 +201,7 @@ def main(argv=None):
     result = evaluate_dataset(
         args.dataset, policy, args.output_dir,
         SafetyLimits(args.safe_dr_mean_max, dr_max_max=args.safe_dr_max_max),
+        eval_suite=args.eval_suite,
         checkpoint=args.checkpoint, max_scenes=args.max_scenes,
         episodes_per_scene=args.episodes_per_scene, max_steps=args.max_steps,
         exec_horizon=exec_horizon, eval_seed=args.eval_seed,
