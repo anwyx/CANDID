@@ -166,3 +166,61 @@ def make_candidates(expert_actions, low, high, *, count, seed, sigma=0.02,
         else:
             raise RuntimeError("Could not construct distinct bounded perturbation")
     return np.stack(output)
+
+
+def make_multiscale_candidates(expert_actions, low, high, *, count, seed,
+                               sigma_levels=(0.02, 0.06, 0.12),
+                               freeze_last_dimension=True):
+    """Expert chunk plus smooth +/- action pairs at several physical scales.
+
+    Unlike the legacy make_candidates, this deliberately tests both sides of
+    the SAME direction. Each output still requires a separate physics label.
+    Returns (actions[K,H,A], nominal_sigmas[K]), with index 0 the untouched
+    expert. No outcome-based rejection or synthetic label assignment occurs.
+    """
+    actions = np.asarray(expert_actions, dtype=np.float32)
+    low = np.asarray(low, dtype=np.float32).reshape(-1)
+    high = np.asarray(high, dtype=np.float32).reshape(-1)
+    levels = tuple(float(s) for s in sigma_levels)
+    if (actions.ndim != 2 or actions.shape[0] < 2 or actions.shape[1] != len(low)
+            or high.shape != low.shape or not np.isfinite(actions).all()
+            or np.isnan(low).any() or np.isnan(high).any()
+            or np.any(low > high) or np.any(actions < low - 1e-6)
+            or np.any(actions > high + 1e-6)):
+        raise ValueError("Invalid expert action chunk or environment bounds")
+    if count < 3 or not levels or any(not np.isfinite(s) or s <= 0 for s in levels):
+        raise ValueError("Require >=3 candidates and strictly positive finite sigma levels")
+    rng = np.random.default_rng(seed)
+    horizon, dim = actions.shape
+    envelope = np.sin(np.pi * np.arange(1, horizon + 1) / (horizon + 1))[:, None]
+    output = [actions.copy()]
+    nominal_sigmas = [0.0]
+    pair_index = 0
+    while len(output) < count:
+        sigma = levels[pair_index % len(levels)]
+        wanted = min(2, count - len(output))
+        for _ in range(32):
+            noise = rng.standard_normal((horizon, dim))
+            padded = np.pad(noise, ((1, 1), (0, 0)), mode="edge")
+            smooth = (padded[:-2] + 2 * padded[1:-1] + padded[2:]) / 4
+            rms = np.sqrt(np.mean(smooth ** 2, axis=0, keepdims=True))
+            delta = sigma * smooth / np.maximum(rms, 1e-12) * envelope
+            if freeze_last_dimension:
+                delta[:, -1] = 0
+            proposals = [
+                np.clip(actions + sign * delta, low, high).astype(np.float32)
+                for sign in (1.0, -1.0)[:wanted]
+            ]
+            # Clipping must not turn these into copies of the expert or of
+            # previously generated candidates; otherwise they add no signal.
+            if all(np.max(np.abs(candidate - actions)) >= sigma * .05
+                   for candidate in proposals):
+                if all(not np.array_equal(candidate, previous)
+                       for candidate in proposals for previous in output):
+                    break
+        else:
+            raise RuntimeError("Unable to produce distinct symmetric perturbation pair")
+        output.extend(proposals)
+        nominal_sigmas.extend([sigma] * wanted)
+        pair_index += 1
+    return np.stack(output), np.asarray(nominal_sigmas, dtype=np.float32)
