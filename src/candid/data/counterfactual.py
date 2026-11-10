@@ -36,7 +36,7 @@ def _read_jsonl(path):
 
 def choose_probes(dataset, allowed_scene_ids, *, count, seed=0,
                   action_horizon=8, obs_horizon=2, max_per_scene=4,
-                  max_prefix_steps=None):
+                  max_prefix_steps=None, reserve_count=0):
     """Stratify by episode-local onset, high disturbance, and safe controls.
 
     At most one probe is taken per source trajectory to limit correlation.
@@ -45,6 +45,8 @@ def choose_probes(dataset, allowed_scene_ids, *, count, seed=0,
     """
     if min(count, action_horizon, obs_horizon, max_per_scene) < 1:
         raise ValueError("count, horizons and max_per_scene must be positive")
+    if reserve_count < 0:
+        raise ValueError("reserve_count must be nonnegative")
     if max_prefix_steps is not None and max_prefix_steps < obs_horizon - 1:
         raise ValueError("max_prefix_steps is too small")
     root = Path(dataset)
@@ -101,12 +103,13 @@ def choose_probes(dataset, allowed_scene_ids, *, count, seed=0,
               "high_dr": count // 4,
               "low_dr": count - (count + 1) // 2 - count // 4}
     selected = []
+    target_count = count
     scene_counts = {}
     chosen = set()
 
     def take(category, wanted):
         for probe in buckets[category]:
-            if wanted <= 0 or len(selected) == count:
+            if wanted <= 0 or len(selected) == target_count:
                 break
             if scene_counts.get(probe.scene_id, 0) >= max_per_scene:
                 continue
@@ -125,6 +128,11 @@ def choose_probes(dataset, allowed_scene_ids, *, count, seed=0,
     if len(selected) < count:
         raise ValueError(f"Requested {count} train probes, only found {len(selected)} "
                          f"under max_per_scene={max_per_scene}; reduce --states or increase the cap")
+    # Append spare probes WITHOUT reordering the first `count` selections.
+    # Spares are only simulated when an expert prefix cannot be replayed.
+    target_count = count + reserve_count
+    for category in ("pre_topple", "high_dr", "low_dr"):
+        take(category, target_count - len(selected))
     return selected
 
 
