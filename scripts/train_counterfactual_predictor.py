@@ -66,7 +66,40 @@ def _counterfactual_losses(model, normalizer, batch, *, temperature,
     return supervised, rank, stats
 
 
+
+@torch.no_grad()
+def _cf_validation(model, normalizer, loader, device, args):
+    model.eval()
+    total_cf, total_rank, total_groups = 0.0, 0.0, 0
+    total_pairs, weighted_correct = 0, 0.0
+    for batch in loader:
+        batch = {key: val.to(device) for key, val in batch.items()}
+        supervised, rank, stats = _counterfactual_losses(
+            model, normalizer, batch,
+            temperature=args.rank_temperature,
+            topple_weight=args.topple_weight,
+            fall_weight=args.fall_weight,
+            dr_max_weight=args.dr_max_weight,
+            min_risk_gap=args.min_risk_gap)
+        groups = batch["obs"].shape[0]
+        total_groups += groups
+        total_cf += float(supervised) * groups
+        total_rank += float(rank) * groups
+        total_pairs += stats["pairs"]
+        if stats["accuracy"] is not None:
+            weighted_correct += stats["accuracy"] * stats["pairs"]
+    return {
+        "cf_loss": total_cf / total_groups if total_groups else None,
+        "ranking_loss": total_rank / total_groups if total_groups else None,
+        "ranking_accuracy": weighted_correct / total_pairs if total_pairs else None,
+        "ranking_pairs": total_pairs,
+        "validation_states": total_groups,
+    }
+
+
 def train(args):
+    if not 0 <= args.cf_val_ratio < 1:
+        raise ValueError("--cf-val-ratio must be in [0,1)")
     if (min(args.steps, args.batch_size, args.cf_batch_size, args.eval_freq) < 1
             or min(args.expert_weight, args.cf_weight, args.rank_weight) < 0
             or args.expert_weight + args.cf_weight + args.rank_weight <= 0):
@@ -92,6 +125,25 @@ def train(args):
         args.counterfactual_dataset, dataset_root, split,
         obs_horizon=2, action_horizon=8,
         obs_dim=train_set.obs_dim, action_dim=train_set.action_dim)
+
+    cf_scenes = sorted({row["scene_id"] for row in cf.rows})
+    permutation = torch.randperm(
+        len(cf_scenes), generator=torch.Generator().manual_seed(args.seed)).tolist()
+    n_cf_val = (max(1, round(len(cf_scenes) * args.cf_val_ratio))
+                if args.cf_val_ratio > 0 and len(cf_scenes) >= 2 else 0)
+    n_cf_val = min(n_cf_val, len(cf_scenes)-1)
+    cf_val_scene_ids = {cf_scenes[i] for i in permutation[:n_cf_val]}
+    cf_train_indices = [i for i, row in enumerate(cf.rows)
+                        if row["scene_id"] not in cf_val_scene_ids]
+    cf_val_indices = [i for i, row in enumerate(cf.rows)
+                      if row["scene_id"] in cf_val_scene_ids]
+    cf_train = Subset(cf, cf_train_indices)
+    cf_val = Subset(cf, cf_val_indices) if cf_val_indices else None
+    if not cf_train_indices:
+        raise ValueError("No counterfactual training states after scene holdout")
+    print(f"counterfactual train={len(cf_train)} states / "
+          f"validation={len(cf_val_indices)} states "
+          f"({len(cf_val_scene_ids)} scenes)", flush=True)
     if args.init_checkpoint:
         model, normalizer = load_predictor(args.init_checkpoint, device=device)
         if not isinstance(model, OrdinalDisturbancePredictor):
@@ -125,7 +177,11 @@ def train(args):
         num_workers=0,
     )
     cf_loader = DataLoader(
-        cf, batch_size=min(args.cf_batch_size, len(cf)), shuffle=True, num_workers=0)
+        cf_train, batch_size=min(args.cf_batch_size, len(cf_train)),
+        shuffle=True, num_workers=0)
+    cf_val_loader = (DataLoader(
+        cf_val, batch_size=min(args.cf_batch_size, len(cf_val)),
+        shuffle=False, num_workers=0) if cf_val is not None else None)
     expert_iter = iter(expert_loader)
     cf_iter = iter(cf_loader)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -134,11 +190,14 @@ def train(args):
     best_val = float("inf")
     best_step = None
     last_val = None
+    last_cf_validation = None
     log_path = outdir/"train_log.csv"
     with log_path.open("w", encoding="utf-8", newline="") as log:
         writer = csv.DictWriter(log, fieldnames=(
             "step", "total_loss", "expert_loss", "cf_loss", "ranking_loss",
-            "ranking_accuracy", "ranking_pairs", "validation_expert_loss"))
+            "ranking_accuracy", "ranking_pairs", "validation_expert_loss",
+            "validation_cf_loss", "validation_ranking_loss",
+            "validation_ranking_accuracy", "validation_ranking_pairs", "selection_score"))
         writer.writeheader()
         for step in range(1, args.steps+1):
             try:
@@ -170,16 +229,26 @@ def train(args):
             loss.backward()
             optimizer.step()
             evaluate = step % args.eval_freq == 0 or step == args.steps
+            selection_score = None
             if evaluate:
                 if fixed_val is not None:
                     last_val = _mean_loss(
                         model, normalizer, fixed_val, device,
                         batch_size=args.val_batch_size)
-                    if last_val < best_val:
-                        best_val = last_val
-                        best_step = step
-                        save_checkpoint(checkpoints/"best_val.pt", model, normalizer, config)
-                else:
+                if cf_val_loader is not None:
+                    last_cf_validation = _cf_validation(
+                        model, normalizer, cf_val_loader, device, args)
+                # Do not use training ranking accuracy for checkpoint selection.
+                # Expert scene validation preserves prior calibration; separate
+                # CF scene validation tests whether candidate ordering generalizes.
+                selection_score = (float(last_val) * args.expert_weight
+                                   if last_val is not None else 0.0)
+                if last_cf_validation is not None:
+                    selection_score += (
+                        args.cf_weight*last_cf_validation["cf_loss"]
+                        + args.rank_weight*last_cf_validation["ranking_loss"])
+                if selection_score < best_val:
+                    best_val = selection_score
                     best_step = step
                     save_checkpoint(checkpoints/"best_val.pt", model, normalizer, config)
             if evaluate or step % args.log_freq == 0 or step == 1:
@@ -192,6 +261,19 @@ def train(args):
                     "ranking_accuracy": ranking_stats["accuracy"],
                     "ranking_pairs": ranking_stats["pairs"],
                     "validation_expert_loss": last_val if evaluate else "",
+                    "validation_cf_loss": (
+                        last_cf_validation["cf_loss"]
+                        if evaluate and last_cf_validation is not None else ""),
+                    "validation_ranking_loss": (
+                        last_cf_validation["ranking_loss"]
+                        if evaluate and last_cf_validation is not None else ""),
+                    "validation_ranking_accuracy": (
+                        last_cf_validation["ranking_accuracy"]
+                        if evaluate and last_cf_validation is not None else ""),
+                    "validation_ranking_pairs": (
+                        last_cf_validation["ranking_pairs"]
+                        if evaluate and last_cf_validation is not None else ""),
+                    "selection_score": selection_score if evaluate else "",
                 })
                 log.flush()
                 print(
@@ -199,18 +281,25 @@ def train(args):
                     f"loss={loss.item():.5f} expert={expert_loss.item():.5f} "
                     f"cf={cf_loss.item():.5f} ranking={ranking.item():.5f} "
                     f"pairs={ranking_stats['pairs']} acc={ranking_stats['accuracy']} "
-                    f"val_expert={last_val if evaluate else 'NA'}", flush=True)
+                    f"val_expert={last_val if evaluate else 'NA'} "
+                    f"val_rank_acc={last_cf_validation['ranking_accuracy'] if evaluate and last_cf_validation else 'NA'}",
+                    flush=True)
     save_checkpoint(checkpoints/"last.pt", model, normalizer, config)
     summary = {
         "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint else None,
         "best_checkpoint": str(checkpoints/"best_val.pt"),
         "last_checkpoint": str(checkpoints/"last.pt"),
-        "best_step": best_step, "best_expert_val_loss": best_val if fixed_val else None,
+        "best_step": best_step, "best_validation_selection_score": best_val,
         "training_expert_windows": len(train_set),
         "counterfactual_states": len(cf),
+        "counterfactual_training_states": len(cf_train),
+        "counterfactual_validation_states": len(cf_val_indices),
+        "counterfactual_validation_scene_ids": sorted(cf_val_scene_ids),
         "counterfactual_candidates_per_state": cf.num_candidates,
         "counterfactual_source": str(args.counterfactual_dataset),
         "validation_expert_windows": len(fixed_val) if fixed_val else 0,
+        "last_expert_validation_loss": last_val,
+        "last_cf_validation": last_cf_validation,
         "train_scene_ids": split["train"], "validation_scene_ids": split["validation"],
         "test_scene_ids": split["test"], "weights": {
             "expert": args.expert_weight, "counterfactual": args.cf_weight,
@@ -236,6 +325,7 @@ def main(argv=None):
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--cf-batch-size", type=int, default=8)
+    p.add_argument("--cf-val-ratio", type=float, default=.2)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--split-seed", type=int, default=0)
