@@ -22,7 +22,7 @@ from model.predictor.config import PredictorConfig
 from model.predictor.counterfactual import (
     CounterfactualStateDataset, pairwise_physical_ranking_loss,
 )
-from model.predictor.dataset import PredictorWindowDataset, TrajectoryBatchSampler
+from model.predictor.dataset import PredictorWindowDataset, MixedTrajectoryBatchSampler
 from model.predictor.network import OrdinalDisturbancePredictor
 from model.predictor.normalizer import fit_predictor_normalizer
 from model.predictor.train import _mean_loss, _validation_subset, _select_device
@@ -172,8 +172,9 @@ def train(args):
     )
     expert_loader = DataLoader(
         train_set,
-        batch_sampler=TrajectoryBatchSampler(
-            train_set, min(args.batch_size, len(train_set)), seed=args.seed),
+        batch_sampler=MixedTrajectoryBatchSampler(
+            train_set, min(args.batch_size, len(train_set)),
+            seed=args.seed, trajectories_per_batch=args.expert_trajectories_per_batch),
         num_workers=0,
     )
     cf_loader = DataLoader(
@@ -324,6 +325,7 @@ def main(argv=None):
     p.add_argument("--device", choices=("auto","cuda","cpu"), default="auto")
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--expert-trajectories-per-batch", type=int, default=4)
     p.add_argument("--cf-batch-size", type=int, default=8)
     p.add_argument("--cf-val-ratio", type=float, default=.2)
     p.add_argument("--lr", type=float, default=1e-4)
