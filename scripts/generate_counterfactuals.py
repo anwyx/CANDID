@@ -16,7 +16,8 @@ import h5py
 import numpy as np
 
 from candid.data.adapter import canonical_observation, observation_vector
-from candid.data.counterfactual import choose_probes, make_candidates, stable_seed
+from candid.data.counterfactual import (choose_probes, make_candidates,
+                                        make_multiscale_candidates, stable_seed)
 from candid.data.metrics import disturbance_from_poses
 from candid.data.splits import validate_scene_split
 from candid.data.storage import freeze_state, json_safe, load_state_npz
@@ -132,7 +133,8 @@ def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
 def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             sigma=0.02, max_per_scene=4, max_prefix_steps=None,
             state_atol=0.005, obs_atol=0.005, dr_atol=0.02,
-            allow_fallback=False, perturb_gripper=False):
+            allow_fallback=False, perturb_gripper=False,
+            candidate_mode="legacy", sigma_levels=(0.02, 0.06, 0.12)):
     dataset = Path(dataset)
     output_dir = Path(output_dir)
     if output_dir.exists() and any(output_dir.iterdir()):
@@ -178,6 +180,14 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             expert, low, high, count=candidates,
             seed=stable_seed(seed, probe.trajectory_id, t), sigma=sigma,
             freeze_last_dimension=not perturb_gripper)
+        if candidate_mode == "multiscale":
+            actions_to_compare, candidate_sigmas = make_multiscale_candidates(
+                expert, low, high, count=candidates,
+                seed=stable_seed(seed, probe.trajectory_id, t),
+                sigma_levels=sigma_levels,
+                freeze_last_dimension=not perturb_gripper)
+        else:
+            candidate_sigmas = np.r_[0., np.repeat(sigma, candidates - 1)].astype(np.float32)
         actual = [_simulate(
             scene, snapshot, prefix, actions_to_compare[0],
             source_pose=truth["distractor_poses"][t],
@@ -212,13 +222,22 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             output_dir / rel, obs=actual[0]["observation"],
             actions=actions_to_compare, targets=targets,
             per_object_dr=obj_dr, per_object_topple=obj_topple,
-            per_object_fall=obj_fall, object_sizes_m=truth["object_sizes_m"])
+            per_object_fall=obj_fall, object_sizes_m=truth["object_sizes_m"],
+            nominal_sigmas=candidate_sigmas)
         meta = {"state_id": state_id, "scene_id": probe.scene_id,
                 "source_trajectory_id": probe.trajectory_id, "source_t": t,
                 "source_split": "train", "stratum": probe.stratum,
                 "file": rel, "object_ids": source_row["object_ids"],
                 "num_candidates": candidates,
                 "perturbation_sigma": sigma,
+                "candidate_mode": candidate_mode,
+                "nominal_sigmas": candidate_sigmas.tolist(),
+                "actual_action_l2_from_expert": np.linalg.norm(
+                    (actions_to_compare - expert[None]).reshape(candidates, -1),
+                    axis=1).tolist(),
+                "dr_mean_range": float(np.ptp(targets[:, 0])),
+                "dr_max_range": float(np.ptp(targets[:, 1])),
+                "topple_label_distinct": bool(len(np.unique(targets[:, 2])) > 1),
                 "reference_obs_replay_max_abs": actual[0]["source_obs_max_abs"],
                 "expert_source_dr_mean": archived["dr_mean"],
                 "expert_replayed_dr_mean": float(targets[0,0]),
@@ -228,6 +247,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         counts[probe.stratum] += 1
         counts["topple_candidates"] += int((targets[:,2] > 0).sum())
         counts["states_with_distinct_topple"] += int(len(set(targets[:,2])) > 1)
+        counts["states_with_dr_mean_range_gt_001"] += int(np.ptp(targets[:, 0]) > .01)
+        counts["states_with_dr_mean_range_gt_005"] += int(np.ptp(targets[:, 0]) > .05)
         counts["physical_action_steps"] += candidates * (t+8)
         visited.add(probe.scene_id)
         print(f"[{index+1}/{states}] {probe.trajectory_id} t={t} "
@@ -243,7 +264,11 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
                "topple_candidates":counts["topple_candidates"],
                "states_with_distinct_topple":counts["states_with_distinct_topple"],
                "replayed_physics_action_steps":counts["physical_action_steps"],
-               "seed":seed,"sigma":sigma,"obs_horizon":2,"action_horizon":8,
+               "seed":seed,"sigma":sigma,"candidate_mode":candidate_mode,
+               "sigma_levels":list(sigma_levels),
+               "states_with_dr_mean_range_gt_001":counts["states_with_dr_mean_range_gt_001"],
+               "states_with_dr_mean_range_gt_005":counts["states_with_dr_mean_range_gt_005"],
+               "obs_horizon":2,"action_horizon":8,
                "label_names":["dr_mean","dr_max","any_topple","any_fall"],
                "labels_from_simulation":True, "trained_model":False}
     (output_dir/"summary.json").write_text(
@@ -259,6 +284,9 @@ def main(argv=None):
     p.add_argument("--candidates",type=int,default=4)
     p.add_argument("--seed",type=int,default=2026)
     p.add_argument("--sigma",type=float,default=0.02)
+    p.add_argument("--candidate-mode",choices=("legacy","multiscale"),default="legacy")
+    p.add_argument("--sigma-levels",default="0.02,0.06,0.12",
+                   help="Comma-separated action perturbation scales in multiscale mode")
     p.add_argument("--max-per-scene",type=int,default=4)
     p.add_argument("--max-prefix-steps",type=int,default=None)
     p.add_argument("--state-atol",type=float,default=0.005)
@@ -267,9 +295,14 @@ def main(argv=None):
     p.add_argument("--allow-scene-spec-fallback",action="store_true")
     p.add_argument("--perturb-gripper",action="store_true")
     args=p.parse_args(argv)
+    try:
+        levels=tuple(float(x.strip()) for x in args.sigma_levels.split(","))
+    except ValueError as exc:
+        p.error(f"Invalid --sigma-levels: {exc}")
     report=collect(
         args.dataset,args.output_dir,states=args.states,
         candidates=args.candidates,seed=args.seed,sigma=args.sigma,
+        candidate_mode=args.candidate_mode,sigma_levels=levels,
         max_per_scene=args.max_per_scene,max_prefix_steps=args.max_prefix_steps,
         state_atol=args.state_atol,obs_atol=args.obs_atol,dr_atol=args.dr_atol,
         allow_fallback=args.allow_scene_spec_fallback,
