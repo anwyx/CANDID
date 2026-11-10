@@ -111,3 +111,46 @@ action-conditioned risk from these samples.
 
 Note: V1.1 still collects data only, without fitting any Predictor or
 claiming an improvement in safety.
+
+
+## V1.2: resume interrupted physical collection
+
+Do not change `obs_atol` to suppress source/replay disagreement: it would
+risk training on mismatched `(observation, action, physical label)` tuples.
+
+An expert trajectory with inconsistent archived/replayed observation or
+baseline physical DR/Topple/Fall is now **skipped and logged**, not used for
+training. Only these known source-replay mismatches are skipped; unexpected
+errors in environment setup, action generation, or physics still fail loudly.
+Deterministic reserve probes make up the requested number of *valid* states
+when available.
+
+For an interrupted run produced before V1.2, preserving the two already
+completed states, use the EXACT original collection flags and add `--resume`:
+
+```bash
+PYTHONPATH=src:. python scripts/generate_counterfactuals.py \
+  --dataset demos/scene1 \
+  --output-dir runs/counterfactual_multiscale_smoke_v1 \
+  --states 6 --candidates 7 --max-per-scene 1 \
+  --candidate-mode multiscale --sigma-levels 0.02,0.06,0.12 \
+  --max-prefix-steps 160 --seed 2026 --resume
+```
+
+The legacy run's manifest records are validated against the original
+deterministic probe selection. Saved NPZ candidate outcomes are retained.
+A `collection_config.json` is written when resuming; subsequent resume
+attempts must match this configuration, including sampling parameters and
+frozen source split fingerprint.
+
+- `skipped_probes.jsonl` records unreproducible expert chunks, including the
+  exact source trajectory ID, step and reason.
+- `summary.json` is updated after each committed valid group and skip.
+- `num_states` is the actual count of valid saved groups, not a requested
+  target; `requested_states` and `complete` distinguish shortfalls.
+- `--reserve-probes 16` adds up to 16 more training-only probes without
+  changing the primary six selected states. No test/validation samples are used.
+
+This does not solve the underlying historical observation mismatch. It
+prevents such mismatched source samples from contaminating Predictor training
+and lets the physically verified data collection continue.
