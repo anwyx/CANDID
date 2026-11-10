@@ -426,7 +426,13 @@ def evaluate_dataset(
         "evaluation_source": evaluation_source,
         "eval_suite": str(snapshot_root) if suite_meta is not None else None,
         "eval_suite_sha256": suite_meta["suite_content_sha256"] if suite_meta else None,
-        "eval_suite_seed": suite_meta["seed"] if suite_meta else None,
+        "eval_suite_seed": suite_meta.get("seed") if suite_meta else None,
+        "eval_suite_groups": (
+            {component["label"]: component["num_scenes"]
+             for component in suite_meta["components"]}
+            if suite_meta and suite_meta["source"] == "multi_env_eval_suite"
+            else None
+        ),
         "test_scene_ids": test_ids,
         "episodes_per_scene": episodes_per_scene, "exec_horizon": exec_horizon,
         "max_steps": max_steps, "eval_seed": eval_seed,
