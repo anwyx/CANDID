@@ -159,3 +159,38 @@ def test_counterfactual_supervision_and_ranking_optimizer_step():
     (supervised + ranking).backward()
     assert model.event_head.weight.grad is not None
     assert model.event_head.weight.grad.abs().sum() > 0
+
+
+def test_counterfactual_event_weight_cap_limits_outlier_loss():
+    from model.predictor.normalizer import PredictorNormalizer
+    from scripts.train_counterfactual_predictor import _counterfactual_losses
+    torch.manual_seed(5)
+    model = OrdinalDisturbancePredictor(
+        obs_dim=3, action_dim=2, obs_horizon=2,
+        action_horizon=8, hidden=16)
+    normalizer = PredictorNormalizer(
+        torch.zeros(3), torch.ones(3),
+        torch.zeros(2), torch.ones(2),
+        torch.zeros(2), torch.ones(2),
+        torch.tensor([50., 50.]))
+    batch = {
+        "obs": torch.zeros(1, 2, 3),
+        "actions": torch.zeros(1, 3, 8, 2),
+        "targets": torch.tensor([[
+            [.04, .08, 1., 0.],
+            [.01, .03, 0., 0.],
+            [.10, .20, 1., 0.],
+        ]]),
+    }
+    options = dict(temperature=.1, topple_weight=.5,
+                   fall_weight=1., dr_max_weight=.25,
+                   min_risk_gap=.01)
+    high, _, _ = _counterfactual_losses(
+        model, normalizer, batch, cf_pos_weight_cap=50., **options)
+    low, rank, stats = _counterfactual_losses(
+        model, normalizer, batch, cf_pos_weight_cap=3., **options)
+    assert low < high
+    assert stats["pairs"] > 0
+    assert torch.isfinite(rank)
+    (low + rank).backward()
+    assert torch.isfinite(model.event_head.weight.grad).all()
