@@ -10,6 +10,7 @@ from model.predictor.counterfactual import (
     CounterfactualStateDataset, pairwise_physical_ranking_loss,
 )
 from model.predictor.network import OrdinalDisturbancePredictor
+from model.predictor.dataset import MixedTrajectoryBatchSampler
 
 
 def _fixture(tmp_path):
@@ -114,3 +115,47 @@ def test_ranking_matches_known_preference():
     assert good_stats["accuracy"] == 1.
     assert bad_stats["accuracy"] == 0.
     assert good < bad
+
+
+def test_mixed_sampler_complete_coverage_and_exact_length():
+    class FakeWindowDataset:
+        indices = np.concatenate([
+            np.stack([np.full(11, i), np.arange(11)], axis=1)
+            for i in range(8)
+        ], axis=0)
+    sampler = MixedTrajectoryBatchSampler(
+        FakeWindowDataset(), batch_size=16, trajectories_per_batch=4, seed=7)
+    batches = list(iter(sampler))
+    assert len(batches) == len(sampler)
+    assert all(0 < len(batch) <= 16 for batch in batches)
+    covered = [idx for batch in batches for idx in batch]
+    assert sorted(covered) == list(range(88))
+    assert any(len({int(FakeWindowDataset.indices[idx, 0]) for idx in batch}) >= 3
+               for batch in batches)
+
+
+def test_counterfactual_supervision_and_ranking_optimizer_step():
+    from model.predictor.normalizer import PredictorNormalizer
+    from scripts.train_counterfactual_predictor import _counterfactual_losses
+    model = OrdinalDisturbancePredictor(
+        obs_dim=3, action_dim=2, obs_horizon=2, action_horizon=8,
+        hidden=16)
+    normalizer = PredictorNormalizer(
+        torch.zeros(3), torch.ones(3), torch.zeros(2), torch.ones(2),
+        torch.zeros(2), torch.ones(2), torch.ones(2))
+    batch = {
+        "obs": torch.zeros(2, 2, 3),
+        "actions": torch.randn(2, 3, 8, 2),
+        "targets": torch.tensor([
+            [[.001, .002, 0., 0.], [.03, .06, 1., 0.], [.08, .16, 0., 0.]],
+            [[.004, .008, 0., 0.], [.09, .20, 1., 0.], [.04, .08, 0., 0.]],
+        ]),
+    }
+    supervised, ranking, stats = _counterfactual_losses(
+        model, normalizer, batch, temperature=.1, topple_weight=.5,
+        fall_weight=1., dr_max_weight=.25, min_risk_gap=.01)
+    assert torch.isfinite(supervised) and torch.isfinite(ranking)
+    assert stats["pairs"] > 0
+    (supervised + ranking).backward()
+    assert model.event_head.weight.grad is not None
+    assert model.event_head.weight.grad.abs().sum() > 0
