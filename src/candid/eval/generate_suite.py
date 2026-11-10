@@ -77,6 +77,10 @@ def generate_suite(output_dir, env_id, env_module, *,
         render_mode=None, render_backend="none",
         robot_uids="xarm6_robotiq", reward_mode="dense",
         sim_backend="cpu", max_episode_steps=max_episode_steps,
+        # BaseEnv.__init__ does its own seed-2022 bootstrap reset.
+        # Only that throwaway bootstrap skips settling. The candidate
+        # trace.reset(seed=scene_seed) below still validates every layout.
+        skip_constructor_settling=True,
         **kwargs,
     )
     trace = PhysicsTrace(env)
