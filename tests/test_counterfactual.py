@@ -4,7 +4,8 @@ import json
 import numpy as np
 import pytest
 
-from candid.data.counterfactual import choose_probes, make_candidates, stable_seed
+from candid.data.counterfactual import (choose_probes, make_candidates,
+                                        make_multiscale_candidates, stable_seed)
 
 
 def _trajectory(root, scene, index, topple=False, displacement=0.0):
@@ -79,3 +80,34 @@ def test_probe_prefix_bound(tmp_path):
     assert probe.step<=3
     with pytest.raises(ValueError,match="max_prefix_steps"):
         choose_probes(tmp_path,["train-A"],count=1,max_prefix_steps=0)
+
+
+def test_multiscale_pairs_cover_signed_directions_and_scales():
+    expert = np.full((8, 7), 0.5, dtype=np.float32)
+    low, high = np.zeros(7), np.ones(7)
+    chunks, sigmas = make_multiscale_candidates(
+        expert, low, high, count=7, seed=42,
+        sigma_levels=(0.02, 0.06, 0.12))
+    repeat, _ = make_multiscale_candidates(
+        expert, low, high, count=7, seed=42,
+        sigma_levels=(0.02, 0.06, 0.12))
+    np.testing.assert_array_equal(chunks, repeat)
+    np.testing.assert_array_equal(chunks[0], expert)
+    np.testing.assert_allclose(sigmas, [0, .02, .02, .06, .06, .12, .12], atol=1e-7)
+    assert chunks.shape == (7, 8, 7)
+    assert np.isfinite(chunks).all()
+    assert (chunks >= low).all() and (chunks <= high).all()
+    np.testing.assert_array_equal(chunks[:, :, -1], np.full((7, 8), 0.5))
+    for i in (1, 3, 5):
+        np.testing.assert_allclose(chunks[i] + chunks[i+1], 2*expert, atol=1e-6)
+    scales = [np.linalg.norm((chunks[i] - expert).ravel()) for i in (1, 3, 5)]
+    assert scales[0] < scales[1] < scales[2]
+
+
+def test_multiscale_validates_invalid_candidates():
+    expert = np.full((8, 7), .5, dtype=np.float32)
+    with pytest.raises(ValueError, match=">=3"):
+        make_multiscale_candidates(expert, np.zeros(7), np.ones(7), count=2, seed=0)
+    with pytest.raises(ValueError, match="sigma levels"):
+        make_multiscale_candidates(expert, np.zeros(7), np.ones(7), count=3,
+                                   seed=0, sigma_levels=(-.02,))
