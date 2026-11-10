@@ -26,6 +26,10 @@ from candid.eval.replay_env import resolve_scene_environment
 from candid.eval.rollout import _canonical_live, _check_initial_scene, _clamp_action, _is_true
 
 
+class ExpertReplayMismatch(RuntimeError):
+    """Archived expert state/outcome cannot be reproduced faithfully."""
+
+
 def _read_jsonl(path):
     with Path(path).open(encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
@@ -103,12 +107,12 @@ def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
             if actual.shape != source_pose.shape:
                 raise ValueError("Source pose shape mismatch")
             if np.max(np.abs(actual - source_pose)) > state_atol:
-                raise RuntimeError("Archived expert state not reproduced by physics replay")
+                raise ExpertReplayMismatch("Archived expert state not reproduced by physics replay")
         obs_history = np.stack(history).astype(np.float32)
         if source_obs is not None:
             error = float(np.max(np.abs(obs_history - source_obs)))
             if error > obs_atol:
-                raise RuntimeError(f"Archived expert observation replay mismatch: {error}")
+                raise ExpertReplayMismatch(f"Archived expert observation replay mismatch: {error}")
         else:
             error = None
         for index, action in enumerate(candidate):
@@ -134,23 +138,130 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             sigma=0.02, max_per_scene=4, max_prefix_steps=None,
             state_atol=0.005, obs_atol=0.005, dr_atol=0.02,
             allow_fallback=False, perturb_gripper=False,
-            candidate_mode="legacy", sigma_levels=(0.02, 0.06, 0.12)):
+            candidate_mode="legacy", sigma_levels=(0.02, 0.06, 0.12),
+            resume=False, reserve_probes=16):
     dataset = Path(dataset)
     output_dir = Path(output_dir)
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Output directory must be empty: {output_dir}")
-    if states < 1 or candidates < 2 or dr_atol < 0:
-        raise ValueError("Require positive states, >=2 candidates, nonnegative DR tolerance")
+    if states < 1 or candidates < 2 or dr_atol < 0 or reserve_probes < 0:
+        raise ValueError("Require states>=1, candidates>=2, nonnegative tolerances/reserves")
+    if candidate_mode == "multiscale" and candidates < 3:
+        raise ValueError("Multiscale sampling requires at least three candidates")
     split, scenes = load_train_source(dataset)
+    config = {
+        "source_dataset": str(dataset), "source_split_sha256": split["dataset_sha256"],
+        "states": states, "candidates": candidates, "seed": seed,
+        "sigma": sigma, "candidate_mode": candidate_mode,
+        "sigma_levels": [float(x) for x in sigma_levels],
+        "max_per_scene": max_per_scene,
+        "max_prefix_steps": max_prefix_steps,
+        "state_atol": state_atol, "obs_atol": obs_atol, "dr_atol": dr_atol,
+        "allow_fallback": allow_fallback, "perturb_gripper": perturb_gripper,
+    }
+    manifest = output_dir / "states.jsonl"
+    failed_manifest = output_dir / "skipped_probes.jsonl"
+    config_path = output_dir / "collection_config.json"
+    existing = output_dir.exists() and any(output_dir.iterdir())
+    if existing and not resume:
+        raise FileExistsError("Nonempty output directory: pass --resume to reuse verified samples")
+    if resume and existing and not manifest.exists():
+        raise RuntimeError("Cannot resume without states.jsonl")
+    previous = _read_jsonl(manifest) if existing else []
+    failed = _read_jsonl(failed_manifest) if existing and failed_manifest.exists() else []
+    for row in previous:
+        if row.get("source_split") != "train":
+            raise RuntimeError("Resume manifest contains non-training scene")
+        if row["scene_id"] not in split["train"]:
+            raise RuntimeError("Resume manifest scene not in current training split")
+        if row.get("num_candidates") != candidates or row.get("candidate_mode", "legacy") != candidate_mode:
+            raise RuntimeError("Existing candidate settings disagree with resume options")
+        if float(row.get("perturbation_sigma", sigma)) != float(sigma):
+            raise RuntimeError("Existing sigma disagrees with resume options")
+        expected_sigmas = ([0.] + [sigma] * (candidates - 1)
+                           if candidate_mode == "legacy" else
+                           [0.] + [float(sigma_levels[(i-1)//2 % len(sigma_levels)])
+                                   for i in range(1, candidates)])
+        if not np.allclose(row.get("nominal_sigmas", []), expected_sigmas, atol=1e-6):
+            raise RuntimeError("Existing nominal perturbation scales disagree with resume")
+        data_path = output_dir / row["file"]
+        if not data_path.is_file():
+            raise FileNotFoundError(f"Resume sample missing: {data_path}")
+        with np.load(data_path, allow_pickle=False) as data:
+            if data["targets"].shape != (candidates, 4):
+                raise RuntimeError(f"Existing sample shape invalid: {data_path}")
+    if existing and config_path.exists():
+        previous_config = json.loads(config_path.read_text(encoding="utf-8"))
+        if previous_config != config:
+            raise RuntimeError("Resume arguments disagree with collection_config.json")
+    elif existing and previous:
+        # V1.1 interrupted runs had no config file. Verify their original
+        # deterministic probe selection before adopting the saved records.
+        legacy_probes = choose_probes(
+            dataset, split["train"], count=states, seed=seed,
+            max_per_scene=max_per_scene, max_prefix_steps=max_prefix_steps)
+        legacy_ids = {(p.trajectory_id, p.step) for p in legacy_probes}
+        for row in previous:
+            if (row["source_trajectory_id"], row["source_t"]) not in legacy_ids:
+                raise RuntimeError("Existing probe does not match deterministic source selection")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    samples_dir = output_dir / "samples"
+    samples_dir.mkdir(parents=True, exist_ok=True)
+    if not config_path.exists():
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     probes = choose_probes(
         dataset, split["train"], count=states, seed=seed,
-        max_per_scene=max_per_scene, max_prefix_steps=max_prefix_steps)
-    samples_dir = output_dir / "samples"
-    samples_dir.mkdir(parents=True, exist_ok=False)
+        max_per_scene=max_per_scene, max_prefix_steps=max_prefix_steps,
+        reserve_count=reserve_probes)
     counts = Counter()
     visited = set()
-    manifest = output_dir / "states.jsonl"
-    for index, probe in enumerate(probes):
+    completed = {(row["source_trajectory_id"], row["source_t"]) for row in previous}
+    failed_keys = {(row["source_trajectory_id"], row["source_t"]) for row in failed}
+    for row in previous:
+        with np.load(output_dir / row["file"], allow_pickle=False) as data:
+            targets = data["targets"]
+        counts[row["stratum"]] += 1
+        counts["topple_candidates"] += int((targets[:,2] > 0).sum())
+        counts["states_with_distinct_topple"] += int(np.ptp(targets[:,2]) > 0)
+        counts["states_with_dr_mean_range_gt_001"] += int(np.ptp(targets[:,0]) > .01)
+        counts["states_with_dr_mean_range_gt_005"] += int(np.ptp(targets[:,0]) > .05)
+        counts["physical_action_steps"] += candidates * (int(row["source_t"])+8)
+        visited.add(row["scene_id"])
+
+    def save_summary():
+        actual_count = len(completed)
+        summary = {
+            "schema_version": 1, "source_dataset": str(dataset),
+            "source_split_sha256": split["dataset_sha256"],
+            "source_split": "train", "requested_states": states,
+            "num_states": actual_count, "complete": actual_count == states,
+            "num_candidates_per_state": candidates,
+            "physical_rollouts": actual_count * candidates,
+            "distinct_source_scenes": len(visited),
+            "strata": dict(counts),
+            "topple_candidates": counts["topple_candidates"],
+            "states_with_distinct_topple": counts["states_with_distinct_topple"],
+            "states_with_dr_mean_range_gt_001": counts["states_with_dr_mean_range_gt_001"],
+            "states_with_dr_mean_range_gt_005": counts["states_with_dr_mean_range_gt_005"],
+            "skipped_probes": len(failed),
+            "replayed_physics_action_steps": counts["physical_action_steps"],
+            "seed": seed, "sigma": sigma, "candidate_mode": candidate_mode,
+            "sigma_levels": list(sigma_levels),
+            "obs_horizon": 2, "action_horizon": 8,
+            "label_names": ["dr_mean", "dr_max", "any_topple", "any_fall"],
+            "labels_from_simulation": True, "trained_model": False,
+        }
+        (output_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        return summary
+
+    save_summary()
+    for probe in probes:
+        if len(completed) >= states:
+            break
+        key = (probe.trajectory_id, probe.step)
+        if key in completed or key in failed_keys:
+            continue
+        index = len(completed)
         if probe.scene_id not in split["train"]:
             raise RuntimeError("Refusing any test/validation scene")
         source_row = probe.trajectory
@@ -190,20 +301,32 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             candidate_sigmas = np.r_[0., np.repeat(sigma, candidates - 1)].astype(np.float32)
         else:
             raise ValueError(f"Unknown candidate mode: {candidate_mode}")
-        actual = [_simulate(
-            scene, snapshot, prefix, actions_to_compare[0],
-            source_pose=truth["distractor_poses"][t],
-            source_obs=obs_window, state_atol=state_atol,
-            obs_atol=obs_atol, allow_fallback=allow_fallback)]
-        for metric in ("dr_mean", "dr_max"):
-            delta = abs(actual[0]["label"][metric] - archived[metric])
-            if delta > dr_atol:
-                raise RuntimeError(f"Expert source/replay {metric} mismatch "
-                                   f"{delta} > {dr_atol}: {probe.trajectory_id}:{t}")
-        for event in ("topple_count", "fall_count"):
-            if actual[0]["label"][event] != archived[event]:
-                raise RuntimeError(f"Expert source/replay {event} mismatch: "
-                                   f"{probe.trajectory_id}:{t}")
+        try:
+            actual = [_simulate(
+                scene, snapshot, prefix, actions_to_compare[0],
+                source_pose=truth["distractor_poses"][t],
+                source_obs=obs_window, state_atol=state_atol,
+                obs_atol=obs_atol, allow_fallback=allow_fallback)]
+            for metric in ("dr_mean", "dr_max"):
+                delta = abs(actual[0]["label"][metric] - archived[metric])
+                if delta > dr_atol:
+                    raise ExpertReplayMismatch(
+                        f"Expert source/replay {metric} mismatch {delta} > {dr_atol}: "
+                        f"{probe.trajectory_id}:{t}")
+            for event in ("topple_count", "fall_count"):
+                if actual[0]["label"][event] != archived[event]:
+                    raise ExpertReplayMismatch(
+                        f"Expert source/replay {event} mismatch: {probe.trajectory_id}:{t}")
+        except ExpertReplayMismatch as exc:
+            row = {"scene_id": probe.scene_id, "source_trajectory_id": probe.trajectory_id,
+                   "source_t": t, "reason": str(exc)}
+            with failed_manifest.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            failed.append(row)
+            failed_keys.add(key)
+            save_summary()
+            print(f"SKIP unrepeatable expert: {probe.trajectory_id} t={t}: {exc}", flush=True)
+            continue
         for alternate in actions_to_compare[1:]:
             actual.append(_simulate(
                 scene, snapshot, prefix, alternate,
@@ -253,28 +376,16 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         counts["states_with_dr_mean_range_gt_005"] += int(np.ptp(targets[:, 0]) > .05)
         counts["physical_action_steps"] += candidates * (t+8)
         visited.add(probe.scene_id)
-        print(f"[{index+1}/{states}] {probe.trajectory_id} t={t} "
+        completed.add(key)
+        save_summary()
+        print(f"[{len(completed)}/{states}] {probe.trajectory_id} t={t} "
               f"{probe.stratum} topples={targets[:,2].astype(int).tolist()}",
               flush=True)
-    summary = {"schema_version":1, "source_dataset":str(dataset),
-               "source_split_sha256":split["dataset_sha256"],
-               "source_split":"train", "num_states":states,
-               "num_candidates_per_state":candidates,
-               "physical_rollouts":states*candidates,
-               "distinct_source_scenes":len(visited),
-               "strata":dict(counts),
-               "topple_candidates":counts["topple_candidates"],
-               "states_with_distinct_topple":counts["states_with_distinct_topple"],
-               "replayed_physics_action_steps":counts["physical_action_steps"],
-               "seed":seed,"sigma":sigma,"candidate_mode":candidate_mode,
-               "sigma_levels":list(sigma_levels),
-               "states_with_dr_mean_range_gt_001":counts["states_with_dr_mean_range_gt_001"],
-               "states_with_dr_mean_range_gt_005":counts["states_with_dr_mean_range_gt_005"],
-               "obs_horizon":2,"action_horizon":8,
-               "label_names":["dr_mean","dr_max","any_topple","any_fall"],
-               "labels_from_simulation":True, "trained_model":False}
-    (output_dir/"summary.json").write_text(
-        json.dumps(summary,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
+    summary = save_summary()
+    if not summary["complete"]:
+        print(f"INCOMPLETE: collected {len(completed)}/{states} valid states; "
+              f"skipped {len(failed)} unrepeatable expert probes. "
+              "See skipped_probes.jsonl.", flush=True)
     return summary
 
 
@@ -296,6 +407,10 @@ def main(argv=None):
     p.add_argument("--dr-atol",type=float,default=0.02)
     p.add_argument("--allow-scene-spec-fallback",action="store_true")
     p.add_argument("--perturb-gripper",action="store_true")
+    p.add_argument("--resume",action="store_true",
+                   help="Continue an interrupted run from verified saved states")
+    p.add_argument("--reserve-probes",type=int,default=16,
+                   help="Additional deterministic training probes if some expert replays mismatch")
     args=p.parse_args(argv)
     try:
         levels=tuple(float(x.strip()) for x in args.sigma_levels.split(","))
@@ -308,7 +423,8 @@ def main(argv=None):
         max_per_scene=args.max_per_scene,max_prefix_steps=args.max_prefix_steps,
         state_atol=args.state_atol,obs_atol=args.obs_atol,dr_atol=args.dr_atol,
         allow_fallback=args.allow_scene_spec_fallback,
-        perturb_gripper=args.perturb_gripper)
+        perturb_gripper=args.perturb_gripper,
+        resume=args.resume, reserve_probes=args.reserve_probes)
     print(json.dumps(report,indent=2,ensure_ascii=False))
     return report
 
