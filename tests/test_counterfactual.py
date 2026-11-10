@@ -111,3 +111,22 @@ def test_multiscale_validates_invalid_candidates():
     with pytest.raises(ValueError, match="sigma levels"):
         make_multiscale_candidates(expert, np.zeros(7), np.ones(7), count=3,
                                    seed=0, sigma_levels=(-.02,))
+
+
+def test_reserve_probes_preserve_original_selection(tmp_path):
+    rows = [_trajectory(tmp_path, f"train-{i}", 0, topple=(i%2 == 0))
+            for i in range(8)]
+    (tmp_path/"trajectories.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    primary = choose_probes(tmp_path, [r["scene_id"] for r in rows],
+                            count=4, seed=2026, max_per_scene=1)
+    expanded = choose_probes(tmp_path, [r["scene_id"] for r in rows],
+                             count=4, seed=2026, max_per_scene=1,
+                             reserve_count=4)
+    assert [(p.trajectory_id,p.step) for p in expanded[:4]] == [
+        (p.trajectory_id,p.step) for p in primary]
+    assert len(expanded) == 8
+    assert len({(p.trajectory_id,p.step) for p in expanded}) == 8
+    with pytest.raises(ValueError, match="reserve_count"):
+        choose_probes(tmp_path,[r["scene_id"] for r in rows],
+                      count=4,reserve_count=-1)
