@@ -162,6 +162,9 @@ def _rollout_single(
         reward_mode="dense",
         sim_backend="cpu",
         max_episode_steps=max_steps,
+        # As with generation, ignore only ManiSkill's implicit bootstrap
+        # settling; the saved snapshot is restored and verified below.
+        **({"skip_constructor_settling": True} if scene.get("generated_eval_suite") else {}),
         **scene.get("env_kwargs", {}),
     )
     trace = PhysicsTrace(raw_env)
