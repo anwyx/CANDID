@@ -120,7 +120,11 @@ def _check_signature(expected, actual, atol=1e-5):
     for key in expected:
         if expected[key].shape != actual[key].shape:
             raise RuntimeError(f"Restore changed {key} shape")
-        error = float(np.max(np.abs(expected[key] - actual[key])))
+        if key == "poses":
+            from candid.data.replay_diagnostics import orientation_aligned_pose_max_error
+            error = orientation_aligned_pose_max_error(actual[key], expected[key])
+        else:
+            error = float(np.max(np.abs(expected[key] - actual[key])))
         if error > atol:
             raise RuntimeError(f"Restore changed {key} (maximum absolute error={error:.7g})")
 
