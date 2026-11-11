@@ -16,12 +16,32 @@ from torch.utils.data import Dataset
 
 class CounterfactualStateDataset(Dataset):
     def __init__(self, root, dataset_root, split, *, obs_horizon=2,
-                 action_horizon=8, obs_dim=None, action_dim=None, allowed_scenes=None):
+                 action_horizon=8, obs_dim=None, action_dim=None, allowed_scenes=None,
+                 allow_incomplete=False):
         self.root = Path(root)
         summary = json.loads((self.root / "summary.json").read_text(encoding="utf-8"))
-        if (summary.get("complete") is not True or summary.get("labels_from_simulation") is not True
+        if (summary.get("labels_from_simulation") is not True
                 or summary.get("source_split") != "train"):
-            raise ValueError("Only complete, physically relabeled TRAIN counterfactual data are allowed")
+            raise ValueError("Only physically relabeled TRAIN counterfactual data are allowed")
+        self.collection_complete = summary.get("complete") is True
+        if not self.collection_complete and not allow_incomplete:
+            raise ValueError(
+                "Counterfactual collection is incomplete. Use the explicit "
+                "--allow-incomplete-counterfactual training flag only after "
+                "reviewing its quality report.")
+        self.original_requested_states = int(summary.get("requested_states", 0))
+        self.original_collected_states = int(summary.get("num_states", 0))
+        if (self.original_requested_states < 1 or self.original_collected_states < 1
+                or self.original_collected_states > self.original_requested_states
+                or self.collection_complete != (
+                    self.original_collected_states == self.original_requested_states)):
+            raise ValueError("Invalid counterfactual completion metadata")
+        self.original_stratum_shortfall = dict(summary.get("stratum_shortfall") or {})
+        if not self.collection_complete:
+            if not self.original_stratum_shortfall or (
+                    sum(int(x) for x in self.original_stratum_shortfall.values())
+                    != self.original_requested_states - self.original_collected_states):
+                raise ValueError("Incomplete dataset has inconsistent stratum shortfall")
         if summary.get("source_split_sha256") != split["dataset_sha256"]:
             raise ValueError("Counterfactual source split differs from the expert dataset")
         if Path(summary.get("source_dataset", "")).resolve() != Path(dataset_root).resolve():
