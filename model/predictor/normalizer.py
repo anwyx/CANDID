@@ -71,7 +71,7 @@ def normalize_predictor_actions(normalizer, actions, *, obs):
     raise ValueError(f"Unknown predictor action representation: {representation}")
 
 
-def fit_predictor_normalizer(dataset, batch_size=256, *
+def fit_predictor_normalizer(dataset, batch_size=256, *,
                              action_representation="absolute") -> PredictorNormalizer:
     """One streaming pass; no stack of all overlapping predictor windows."""
     totals = {}
