@@ -68,7 +68,7 @@ def normalize_predictor_actions(normalizer, actions, *, obs):
         return normalizer.normalize_action(actions, obs=obs)
     if representation == "absolute":
         return normalizer.normalize_action(actions)
-    raise ValueError(f"Unknown predictor action representation: {representation}"
+    raise ValueError(f"Unknown predictor action representation: {representation}")
 
 
 def fit_predictor_normalizer(dataset, batch_size=256, *
