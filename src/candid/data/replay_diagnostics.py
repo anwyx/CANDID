@@ -55,3 +55,54 @@ def observation_error_breakdown(replayed, archived):
         "per_field": per_field,
         "total_features": int(live.shape[1]),
     }
+
+
+
+def orientation_aligned_pose_max_error(replayed, archived):
+    """Compare pose positions and rotations; q and -q encode the same orientation."""
+    live = np.asarray(replayed, dtype=np.float64)
+    source = np.asarray(archived, dtype=np.float64)
+    if live.shape != source.shape or live.shape[-1] != 7:
+        raise ValueError("Pose tensors must have matching [...,7] shapes")
+    if not (np.isfinite(live).all() and np.isfinite(source).all()):
+        return float("inf")
+    aligned_q = np.where(
+        (live[..., 3:7] * source[..., 3:7]).sum(axis=-1, keepdims=True) < 0,
+        -source[..., 3:7], source[..., 3:7])
+    return float(max(np.abs(live[..., :3] - source[..., :3]).max(),
+                     np.abs(live[..., 3:7] - aligned_q).max()))
+
+
+def orientation_aligned_observation_max_error(replayed, archived):
+    """Compare canonical observations allowing quaternion sign equivalence.
+
+    This does not change any actual observation used for model input.
+    """
+    live = np.asarray(replayed, dtype=np.float64)
+    source = np.asarray(archived, dtype=np.float64)
+    if live.shape != source.shape or live.ndim != 2:
+        raise ValueError("Observation windows must have matching [T,D] shapes")
+    if not (np.isfinite(live).all() and np.isfinite(source).all()):
+        return float("inf")
+    fixed = 7 + 16 + 6 * 16 + 6 + 2
+    robot_total = live.shape[1] - fixed
+    if robot_total < 2 or robot_total % 2:
+        raise ValueError(f"Unknown canonical observation width: {live.shape[1]}")
+    source = source.copy()
+
+    def align_quat(pose_offset):
+        start = pose_offset + 3
+        end = start + 4
+        live_q = live[:, start:end]
+        src_q = source[:, start:end]
+        flip = (live_q * src_q).sum(axis=-1, keepdims=True) < 0
+        source[:, start:end] = np.where(flip, -src_q, src_q)
+
+    tcp_start = robot_total
+    target_start = tcp_start + 7
+    distractors_start = target_start + 16
+    align_quat(tcp_start)
+    align_quat(target_start)
+    for i in range(6):
+        align_quat(distractors_start + i * 16)
+    return float(np.abs(live - source).max())
