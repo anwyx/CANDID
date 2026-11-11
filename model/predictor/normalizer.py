@@ -56,7 +56,22 @@ class PredictorNormalizer:
         return target * self.target_std + self.target_mean
 
 
-def fit_predictor_normalizer(dataset, batch_size=256, *,
+def normalize_predictor_actions(normalizer, actions, *, obs):
+    """Use raw observations only for delta-q; preserve legacy normalizer API.
+
+    The legacy absolute-action normalizer (including test IdentityNormalizer)
+    accepts normalize_action(actions) without an obs argument. Scene1 v3
+    delta-q needs raw obs before normalization and remains differentiable.
+    """
+    representation = getattr(normalizer, "action_representation", "absolute")
+    if representation == "delta_q":
+        return normalizer.normalize_action(actions, obs=obs)
+    if representation == "absolute":
+        return normalizer.normalize_action(actions)
+    raise ValueError(f"Unknown predictor action representation: {representation}"
+
+
+def fit_predictor_normalizer(dataset, batch_size=256, *
                              action_representation="absolute") -> PredictorNormalizer:
     """One streaming pass; no stack of all overlapping predictor windows."""
     totals = {}
