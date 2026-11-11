@@ -78,12 +78,17 @@ def make_env(scene, max_steps, env_id):
     import gymnasium as gym
     from candid.data.monitor import PhysicsTrace
 
+    # ManiSkill's BaseEnv constructor performs a throwaway seed-2022 reset.
+    # That random layout is NOT the archived scene. Only bypass settling
+    # validation for the throwaway reset; explicit resets remain checked.
+    env_kwargs = dict(scene.get("env_kwargs", {}))
+    env_kwargs.setdefault("skip_constructor_settling", True)
     return PhysicsTrace(gym.make(
         env_id, obs_mode="state_dict", control_mode="pd_joint_pos",
         render_mode=None, render_backend="none",
         robot_uids="xarm6_robotiq", reward_mode="dense",
         sim_backend="cpu", max_episode_steps=max_steps,
-        **scene.get("env_kwargs", {}),
+        **env_kwargs,
     ))
 
 
