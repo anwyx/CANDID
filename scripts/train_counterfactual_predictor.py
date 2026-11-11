@@ -130,7 +130,8 @@ def train(args):
     fixed_val = _validation_subset(val_set, args.val_max_windows, args.seed)
     cf = CounterfactualStateDataset(
         args.counterfactual_dataset, dataset_root, split,
-        obs_horizon=2, action_horizon=8)
+        obs_horizon=2, action_horizon=8,
+        allow_incomplete=args.allow_incomplete_counterfactual)
 
     cf_scenes = sorted({row["scene_id"] for row in cf.rows})
     permutation = torch.randperm(
@@ -348,6 +349,10 @@ def train(args):
         "best_cf_validation": best_cf_validation,
         "training_expert_windows": len(train_set),
         "counterfactual_states": len(cf),
+        "cf_collection_complete": cf.collection_complete,
+        "cf_original_requested_states": cf.original_requested_states,
+        "cf_original_collected_states": cf.original_collected_states,
+        "cf_original_stratum_shortfall": cf.original_stratum_shortfall,
         "counterfactual_training_states": len(cf_train),
         "counterfactual_validation_states": len(cf_val_indices),
         "counterfactual_validation_scene_ids": sorted(cf_val_scene_ids),
@@ -382,6 +387,9 @@ def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--counterfactual-dataset", type=Path, required=True)
+    p.add_argument("--allow-incomplete-counterfactual", action="store_true",
+                   help="Explicit opt-in to verified but incompletely collected "
+                        "counterfactual states; retain original shortfall metadata")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--init-checkpoint", type=Path)
     p.add_argument("--device", choices=("auto","cuda","cpu"), default="auto")
