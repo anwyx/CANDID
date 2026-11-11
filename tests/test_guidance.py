@@ -283,10 +283,17 @@ def test_odd_timestep_guidance_and_zero_strength_rng_contract():
         def __init__(self, denoiser):
             super().__init__()
             self.denoiser = denoiser
-            self.guided_timesteps = []
+            self.gradient_timesteps = []
+            self.scoring_timesteps = []
 
         def forward(self, obs, actions):
-            self.guided_timesteps.append(self.denoiser.last_timestep)
+            # Guidance computes Predictor risk with autograd enabled;
+            # policy.act also scores the final chunk under no_grad().
+            # The latter must not be mistaken for a guidance update.
+            if torch.is_grad_enabled():
+                self.gradient_timesteps.append(self.denoiser.last_timestep)
+            else:
+                self.scoring_timesteps.append(self.denoiser.last_timestep)
             return super().forward(obs, actions)
 
     def tracked_policy(parity):
@@ -312,8 +319,13 @@ def test_odd_timestep_guidance_and_zero_strength_rng_contract():
 
     assert odd.get_diagnostics()["total_guided_steps"] == 1
     assert even.get_diagnostics()["total_guided_steps"] == 1
-    assert odd_predictor.guided_timesteps == [1]
-    assert even_predictor.guided_timesteps == [0]
+    assert odd_predictor.gradient_timesteps == [1]
+    assert even_predictor.gradient_timesteps == [0]
+    # One extra forward per policy.act is a diagnostic score at final t=0.
+    assert odd_predictor.scoring_timesteps == [0]
+    assert even_predictor.scoring_timesteps == [0]
+    assert odd_predictor.calls == 2
+    assert even_predictor.calls == 2
     assert not np.array_equal(base, odd_actions)
     assert not np.array_equal(base, even_actions)
 
