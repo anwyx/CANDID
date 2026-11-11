@@ -134,6 +134,14 @@ class ConsequenceGuidedPolicy:
             "start_timestep": self.config.start_timestep,
             "num_replans": len(self.decisions),
             "total_guided_steps": sum(r["guided_steps"] for r in self.decisions),
+            "total_guidance_updates_clipped": sum(
+                r.get("num_step_clipped", 0) for r in self.decisions
+            ),
+            "mean_actual_guidance_update_norm": (
+                sum(r.get("mean_guidance_update_norm", 0.) * r["guided_steps"]
+                    for r in self.decisions)
+                / max(sum(r["guided_steps"] for r in self.decisions), 1)
+            ),
             "paired_count": len(pairs),
             "paired_risk_decreased_count": sum(p["risk_delta"] < 0 for p in pairs),
             "paired_risk_delta_mean": (
