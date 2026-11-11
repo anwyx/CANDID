@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import torch
 
+from model.predictor.normalizer import normalize_predictor_actions
+
 
 def predict(model, normalizer, obs, actions):
     """Return original-unit DR estimates and calibrated-by-sigmoid event scores."""
@@ -14,7 +16,7 @@ def predict(model, normalizer, obs, actions):
     with torch.no_grad():
         outputs = model(
             normalizer.normalize_obs(obs),
-            normalizer.normalize_action(actions, obs=obs),
+            normalize_predictor_actions(normalizer, actions, obs=obs),
         )
         dr = (outputs["dr"] if "ordinal_logits" in outputs
               else normalizer.denormalize_target(outputs["dr"]))
