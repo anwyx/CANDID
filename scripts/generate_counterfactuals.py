@@ -20,6 +20,7 @@ import h5py
 import numpy as np
 
 from candid.data.adapter import canonical_observation, observation_vector
+from candid.data.balanced_counterfactual import choose_balanced_probes, stratum_quotas
 from candid.data.counterfactual import (choose_probes, make_candidates,
                                         make_multiscale_candidates, stable_seed)
 from candid.data.metrics import disturbance_from_poses
@@ -32,6 +33,10 @@ from candid.eval.rollout import _canonical_live, _check_initial_scene, _clamp_ac
 
 class ExpertReplayMismatch(RuntimeError):
     """Archived expert state/outcome cannot be reproduced faithfully."""
+
+    def __init__(self, message, *, details=None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 def _read_jsonl(path):
@@ -127,7 +132,12 @@ def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
         if source_obs is not None:
             error = float(np.max(np.abs(obs_history - source_obs)))
             if error > obs_atol:
-                raise ExpertReplayMismatch(f"Archived expert observation replay mismatch: {error}")
+                from candid.data.replay_diagnostics import observation_error_breakdown
+                breakdown = observation_error_breakdown(obs_history, source_obs)
+                raise ExpertReplayMismatch(
+                    f"Archived expert observation replay mismatch: {error}; "
+                    f"largest_field={breakdown['largest_field']}",
+                    details={"observation": breakdown})
         else:
             error = None
         for index, action in enumerate(candidate):
@@ -163,11 +173,13 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             allow_fallback=False, perturb_gripper=False,
             candidate_mode="legacy", sigma_levels=(0.02, 0.06, 0.12),
             resume=False, reserve_probes=16,
-            consequence_horizons=(8,)):
+            consequence_horizons=(8,), probe_strategy="legacy"):
     consequence_horizons = tuple(int(x) for x in consequence_horizons)
     if (8 not in consequence_horizons or sorted(set(consequence_horizons)) != list(consequence_horizons)
             or min(consequence_horizons) < 1 or max(consequence_horizons) < 8):
         raise ValueError("Consequence horizons must be sorted unique positives including 8")
+    if probe_strategy not in ("legacy", "balanced"):
+        raise ValueError("probe_strategy must be legacy or balanced")
     dataset = Path(dataset)
     output_dir = Path(output_dir)
     if states < 1 or candidates < 2 or dr_atol < 0 or reserve_probes < 0:
@@ -185,6 +197,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         "state_atol": state_atol, "obs_atol": obs_atol, "dr_atol": dr_atol,
         "allow_fallback": allow_fallback, "perturb_gripper": perturb_gripper,
     }
+    if probe_strategy != "legacy":
+        config["probe_strategy"] = probe_strategy
     # Keep resume compatibility with old 8-step CF datasets.
     if consequence_horizons != (8,):
         config["consequence_horizons"] = list(consequence_horizons)
@@ -242,10 +256,12 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
     samples_dir.mkdir(parents=True, exist_ok=True)
     if not config_path.exists():
         config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-    probes = choose_probes(
+    select = choose_balanced_probes if probe_strategy == "balanced" else choose_probes
+    probes = select(
         dataset, split["train"], count=states, seed=seed,
         max_per_scene=max_per_scene, max_prefix_steps=max_prefix_steps,
         reserve_count=reserve_probes)
+    desired_strata = stratum_quotas(states) if probe_strategy == "balanced" else None
     counts = Counter()
     visited = set()
     completed = {(row["source_trajectory_id"], row["source_t"]) for row in previous}
@@ -285,6 +301,10 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             "labels_from_simulation": True, "trained_model": False,
             "consequence_horizons": list(consequence_horizons),
             "continuation_policy": "hold_last_joint_target_after_step_8",
+            "probe_strategy": probe_strategy,
+            "requested_strata": desired_strata,
+            "stratum_shortfall": ({k: max(0, v-counts[k]) for k,v in desired_strata.items()}
+                                  if desired_strata is not None else None),
         }
         (output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
@@ -297,6 +317,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             break
         key = (probe.trajectory_id, probe.step)
         if key in completed or key in failed_keys:
+            continue
+        if desired_strata is not None and counts[probe.stratum] >= desired_strata[probe.stratum]:
             continue
         index = len(completed)
         if probe.scene_id not in split["train"]:
@@ -363,7 +385,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
                     consequence_horizons=consequence_horizons))
         except ExpertReplayMismatch as exc:
             row = {"scene_id": probe.scene_id, "source_trajectory_id": probe.trajectory_id,
-                   "source_t": t, "reason": str(exc)}
+                   "source_t": t, "stratum": probe.stratum,
+                   "reason": str(exc), "details": exc.details}
             with failed_manifest.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
             failed.append(row)
@@ -449,6 +472,8 @@ def main(argv=None):
     p.add_argument("--sigma-levels",default="0.02,0.06,0.12",
                    help="Comma-separated action perturbation scales in multiscale mode")
     p.add_argument("--max-per-scene",type=int,default=4)
+    p.add_argument("--probe-strategy",choices=("legacy", "balanced"),default="legacy",
+                   help="Balanced uses five strata and same-stratum reserves")
     p.add_argument("--max-prefix-steps",type=int,default=None)
     p.add_argument("--state-atol",type=float,default=0.005)
     p.add_argument("--obs-atol",type=float,default=0.005)
@@ -475,6 +500,7 @@ def main(argv=None):
         allow_fallback=args.allow_scene_spec_fallback,
         perturb_gripper=args.perturb_gripper,
         resume=args.resume, reserve_probes=args.reserve_probes,
+        probe_strategy=args.probe_strategy,
         consequence_horizons=tuple(int(x) for x in args.consequence_horizons.split(",")))
     print(json.dumps(report,indent=2,ensure_ascii=False))
     return report
