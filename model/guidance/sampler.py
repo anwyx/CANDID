@@ -94,7 +94,7 @@ class ConsequenceGuidedSampler:
 
             t = int(timestep)
             correction = None
-            if self.config.strength > 0 and t <= self.config.start_timestep:
+            if self.config.should_guide_timestep(t):
                 stamp = timer.start()
                 with torch.enable_grad():
                     variable = noisy.detach().requires_grad_(True)
