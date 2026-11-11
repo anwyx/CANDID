@@ -1,5 +1,9 @@
 """Collect physically relabeled counterfactual 8-step chunks from TRAIN expert scenes.
 
+With --consequence-horizons 4,8,16,32: label the first 4/8 candidate
+steps, then observe effects while holding the final absolute joint command.
+This hold protocol is NOT the policy that DP may execute in the future.
+
 Each candidate starts from the archived initial state and replays ALL expert
 prefix commands in a fresh CPU simulator. Never copy a label from a perturbed
 expert action. This collector does not train or load a Predictor/DP checkpoint.
@@ -152,7 +156,7 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             consequence_horizons=(8,)):
     consequence_horizons = tuple(int(x) for x in consequence_horizons)
     if (8 not in consequence_horizons or sorted(set(consequence_horizons)) != list(consequence_horizons)
-            or min(consequence_horizons) < 1):
+            or min(consequence_horizons) < 1 or max(consequence_horizons) < 8):
         raise ValueError("Consequence horizons must be sorted unique positives including 8")
     dataset = Path(dataset)
     output_dir = Path(output_dir)
@@ -203,6 +207,10 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         with np.load(data_path, allow_pickle=False) as data:
             if data["targets"].shape != (candidates, 4):
                 raise RuntimeError(f"Existing sample shape invalid: {data_path}")
+            if len(consequence_horizons) > 1:
+                expected = (candidates, len(consequence_horizons), 4)
+                if "targets_multi" not in data or data["targets_multi"].shape != expected:
+                    raise RuntimeError(f"Existing multihorizon targets invalid: {data_path}")
     if existing and config_path.exists():
         previous_config = json.loads(config_path.read_text(encoding="utf-8"))
         if previous_config != config:
@@ -238,7 +246,7 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         counts["states_with_distinct_topple"] += int(np.ptp(targets[:,2]) > 0)
         counts["states_with_dr_mean_range_gt_001"] += int(np.ptp(targets[:,0]) > .01)
         counts["states_with_dr_mean_range_gt_005"] += int(np.ptp(targets[:,0]) > .05)
-        counts["physical_action_steps"] += candidates * (int(row["source_t"])+8)
+        counts["physical_action_steps"] += candidates * (int(row["source_t"])+max(consequence_horizons))
         visited.add(row["scene_id"])
 
     def save_summary():
@@ -402,7 +410,7 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         counts["states_with_distinct_topple"] += int(len(set(targets[:,2])) > 1)
         counts["states_with_dr_mean_range_gt_001"] += int(np.ptp(targets[:, 0]) > .01)
         counts["states_with_dr_mean_range_gt_005"] += int(np.ptp(targets[:, 0]) > .05)
-        counts["physical_action_steps"] += candidates * (t+8)
+        counts["physical_action_steps"] += candidates * (t+max(consequence_horizons))
         visited.add(probe.scene_id)
         completed.add(key)
         save_summary()
