@@ -1,0 +1,33 @@
+{
+  "source": "trajectory.npz",
+  "second_source": null,
+  "trajectory_count": 1,
+  "frame_count": 242,
+  "fps": 20,
+  "video": "outputs\\scene1_trajectory_video\\trajectory_traces.mp4",
+  "gif": "outputs\\scene1_trajectory_video\\trajectory_traces.gif",
+  "previews": [
+    "outputs\\scene1_trajectory_video\\preview_start.png",
+    "outputs\\scene1_trajectory_video\\preview_mid.png",
+    "outputs\\scene1_trajectory_video\\preview_end.png"
+  ],
+  "episodes": [
+    {
+      "index": 0,
+      "label": "TCP trace",
+      "steps": 218,
+      "dr_mean": 0.28824518477422184,
+      "dr_max": 0.7899207166888808,
+      "topple_count": 2,
+      "fall_count": 0,
+      "per_object_dr": [
+        0.4467219973638735,
+        0.14412055709904042,
+        0.7899207166888808,
+        0.001175941640364642,
+        0.00010315338485589189,
+        0.3474287424683156
+      ]
+    }
+  ]
+}

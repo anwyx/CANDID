@@ -1,0 +1,35 @@
+{
+  "eval_suite": "demos\\scene1",
+  "scene_id": "20261103_114721_bde12458_scene_00000",
+  "trajectory_id": "20261103_114721_bde12458_scene_00000_collision_aware",
+  "hdf5_file": "trajectories_20261103_114721_bde12458.h5",
+  "hdf5_trajectory_key": "traj_0",
+  "episode_step": 0,
+  "replan_index": 0,
+  "observation_source": "recorded_demonstration",
+  "closed_loop_executed": false,
+  "dp_checkpoint": "ckpt/candid/scene1/checkpoints/best_val.pt",
+  "dp_checkpoint_sha256": "ffcdd37c5dcb4088ccbb672bdd81256a86ed5b3cb6eacb480ffeea99a7ecb308",
+  "predictor_checkpoint": "ckpt/candid/scene1_predictor/checkpoints/best_val.pt",
+  "predictor_checkpoint_sha256": "4c5c1214a7d0d192bd06758cfd3cad1735177e1dbdf867ae1cce48f0e8feb3f3",
+  "dp_observation_normalization": false,
+  "action_clip_source": "dp_training_action_range",
+  "strength": 0.005,
+  "start_timestep": 30,
+  "exec_horizon": 4,
+  "eval_seed": 2026,
+  "device": "cpu",
+  "risk_weights": {
+    "dr_mean": 1.0,
+    "dr_max": 0.25,
+    "topple_score": 0.1,
+    "fall_score": 0.0
+  },
+  "notes": [
+    "Vanilla and guided chunks use the same observation and the same initial diffusion noise.",
+    "Predictor scores are local chunk estimates, not measured physical DR.",
+    "Diffusion-step risk is the intermediate x0 estimate, not the final action chunk.",
+    "The correction is subtracted from the noisy sample after DDPMScheduler.step.",
+    "No action from the vanilla chunk was executed."
+  ]
+}
