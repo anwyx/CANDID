@@ -47,8 +47,8 @@ def save_multihorizon_checkpoint(path, model, normalizer):
     """Scene1 v3 format. Old v2 checkpoints remain readable and unchanged."""
     if not isinstance(model, MultiHorizonConsequencePredictor):
         raise TypeError("Expected a multi-horizon Predictor")
-    if normalizer.action_representation != "delta_q":
-        raise ValueError("v3 checkpoint must use delta_q normalizer")
+    if normalizer.action_representation not in ("delta_q", "absolute"):
+        raise ValueError("Unsupported v3 action representation")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
@@ -61,7 +61,8 @@ def save_multihorizon_checkpoint(path, model, normalizer):
             "ordinal_pos_weight": model.ordinal_pos_weight,
             "consequence_horizons": [4, 8, 16, 32],
             "continuation_policy": "hold_last_joint_target_after_step_8",
-            "action_representation": "delta_q",
+            "action_representation": normalizer.action_representation,
+            "horizon_mode": getattr(model, "trained_horizon_mode", "multi"),
             "horizon_weights": model.horizon_weights.cpu().tolist(),
         },
         "obs_dim": model.obs_dim, "action_dim": model.action_dim,
@@ -94,8 +95,14 @@ def load_predictor(path, device="cpu"):
         cfg = payload["config"]
         if (tuple(cfg["consequence_horizons"]) != (4, 8, 16, 32)
                 or cfg["continuation_policy"] != "hold_last_joint_target_after_step_8"
-                or cfg["action_representation"] != "delta_q"):
+                or cfg["action_representation"] not in ("delta_q", "absolute")
+                or cfg.get("horizon_mode", "multi") not in ("multi", "h8_only")):
             raise ValueError("Unknown multi-horizon Predictor physical protocol")
+        if (cfg.get("horizon_mode", "multi") == "h8_only"
+                and (len(cfg["horizon_weights"]) != 4
+                     or any(abs(float(w) - expected) > 1e-6
+                            for w, expected in zip(cfg["horizon_weights"], (0., 1., 0., 0.))))):
+            raise ValueError("H8-only checkpoint must have H8-only guidance risk weights")
         model = MultiHorizonConsequencePredictor(
             obs_dim=payload["obs_dim"], action_dim=payload["action_dim"],
             hidden=cfg["hidden"], dr_thresholds=cfg["dr_thresholds"],
@@ -108,7 +115,8 @@ def load_predictor(path, device="cpu"):
             payload["action_mean"], payload["action_std"],
             payload["target_mean"], payload["target_std"],
             payload["event_pos_weight"],
-            action_representation="delta_q").to(device)
+            action_representation=cfg["action_representation"]).to(device)
+        model.trained_horizon_mode = cfg.get("horizon_mode", "multi")
         return model, normalizer
     cls = OrdinalDisturbancePredictor if objective == 'ordinal' else DisturbancePredictor
     extra = (

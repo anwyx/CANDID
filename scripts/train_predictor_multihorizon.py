@@ -129,8 +129,12 @@ def cf_losses(model, normalizer, batch, args):
     flat_obs = obs[:, None].expand(-1, k, -1, -1).reshape(n*k, 2, 151)
     flat_actions = actions.reshape(n*k, 8, 7)
     outputs = model_output(model, normalizer, flat_obs, flat_actions)
+    horizon_mask = None
+    if args.horizon_mode == "h8_only":
+        horizon_mask = targets.new_zeros((n*k, 4))
+        horizon_mask[:, 1] = 1.
     supervised = model.multi_loss(
-        outputs, targets.reshape(n*k, 4, 4),
+        outputs, targets.reshape(n*k, 4, 4), horizon_mask=horizon_mask,
         event_pos_weight=normalizer.event_pos_weight.clamp(max=3))
     rank, diff, pairs, acc = pair_losses(
         outputs, targets, model.horizon_weights,
@@ -193,10 +197,15 @@ def train(args):
         root, train_scenes, obs_horizon=2, action_horizon=8,
         allow_missing_event_labels=False, cache_size=8)
     normalizer = fit_predictor_normalizer(
-        expert, action_representation="delta_q").to(device)
+        expert, action_representation=args.action_representation).to(device)
+    horizon_weights = (
+        (0., 1., 0., 0.) if args.horizon_mode == "h8_only"
+        else tuple(float(x) for x in args.horizon_weights.split(","))
+    )
     net = MultiHorizonConsequencePredictor(
         obs_dim=151, action_dim=7, hidden=args.hidden,
-        horizon_weights=tuple(float(x) for x in args.horizon_weights.split(","))).to(device)
+        horizon_weights=horizon_weights).to(device)
+    net.trained_horizon_mode = args.horizon_mode
     optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=.01)
     expert_loader = DataLoader(
         expert, batch_sampler=MixedTrajectoryBatchSampler(
@@ -281,6 +290,9 @@ def train(args):
         "cf_original_requested_states":cf.base.original_requested_states,
         "cf_original_collected_states":cf.base.original_collected_states,
         "cf_original_stratum_shortfall":cf.base.original_stratum_shortfall,
+        "horizon_mode":args.horizon_mode,
+        "effective_horizon_weights":net.horizon_weights.detach().cpu().tolist(),
+        "action_representation":args.action_representation,
         "cf_val_scene_ids":sorted(held_out),
         "expert_train_scenes":len(train_scenes),
         "expert_train_windows":len(expert),
@@ -324,6 +336,13 @@ def main():
     p.add_argument("--min-gap",type=float,default=.01)
     p.add_argument("--topple-weight",type=float,default=.5)
     p.add_argument("--horizon-weights",default="0.35,0.25,0.25,0.15")
+    p.add_argument("--horizon-mode", choices=("multi","h8_only"),
+                   default="multi",
+                   help="H8-only supervision, ranking, difference and guidance risk "
+                        "while retaining the same four-head architecture")
+    p.add_argument("--action-representation", choices=("delta_q","absolute"),
+                   default="delta_q",
+                   help="Predictor input representation; physical control is unchanged")
     args=p.parse_args()
     if not 0 < args.cf_val_ratio < 1:
         p.error("--cf-val-ratio must be between 0 and 1")

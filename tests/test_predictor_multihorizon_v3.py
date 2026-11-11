@@ -130,3 +130,66 @@ def test_checkpoint_roundtrip_scene1_v3(tmp_path):
 def model_output(model, norm, obs, actions):
     return model(norm.normalize_obs(obs),
                  norm.normalize_action(actions, obs=obs))
+
+def test_ablation_checkpoint_and_risk_gradient(tmp_path):
+    """H8-only and absolute-q variants must survive checkpoint roundtrip."""
+    for representation in ("delta_q", "absolute"):
+        for only_h8 in (False, True):
+            weights = (0., 1., 0., 0.) if only_h8 else (.35, .25, .25, .15)
+            model = MultiHorizonConsequencePredictor(
+                hidden=32, horizon_weights=weights)
+            model.trained_horizon_mode = "h8_only" if only_h8 else "multi"
+            normalizer = PredictorNormalizer(
+                torch.zeros(151), torch.ones(151),
+                torch.zeros(7), torch.ones(7),
+                torch.zeros(2), torch.ones(2), torch.ones(2),
+                action_representation=representation)
+            path = tmp_path / (representation + ("_h8" if only_h8 else "_multi") + ".pt")
+            save_multihorizon_checkpoint(path, model, normalizer)
+            restored, loaded_norm = load_predictor(path)
+            assert loaded_norm.action_representation == representation
+            assert restored.trained_horizon_mode == model.trained_horizon_mode
+            torch.testing.assert_close(
+                restored.horizon_weights, torch.tensor(weights))
+            obs = torch.randn(2, 2, 151)
+            actions = torch.randn(2, 8, 7, requires_grad=True)
+            risk = chunk_risk(
+                obs, actions, restored, loaded_norm,
+                GuidanceConfig(strength=.02, topple_weight=.5))
+            risk.sum().backward()
+            assert actions.grad is not None
+            assert torch.isfinite(actions.grad).all()
+            assert actions.grad.abs().sum() > 0
+
+
+def test_h8_ablation_excludes_all_other_horizons():
+    """Changing H4/H16/H32 labels must not change H8-only losses."""
+    model = MultiHorizonConsequencePredictor(hidden=32, horizon_weights=(0, 1, 0, 0))
+    obs, actions = make_inputs(batch=2)
+    out = model(obs, actions)
+    truth = torch.zeros(2, 4, 4)
+    truth[:, 1, :2] = .1
+    mask = torch.zeros(2, 4)
+    mask[:, 1] = 1
+    original = model.multi_loss(out, truth, horizon_mask=mask)
+    changed = truth.clone()
+    changed[:, 0, :2] = .3
+    changed[:, 2, :2] = .9
+    changed[:, 3, :2] = .7
+    changed[:, (0, 2, 3), 2:] = 1.
+    torch.testing.assert_close(
+        original, model.multi_loss(out, changed, horizon_mask=mask))
+    pairs = torch.zeros(1, 2, 4, 4)
+    pairs[:, 1, 1, :2] = .5
+    pred_dr = torch.zeros(2, 4, 2)
+    pred_dr[1, 1, :] = .5
+    pred = {"multi_dr": pred_dr, "multi_event_logits": torch.full((2, 4, 2), -10.)}
+    rank, diff, count, _ = pair_losses(pred, pairs, model.horizon_weights)
+    other = pairs.clone()
+    other[:, :, 0, :2] = 1.
+    other[:, :, 2, :2] = .7
+    other[:, :, 3, :2] = .8
+    rank2, diff2, count2, _ = pair_losses(pred, other, model.horizon_weights)
+    assert count == count2
+    torch.testing.assert_close(rank, rank2)
+    torch.testing.assert_close(diff, diff2)
