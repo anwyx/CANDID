@@ -26,10 +26,11 @@ from model.predictor.train import _validation_subset, _select_device
 
 
 class MultiHorizonCFDataset(Dataset):
-    def __init__(self, root, dataset_root, split):
+    def __init__(self, root, dataset_root, split, *, allow_incomplete=False):
         self.base = CounterfactualStateDataset(
             root, dataset_root, split, obs_horizon=2,
-            action_horizon=8, obs_dim=151, action_dim=7)
+            action_horizon=8, obs_dim=151, action_dim=7,
+            allow_incomplete=allow_incomplete)
         self.rows = self.base.rows
         summary = json.loads((Path(root) / "summary.json").read_text())
         if (summary.get("consequence_horizons") != [4, 8, 16, 32]
@@ -170,7 +171,9 @@ def train(args):
     if min(args.steps, args.batch_size, args.cf_batch_size, args.eval_freq) < 1:
         raise ValueError("Batch sizes, steps, and eval frequency must be positive")
     split = load_or_create_scene_split(root, seed=args.split_seed)
-    cf = MultiHorizonCFDataset(args.counterfactual_dataset, root, split)
+    cf = MultiHorizonCFDataset(
+        args.counterfactual_dataset, root, split,
+        allow_incomplete=args.allow_incomplete_counterfactual)
     # Hold out entire CF source scenes, including their expert windows.
     cf_scenes = sorted({r["scene_id"] for r in cf.rows})
     if len(cf_scenes) < 2:
@@ -274,6 +277,10 @@ def train(args):
         "dataset":str(root), "cf_dataset":str(args.counterfactual_dataset),
         "counterfactual_states":len(cf), "cf_train_states":len(cf_train),
         "cf_val_states":len(cf_val),
+        "cf_collection_complete":cf.base.collection_complete,
+        "cf_original_requested_states":cf.base.original_requested_states,
+        "cf_original_collected_states":cf.base.original_collected_states,
+        "cf_original_stratum_shortfall":cf.base.original_stratum_shortfall,
         "cf_val_scene_ids":sorted(held_out),
         "expert_train_scenes":len(train_scenes),
         "expert_train_windows":len(expert),
@@ -294,6 +301,9 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset",type=Path,default=Path("demos/scene1"))
     p.add_argument("--counterfactual-dataset",type=Path,required=True)
+    p.add_argument("--allow-incomplete-counterfactual",action="store_true",
+                   help="Explicitly accept incomplete but physically valid CF "
+                        "data; provenance and original strata shortfall retained")
     p.add_argument("--output-dir",type=Path,required=True)
     p.add_argument("--device",choices=("cpu","cuda","auto"),default="auto")
     p.add_argument("--steps",type=int,default=2000)
