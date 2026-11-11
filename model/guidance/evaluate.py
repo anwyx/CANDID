@@ -47,6 +47,12 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
         "strength": settings.strength,
         "start_timestep": settings.start_timestep,
         "guidance_parity": settings.guidance_parity,
+        "strength_schedule": settings.strength_schedule,
+        "snr_center_timestep": settings.snr_center_timestep,
+        "snr_sigma": settings.snr_sigma,
+        "scheduled_step_strengths": {
+            str(t): v for t, v in policy.sampler.step_strengths.items() if v > 0
+        },
         "dr_mean_weight": settings.dr_mean_weight,
         "dr_max_weight": settings.dr_max_weight,
         "topple_weight": settings.topple_weight,
@@ -98,6 +104,16 @@ def main(argv=None):
     parser.add_argument("--start-timestep", type=int, default=30)
     parser.add_argument("--guidance-parity", choices=("all", "odd", "even"), default="all",
                         help="Guide all eligible DDPM steps (default), or only odd/even timestep indices")
+    parser.add_argument(
+        "--strength-schedule",
+        choices=("constant", "snr_gaussian", "snr_increasing", "snr_gaussian_capped"),
+        default="constant",
+        help="constant=legacy; gaussian/increasing preserve summed nominal guidance; capped only attenuates",
+    )
+    parser.add_argument("--snr-center-timestep", type=int, default=15,
+                        help="DDPM timestep defining reference log-SNR")
+    parser.add_argument("--snr-sigma", type=float, default=1.0,
+                        help="Gaussian log-SNR width or increasing sigmoid temperature")
     parser.add_argument("--dr-mean-weight", type=float, default=1.0)
     parser.add_argument("--dr-max-weight", type=float, default=0.25)
     parser.add_argument("--topple-weight", type=float, default=0.1)
@@ -112,6 +128,9 @@ def main(argv=None):
     settings = GuidanceConfig(
         strength=args.strength, start_timestep=args.start_timestep,
         guidance_parity=args.guidance_parity,
+        strength_schedule=args.strength_schedule,
+        snr_center_timestep=args.snr_center_timestep,
+        snr_sigma=args.snr_sigma,
         dr_mean_weight=args.dr_mean_weight, dr_max_weight=args.dr_max_weight,
         topple_weight=args.topple_weight, fall_weight=args.fall_weight,
         max_grad_norm=args.max_grad_norm, max_step_norm=args.max_step_norm,
