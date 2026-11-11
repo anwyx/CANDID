@@ -5,10 +5,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from model.predictor.action_features import absolute_to_delta_q
+
 
 class PredictorNormalizer:
     def __init__(self, obs_mean, obs_std, action_mean, action_std,
-                 target_mean, target_std, event_pos_weight=None):
+                 target_mean, target_std, event_pos_weight=None,
+                 action_representation="absolute"):
+        if action_representation not in ("absolute", "delta_q"):
+            raise ValueError("Unknown predictor action representation")
+        self.action_representation = action_representation
         self.obs_mean = torch.as_tensor(obs_mean, dtype=torch.float32)
         self.obs_std = torch.as_tensor(obs_std, dtype=torch.float32)
         self.action_mean = torch.as_tensor(action_mean, dtype=torch.float32)
@@ -26,12 +32,17 @@ class PredictorNormalizer:
             self.action_mean.to(device), self.action_std.to(device),
             self.target_mean.to(device), self.target_std.to(device),
             self.event_pos_weight.to(device),
+            action_representation=self.action_representation,
         )
 
     def normalize_obs(self, obs):
         return (obs - self.obs_mean) / self.obs_std
 
-    def normalize_action(self, action):
+    def normalize_action(self, action, obs=None):
+        if self.action_representation == "delta_q":
+            if obs is None:
+                raise ValueError("delta_q normalization requires raw observation")
+            action = absolute_to_delta_q(obs, action)
         return (action - self.action_mean) / self.action_std
 
     def normalize_target(self, target):
@@ -45,7 +56,8 @@ class PredictorNormalizer:
         return target * self.target_std + self.target_mean
 
 
-def fit_predictor_normalizer(dataset, batch_size=256) -> PredictorNormalizer:
+def fit_predictor_normalizer(dataset, batch_size=256, *,
+                             action_representation="absolute") -> PredictorNormalizer:
     """One streaming pass; no stack of all overlapping predictor windows."""
     totals = {}
     count = {}
@@ -53,9 +65,12 @@ def fit_predictor_normalizer(dataset, batch_size=256) -> PredictorNormalizer:
     known = np.zeros(2, dtype=np.float64)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     for batch in loader:
+        actions = batch["action"]
+        if action_representation == "delta_q":
+            actions = absolute_to_delta_q(batch["obs"], actions)
         for name, values, axes in (
             ("obs", batch["obs"], (0, 1)),
-            ("action", batch["action"], (0, 1)),
+            ("action", actions, (0, 1)),
             ("target", batch["target"][:, :2], (0,)),
         ):
             data = values.numpy().astype(np.float64)
@@ -86,4 +101,5 @@ def fit_predictor_normalizer(dataset, batch_size=256) -> PredictorNormalizer:
     return PredictorNormalizer(
         obs_mean, obs_std, action_mean, action_std,
         target_mean, target_std, weights.astype(np.float32),
+        action_representation=action_representation,
     )
