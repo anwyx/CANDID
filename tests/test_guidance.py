@@ -382,3 +382,54 @@ def test_normalize_action_legacy_and_delta_q_interfaces():
     normalized.sum().backward()
     assert torch.isfinite(act_v3.grad).all()
     assert torch.all(act_v3.grad != 0)
+
+
+def test_snr_schedule_actual_sampler_updates_and_diagnostics():
+    from model.guidance.snr_schedule import build_strength_schedule
+
+    cfg = GuidanceConfig(
+        strength=.02, start_timestep=1, guidance_parity="all",
+        strength_schedule="snr_gaussian", snr_center_timestep=1,
+        snr_sigma=1.0, max_grad_norm=10, max_step_norm=.02,
+        topple_weight=0, fall_weight=0,
+    )
+    policy, _ = make_policy(cfg)
+    scheduler = policy.sampler.agent.noise_scheduler
+    # Construct nontrivial tiny DDPM SNR, unlike the legacy all-one mock.
+    scheduler.alphas_cumprod = torch.tensor([.99, .65])
+    policy.sampler.step_strengths = build_strength_schedule(
+        cfg, scheduler.alphas_cumprod, scheduler.timesteps)
+    assert policy.sampler.step_strengths[1] > policy.sampler.step_strengths[0]
+    assert sum(policy.sampler.step_strengths.values()) == pytest.approx(.04)
+
+    policy.begin_episode(91)
+    action = policy.act(np.zeros((2, 3), dtype=np.float32))
+    assert np.isfinite(action).all()
+    decisions = policy.get_diagnostics()["decisions"]
+    assert len(decisions) == 1
+    record = decisions[0]
+    trace = record["guidance_step_stats"]
+    assert [x["timestep"] for x in trace] == [1, 0]
+    assert record["guided_steps"] == 2
+    assert record["guidance_strength_schedule"] == "snr_gaussian"
+    assert record["nominal_strength_total"] == pytest.approx(.04)
+    assert [x["nominal_strength"] for x in trace] == [
+        policy.sampler.step_strengths[1], policy.sampler.step_strengths[0]]
+    assert all(0 <= x["post_clip_update_norm"] <= .020001 for x in trace)
+    assert all(x["post_clip_update_norm"] <= x["pre_clip_update_norm"] + 1e-7
+               for x in trace)
+
+
+def test_strength_zero_snr_schedule_preserves_vanilla_rng_multiple_replans():
+    obs = np.zeros((2, 3), dtype=np.float32)
+    baseline = TinyDP()
+    zero, predictor = make_policy(GuidanceConfig(
+        strength=0, guidance_parity="odd",
+        strength_schedule="snr_gaussian",
+        snr_center_timestep=15))
+    baseline.begin_episode(43)
+    raw = [baseline.act(obs) for _ in range(3)]
+    zero.begin_episode(43)
+    guided = [zero.act(obs) for _ in range(3)]
+    assert all(np.array_equal(a, b) for a, b in zip(raw, guided))
+    assert predictor.calls == 0
