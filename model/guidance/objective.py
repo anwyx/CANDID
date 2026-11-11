@@ -11,6 +11,17 @@ def risk_from_predictions(outputs, predictor_normalizer, config):
     dr_max >= dr_mean, prevents nonphysical outputs from being rewarded.
     Sigmoid logits are scores, not calibrated episode event probabilities.
     """
+    if "multi_dr" in outputs:
+        dr = outputs["multi_dr"]  # [B, 4 horizons, 2 DR metrics]
+        probs = torch.sigmoid(outputs["multi_event_logits"])
+        weights = outputs["risk_horizon_weights"].view(1, 4)
+        mean = dr[..., 0].clamp_min(0.)
+        maximum = torch.maximum(dr[..., 1].clamp_min(0.), mean)
+        per_horizon = (config.dr_mean_weight * mean
+                       + config.dr_max_weight * maximum
+                       + config.topple_weight * probs[..., 0]
+                       + config.fall_weight * probs[..., 1])
+        return (per_horizon * weights).sum(dim=1)
     dr = (outputs["dr"] if "ordinal_logits" in outputs
           else predictor_normalizer.denormalize_target(outputs["dr"]))
     probabilities = torch.sigmoid(outputs["event_logits"])
@@ -32,7 +43,7 @@ def chunk_risk(obs, absolute_actions, predictor, predictor_normalizer, config, *
         raise ValueError("Observation and action batch sizes disagree")
     outputs = predictor(
         predictor_normalizer.normalize_obs(obs),
-        predictor_normalizer.normalize_action(absolute_actions),
+        predictor_normalizer.normalize_action(absolute_actions, obs=obs),
     )
     risk = risk_from_predictions(outputs, predictor_normalizer, config)
     if risk.shape != (obs.shape[0],):
