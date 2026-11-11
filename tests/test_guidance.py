@@ -305,3 +305,39 @@ def test_all_parity_matches_legacy_guided_path():
     explicit.begin_episode(73)
     b = [explicit.act(obs) for _ in range(3)]
     assert all(np.array_equal(x, y) for x, y in zip(a, b))
+
+
+def test_normalize_action_legacy_and_delta_q_interfaces():
+    from model.predictor.normalizer import (
+        PredictorNormalizer, normalize_predictor_actions
+    )
+    from model.predictor.action_features import absolute_to_delta_q
+
+    # Old test normalizers only accept actions, not an obs keyword.
+    obs = torch.zeros((1, 2, 3), dtype=torch.float32)
+    actions = torch.ones((1, 8, 2), dtype=torch.float32, requires_grad=True)
+    old = normalize_predictor_actions(IdentityNormalizer(), actions, obs=obs)
+    assert torch.equal(old, actions)
+    old.sum().backward()
+    assert torch.equal(actions.grad, torch.ones_like(actions))
+
+    # Old fitted Predictor normalizers retain absolute-action semantics.
+    old_normalizer = PredictorNormalizer(
+        torch.zeros(3), torch.ones(3), torch.zeros(2), torch.ones(2),
+        torch.zeros(2), torch.ones(2))
+    assert torch.equal(normalize_predictor_actions(
+        old_normalizer, actions.detach(), obs=obs), actions.detach())
+
+    # Scene1 v3 uses the observation to produce differentiable delta-q.
+    obs_v3 = torch.randn(1, 2, 151)
+    act_v3 = torch.randn(1, 8, 7, requires_grad=True)
+    normalizer_v3 = PredictorNormalizer(
+        torch.zeros(151), torch.ones(151), torch.zeros(7), torch.ones(7),
+        torch.zeros(2), torch.ones(2),
+        action_representation="delta_q")
+    normalized = normalize_predictor_actions(
+        normalizer_v3, act_v3, obs=obs_v3)
+    assert torch.allclose(normalized, absolute_to_delta_q(obs_v3, act_v3))
+    normalized.sum().backward()
+    assert torch.isfinite(act_v3.grad).all()
+    assert torch.all(act_v3.grad != 0)
