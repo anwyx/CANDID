@@ -169,27 +169,34 @@ class ConsequenceGuidedSampler:
         if not torch.isfinite(result).all():
             raise FloatingPointError("Guided diffusion generated NaN/Inf actions")
         timing = timer.finish()
+        # Move all update norms to CPU in one transfer after the denoising
+        # loop; never synchronize for each of the 15 guided timesteps.
+        update_norms = (
+            torch.stack([torch.stack((pre, post)) for _, _, pre, post in update_trace])
+            .detach().cpu().tolist() if update_trace else []
+        )
+        step_stats = [
+            {
+                "timestep": t,
+                "nominal_strength": strength,
+                "pre_clip_update_norm": float(pre),
+                "post_clip_update_norm": float(post),
+                "step_clipped": bool(pre > self.config.max_step_norm + 1e-8),
+            }
+            for (t, strength, _, _), (pre, post) in zip(update_trace, update_norms)
+        ]
         stats = {
             "guided_steps": guided_steps,
             "max_raw_grad_norm": float(largest_gradient.item()),
             "max_guidance_update_norm": float(largest_update.item()),
             "guidance_strength_schedule": self.config.strength_schedule,
             "nominal_strength_total": float(sum(self.step_strengths.values())),
-            "guidance_step_stats": [
-                {
-                    "timestep": t,
-                    "nominal_strength": strength,
-                    "pre_clip_update_norm": float(pre),
-                    "post_clip_update_norm": float(post),
-                    "step_clipped": bool(pre > self.config.max_step_norm + 1e-8),
-                }
-                for (t, strength, _, _), (pre, post) in zip(
-                    update_trace,
-                    (torch.stack([torch.stack([before, after]) for _, _, before, after
-                                  in update_trace]).detach().cpu().tolist()
-                     if update_trace else []),
-                )
-            ],
+            "guidance_step_stats": step_stats,
+            "num_step_clipped": sum(x["step_clipped"] for x in step_stats),
+            "mean_guidance_update_norm": (
+                sum(x["post_clip_update_norm"] for x in step_stats) / len(step_stats)
+                if step_stats else 0.0
+            ),
         }
         if timing is not None:
             stats["timing_ms"] = timing
