@@ -11,6 +11,7 @@ import torch
 
 from model.guidance.objective import chunk_risk
 from model.guidance.timing import PhaseTimer
+from model.guidance.snr_schedule import build_strength_schedule
 
 
 class ConsequenceGuidedSampler:
@@ -21,6 +22,10 @@ class ConsequenceGuidedSampler:
         self.predictor = predictor
         self.predictor_normalizer = predictor_normalizer
         self.config = config
+        self.step_strengths = build_strength_schedule(
+            config, self.agent.noise_scheduler.alphas_cumprod,
+            self.agent.noise_scheduler.timesteps,
+        )
         self.start = self.agent.obs_horizon - 1
         self.stop = self.start + self.agent.act_horizon
         if self.stop > self.agent.pred_horizon:
@@ -76,6 +81,7 @@ class ConsequenceGuidedSampler:
             device=obs.device, dtype=obs.dtype,
         )
         guided_steps = 0
+        update_trace = []  # step, SNR strength, pre/post clipping norms (one sync at end)
         # Accumulate on-device; a .item() inside every guided step would
         # synchronize CUDA tens of thousands of times in a scene1 evaluation.
         largest_gradient = torch.zeros((), device=obs.device, dtype=obs.dtype)
@@ -135,13 +141,16 @@ class ConsequenceGuidedSampler:
                     gradient.flatten(start_dim=1).norm(dim=1).max(),
                 )
                 gradient = self._limit_l2(gradient, self.config.max_grad_norm)
-                correction = self._limit_l2(
-                    self.config.strength * gradient, self.config.max_step_norm
-                )
-                largest_update = torch.maximum(
-                    largest_update,
-                    correction.flatten(start_dim=1).norm(dim=1).max(),
-                )
+                nominal_strength = self.step_strengths[t]
+                before_clip = nominal_strength * gradient
+                correction = self._limit_l2(before_clip, self.config.max_step_norm)
+                correction_norm = correction.flatten(start_dim=1).norm(dim=1).max()
+                update_trace.append((
+                    t, nominal_strength,
+                    before_clip.flatten(start_dim=1).norm(dim=1).max().detach(),
+                    correction_norm.detach(),
+                ))
+                largest_update = torch.maximum(largest_update, correction_norm)
                 guided_steps += 1
                 timer.stop("predictor_gradient", stamp)
 
@@ -164,6 +173,23 @@ class ConsequenceGuidedSampler:
             "guided_steps": guided_steps,
             "max_raw_grad_norm": float(largest_gradient.item()),
             "max_guidance_update_norm": float(largest_update.item()),
+            "guidance_strength_schedule": self.config.strength_schedule,
+            "nominal_strength_total": float(sum(self.step_strengths.values())),
+            "guidance_step_stats": [
+                {
+                    "timestep": t,
+                    "nominal_strength": strength,
+                    "pre_clip_update_norm": float(pre),
+                    "post_clip_update_norm": float(post),
+                    "step_clipped": bool(pre > self.config.max_step_norm + 1e-8),
+                }
+                for (t, strength, _, _), (pre, post) in zip(
+                    update_trace,
+                    (torch.stack([torch.stack([before, after]) for _, _, before, after
+                                  in update_trace]).detach().cpu().tolist()
+                     if update_trace else []),
+                )
+            ],
         }
         if timing is not None:
             stats["timing_ms"] = timing
