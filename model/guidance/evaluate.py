@@ -46,6 +46,7 @@ def evaluate_guidance(dataset, dp_checkpoint, predictor_checkpoint, output_dir, 
         "predictor_checkpoint": str(predictor_checkpoint),
         "strength": settings.strength,
         "start_timestep": settings.start_timestep,
+        "guidance_parity": settings.guidance_parity,
         "dr_mean_weight": settings.dr_mean_weight,
         "dr_max_weight": settings.dr_max_weight,
         "topple_weight": settings.topple_weight,
@@ -95,6 +96,8 @@ def main(argv=None):
     parser.add_argument("--no-stop-on-success", action="store_true")
     parser.add_argument("--strength", type=float, default=0.005)
     parser.add_argument("--start-timestep", type=int, default=30)
+    parser.add_argument("--guidance-parity", choices=("all", "odd", "even"), default="all",
+                        help="Guide all eligible DDPM steps (default), or only odd/even timestep indices")
     parser.add_argument("--dr-mean-weight", type=float, default=1.0)
     parser.add_argument("--dr-max-weight", type=float, default=0.25)
     parser.add_argument("--topple-weight", type=float, default=0.1)
@@ -108,6 +111,7 @@ def main(argv=None):
         parser.error("--dataset and --eval-suite are mutually exclusive")
     settings = GuidanceConfig(
         strength=args.strength, start_timestep=args.start_timestep,
+        guidance_parity=args.guidance_parity,
         dr_mean_weight=args.dr_mean_weight, dr_max_weight=args.dr_max_weight,
         topple_weight=args.topple_weight, fall_weight=args.fall_weight,
         max_grad_norm=args.max_grad_norm, max_step_norm=args.max_step_norm,
