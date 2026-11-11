@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import torch
 
+from model.predictor.normalizer import normalize_predictor_actions
+
 
 def risk_from_predictions(outputs, predictor_normalizer, config):
     """Return [B] risk with the same nonnegative DR semantics as reranking.
@@ -43,7 +45,7 @@ def chunk_risk(obs, absolute_actions, predictor, predictor_normalizer, config, *
         raise ValueError("Observation and action batch sizes disagree")
     outputs = predictor(
         predictor_normalizer.normalize_obs(obs),
-        predictor_normalizer.normalize_action(absolute_actions, obs=obs),
+        normalize_predictor_actions(predictor_normalizer, absolute_actions, obs=obs),
     )
     risk = risk_from_predictions(outputs, predictor_normalizer, config)
     if risk.shape != (obs.shape[0],):
