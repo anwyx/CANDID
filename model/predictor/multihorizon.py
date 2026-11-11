@@ -56,8 +56,10 @@ class MultiHorizonConsequencePredictor(nn.Module):
         # derivatives flow through the action branch.
         self.state_dr = nn.Linear(hidden, 8)
         self.state_event = nn.Linear(hidden, 8)
-        self.action_dr = nn.Linear(hidden, 8)
-        self.action_event = nn.Linear(hidden, 8)
+        # action_encoder emits one feature vector PER horizon [B, 4, hidden].
+        # Predict only DR_mean/DR_max and Topple/Fall for that horizon.
+        self.action_dr = nn.Linear(hidden, 2)
+        self.action_event = nn.Linear(hidden, 2)
         self.first_cutpoint = nn.Parameter(torch.full((4, 2, 1), 1.5))
         self.raw_cutpoint_gaps = nn.Parameter(
             torch.full((4, 2, max(len(dr_thresholds)-1, 0)), -.3))
