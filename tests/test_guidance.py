@@ -266,15 +266,42 @@ def test_alternating_parity_timestep_selection():
 
 
 def test_odd_timestep_guidance_and_zero_strength_rng_contract():
+    # A linear toy risk has an action-independent gradient. Moving it from
+    # t=1 to t=0 can produce EXACTLY the same final action: parity must be
+    # tested by recording when Predictor is called, not by assuming outputs
+    # from odd/even schedules are necessarily different.
+    class TrackedDenoiser(TinyDenoiser):
+        def __init__(self):
+            super().__init__()
+            self.last_timestep = None
+
+        def forward(self, sample, timestep, global_cond):
+            self.last_timestep = int(timestep)
+            return super().forward(sample, timestep, global_cond)
+
+    class TrackedPredictor(TinyPredictor):
+        def __init__(self, denoiser):
+            super().__init__()
+            self.denoiser = denoiser
+            self.guided_timesteps = []
+
+        def forward(self, obs, actions):
+            self.guided_timesteps.append(self.denoiser.last_timestep)
+            return super().forward(obs, actions)
+
+    def tracked_policy(parity):
+        denoiser = TrackedDenoiser()
+        predictor = TrackedPredictor(denoiser)
+        policy, _ = make_policy(GuidanceConfig(
+            strength=.1, start_timestep=1, guidance_parity=parity,
+            max_grad_norm=10, max_step_norm=1, topple_weight=0, fall_weight=0,
+        ), predictor=predictor)
+        policy.sampler.agent.noise_pred_net = denoiser
+        return policy, predictor
+
     obs = np.zeros((2, 3), np.float32)
-    odd, _ = make_policy(GuidanceConfig(
-        strength=.1, start_timestep=1, guidance_parity="odd",
-        max_grad_norm=10, max_step_norm=1, topple_weight=0, fall_weight=0,
-    ))
-    even, _ = make_policy(GuidanceConfig(
-        strength=.1, start_timestep=1, guidance_parity="even",
-        max_grad_norm=10, max_step_norm=1, topple_weight=0, fall_weight=0,
-    ))
+    odd, odd_predictor = tracked_policy("odd")
+    even, even_predictor = tracked_policy("even")
     vanilla = TinyDP()
     vanilla.begin_episode(5)
     base = vanilla.act(obs)
@@ -282,12 +309,14 @@ def test_odd_timestep_guidance_and_zero_strength_rng_contract():
     odd_actions = odd.act(obs)
     even.begin_episode(5)
     even_actions = even.act(obs)
+
     assert odd.get_diagnostics()["total_guided_steps"] == 1
     assert even.get_diagnostics()["total_guided_steps"] == 1
-    # A guided step remains capable of changing an action.
+    assert odd_predictor.guided_timesteps == [1]
+    assert even_predictor.guided_timesteps == [0]
     assert not np.array_equal(base, odd_actions)
     assert not np.array_equal(base, even_actions)
-    assert not np.array_equal(odd_actions, even_actions)
+
     zero, predictor = make_policy(GuidanceConfig(
         strength=0, start_timestep=1, guidance_parity="odd"))
     zero.begin_episode(5)
