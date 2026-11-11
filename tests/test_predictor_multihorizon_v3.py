@@ -36,7 +36,8 @@ def test_delta_q_is_invertible_preserves_gripper_and_is_differentiable():
     transformed = absolute_to_delta_q(obs, actions)
     reconstructed = transformed.clone()
     reconstructed[:, :, :6] += obs[:, -1:, :6]
-    assert torch.allclose(reconstructed, actions)
+    # Subtracting and adding FP32 qpos can introduce ~1e-7 roundoff.
+    torch.testing.assert_close(reconstructed, actions, rtol=1e-5, atol=5e-7)
     assert torch.equal(transformed[:, :, 6], actions[:, :, 6])
     transformed.sum().backward()
     assert torch.allclose(actions.grad, torch.ones_like(actions))
