@@ -21,6 +21,10 @@ import numpy as np
 
 from candid.data.adapter import canonical_observation, observation_vector
 from candid.data.balanced_counterfactual import choose_balanced_probes, stratum_quotas
+from candid.data.replay_diagnostics import (
+    orientation_aligned_pose_max_error,
+    orientation_aligned_observation_max_error,
+)
 from candid.data.counterfactual import (choose_probes, make_candidates,
                                         make_multiscale_candidates, stable_seed)
 from candid.data.metrics import disturbance_from_poses
@@ -126,11 +130,14 @@ def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
             actual = trace.arrays()["distractor_poses"][start]
             if actual.shape != source_pose.shape:
                 raise ValueError("Source pose shape mismatch")
-            if np.max(np.abs(actual - source_pose)) > state_atol:
-                raise ExpertReplayMismatch("Archived expert state not reproduced by physics replay")
+            pose_error = orientation_aligned_pose_max_error(actual, source_pose)
+            if pose_error > state_atol:
+                raise ExpertReplayMismatch(
+                    f"Archived expert state not reproduced by physics replay "
+                    f"(pose max abs error={pose_error:.6g}, tolerance={state_atol})")
         obs_history = np.stack(history).astype(np.float32)
         if source_obs is not None:
-            error = float(np.max(np.abs(obs_history - source_obs)))
+            error = orientation_aligned_observation_max_error(obs_history, source_obs)
             if error > obs_atol:
                 from candid.data.replay_diagnostics import observation_error_breakdown
                 breakdown = observation_error_breakdown(obs_history, source_obs)
@@ -173,13 +180,16 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             allow_fallback=False, perturb_gripper=False,
             candidate_mode="legacy", sigma_levels=(0.02, 0.06, 0.12),
             resume=False, reserve_probes=16,
-            consequence_horizons=(8,), probe_strategy="legacy"):
+            consequence_horizons=(8,), probe_strategy="legacy",
+            replay_reference_mode="archive_strict"):
     consequence_horizons = tuple(int(x) for x in consequence_horizons)
     if (8 not in consequence_horizons or sorted(set(consequence_horizons)) != list(consequence_horizons)
             or min(consequence_horizons) < 1 or max(consequence_horizons) < 8):
         raise ValueError("Consequence horizons must be sorted unique positives including 8")
     if probe_strategy not in ("legacy", "balanced"):
         raise ValueError("probe_strategy must be legacy or balanced")
+    if replay_reference_mode not in ("archive_strict", "physics_consistent"):
+        raise ValueError("Unsupported replay_reference_mode")
     dataset = Path(dataset)
     output_dir = Path(output_dir)
     if states < 1 or candidates < 2 or dr_atol < 0 or reserve_probes < 0:
@@ -199,6 +209,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
     }
     if probe_strategy != "legacy":
         config["probe_strategy"] = probe_strategy
+    if replay_reference_mode != "archive_strict":
+        config["replay_reference_mode"] = replay_reference_mode
     # Keep resume compatibility with old 8-step CF datasets.
     if consequence_horizons != (8,):
         config["consequence_horizons"] = list(consequence_horizons)
@@ -302,6 +314,10 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             "consequence_horizons": list(consequence_horizons),
             "continuation_policy": "hold_last_joint_target_after_step_8",
             "probe_strategy": probe_strategy,
+            "replay_reference_mode": replay_reference_mode,
+            "selection_strata_source": "archived_expert_traces",
+            "duplicate_reference_validation_rollouts": (
+                actual_count if replay_reference_mode == "physics_consistent" else 0),
             "requested_strata": desired_strata,
             "stratum_shortfall": ({k: max(0, v-counts[k]) for k,v in desired_strata.items()}
                                   if desired_strata is not None else None),
@@ -361,22 +377,60 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         else:
             raise ValueError(f"Unknown candidate mode: {candidate_mode}")
         try:
-            actual = [_simulate(
-                scene, snapshot, prefix, actions_to_compare[0],
-                source_pose=truth["distractor_poses"][t],
-                source_obs=obs_window, state_atol=state_atol,
-                obs_atol=obs_atol, allow_fallback=allow_fallback,
-                consequence_horizons=consequence_horizons)]
-            for metric in ("dr_mean", "dr_max"):
-                delta = abs(actual[0]["label"][metric] - archived[metric])
-                if delta > dr_atol:
+            if replay_reference_mode == "archive_strict":
+                reference = _simulate(
+                    scene, snapshot, prefix, actions_to_compare[0],
+                    source_pose=truth["distractor_poses"][t],
+                    source_obs=obs_window, state_atol=state_atol,
+                    obs_atol=obs_atol, allow_fallback=allow_fallback,
+                    consequence_horizons=consequence_horizons)
+                for metric in ("dr_mean", "dr_max"):
+                    delta = abs(reference["label"][metric] - archived[metric])
+                    if delta > dr_atol:
+                        raise ExpertReplayMismatch(
+                            f"Expert source/replay {metric} mismatch {delta} > {dr_atol}: "
+                            f"{probe.trajectory_id}:{t}")
+                for event in ("topple_count", "fall_count"):
+                    if reference["label"][event] != archived[event]:
+                        raise ExpertReplayMismatch(
+                            f"Expert source/replay {event} mismatch: {probe.trajectory_id}:{t}")
+            else:
+                # Opt-in when historical expert trajectories cannot be matched.
+                # Replay recorded expert commands in fresh physics; never use
+                # DP-generated windows. Demand two independent identical
+                # reference rollouts before labeling alternate actions.
+                reference = _simulate(
+                    scene, snapshot, prefix, actions_to_compare[0],
+                    state_atol=state_atol,
+                    allow_fallback=allow_fallback,
+                    consequence_horizons=consequence_horizons)
+                repeat = _simulate(
+                    scene, snapshot, prefix, actions_to_compare[0],
+                    expected_signature=reference["signature"],
+                    state_atol=state_atol,
+                    allow_fallback=allow_fallback,
+                    consequence_horizons=consequence_horizons)
+                obs_error = orientation_aligned_observation_max_error(
+                    reference["observation"], repeat["observation"])
+                if obs_error > obs_atol:
                     raise ExpertReplayMismatch(
-                        f"Expert source/replay {metric} mismatch {delta} > {dr_atol}: "
-                        f"{probe.trajectory_id}:{t}")
-            for event in ("topple_count", "fall_count"):
-                if actual[0]["label"][event] != archived[event]:
-                    raise ExpertReplayMismatch(
-                        f"Expert source/replay {event} mismatch: {probe.trajectory_id}:{t}")
+                        f"Independent expert-prefix replay observations diverged "
+                        f"({obs_error:.6g} > {obs_atol})")
+                for h, (original_h, repeated_h) in enumerate(zip(
+                        reference["multi_labels"], repeat["multi_labels"])):
+                    for metric in ("dr_mean", "dr_max"):
+                        delta = abs(original_h[metric] - repeated_h[metric])
+                        if delta > dr_atol:
+                            raise ExpertReplayMismatch(
+                                f"Independent physical H{consequence_horizons[h]} "
+                                f"reference replay {metric} diverged "
+                                f"({delta:.6g} > {dr_atol})")
+                    for event in ("topple_count", "fall_count"):
+                        if original_h[event] != repeated_h[event]:
+                            raise ExpertReplayMismatch(
+                                f"Independent physical H{consequence_horizons[h]} "
+                                f"reference replay {event} disagrees")
+            actual = [reference]
             for alternate in actions_to_compare[1:]:
                 actual.append(_simulate(
                     scene, snapshot, prefix, alternate,
@@ -436,6 +490,10 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
                 "expert_source_dr_mean": archived["dr_mean"],
                 "expert_replayed_dr_mean": float(targets[0,0]),
                 "physical_relabeling": "fresh_initial_scene_full_expert_prefix_each_candidate",
+                "replay_reference_mode": replay_reference_mode,
+                "archive_alignment_required": replay_reference_mode == "archive_strict",
+                "expert_source_dr_mean_abs_diff": float(abs(
+                    archived["dr_mean"] - actual[0]["label"]["dr_mean"])),
                 "consequence_horizons": list(consequence_horizons),
                 "continuation_policy": "hold_last_joint_target_after_step_8"}
         with manifest.open("a", encoding="utf-8") as f:
@@ -482,6 +540,11 @@ def main(argv=None):
     p.add_argument("--perturb-gripper",action="store_true")
     p.add_argument("--consequence-horizons",default="8",
                    help="Physical horizons e.g. 4,8,16,32; H>8 holds last target")
+    p.add_argument("--replay-reference-mode",
+                   choices=("archive_strict", "physics_consistent"),
+                   default="archive_strict",
+                   help="Strict archive-aligned states (default) or explicitly "
+                        "marked reproducible expert-prefix physical replays")
     p.add_argument("--resume",action="store_true",
                    help="Continue an interrupted run from verified saved states")
     p.add_argument("--reserve-probes",type=int,default=16,
@@ -501,6 +564,7 @@ def main(argv=None):
         perturb_gripper=args.perturb_gripper,
         resume=args.resume, reserve_probes=args.reserve_probes,
         probe_strategy=args.probe_strategy,
+        replay_reference_mode=args.replay_reference_mode,
         consequence_horizons=tuple(int(x) for x in args.consequence_horizons.split(",")))
     print(json.dumps(report,indent=2,ensure_ascii=False))
     return report
