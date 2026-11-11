@@ -423,10 +423,11 @@ def test_snr_schedule_actual_sampler_updates_and_diagnostics():
 def test_strength_zero_snr_schedule_preserves_vanilla_rng_multiple_replans():
     obs = np.zeros((2, 3), dtype=np.float32)
     baseline = TinyDP()
+    # TinyAgent uses a two-step DDPM (t=1, 0), unlike production's T=100.
     zero, predictor = make_policy(GuidanceConfig(
-        strength=0, guidance_parity="odd",
+        strength=0, start_timestep=1, guidance_parity="odd",
         strength_schedule="snr_gaussian",
-        snr_center_timestep=15))
+        snr_center_timestep=1))
     baseline.begin_episode(43)
     raw = [baseline.act(obs) for _ in range(3)]
     zero.begin_episode(43)
