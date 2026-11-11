@@ -174,8 +174,10 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         "max_prefix_steps": max_prefix_steps,
         "state_atol": state_atol, "obs_atol": obs_atol, "dr_atol": dr_atol,
         "allow_fallback": allow_fallback, "perturb_gripper": perturb_gripper,
-        "consequence_horizons": list(consequence_horizons),
     }
+    # Keep resume compatibility with old 8-step CF datasets.
+    if consequence_horizons != (8,):
+        config["consequence_horizons"] = list(consequence_horizons)
     manifest = output_dir / "states.jsonl"
     failed_manifest = output_dir / "skipped_probes.jsonl"
     config_path = output_dir / "collection_config.json"
