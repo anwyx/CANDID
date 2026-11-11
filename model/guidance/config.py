@@ -11,6 +11,9 @@ class GuidanceConfig:
     strength: float = 0.005
     start_timestep: int = 30  # guide at t <= 30; negative values are invalid
     guidance_parity: str = "all"  # all, odd, or even DDPM timestep indices
+    strength_schedule: str = "constant"  # constant, snr_gaussian, snr_increasing, snr_gaussian_capped
+    snr_center_timestep: int = 15  # log-SNR peak/midpoint in the SAME DDPM schedule
+    snr_sigma: float = 1.0  # log-SNR width (gaussian) or temperature (increasing)
     dr_mean_weight: float = 1.0
     dr_max_weight: float = 0.25
     topple_weight: float = 0.1
@@ -21,7 +24,7 @@ class GuidanceConfig:
     def __post_init__(self):
         for name in (
             "strength", "dr_mean_weight", "dr_max_weight", "topple_weight",
-            "fall_weight", "max_grad_norm", "max_step_norm",
+            "fall_weight", "max_grad_norm", "max_step_norm", "snr_sigma",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
@@ -30,6 +33,14 @@ class GuidanceConfig:
             raise ValueError("start_timestep must be a nonnegative integer")
         if self.guidance_parity not in ("all", "odd", "even"):
             raise ValueError("guidance_parity must be one of all, odd, even")
+        if self.strength_schedule not in (
+            "constant", "snr_gaussian", "snr_increasing", "snr_gaussian_capped"
+        ):
+            raise ValueError("Unsupported strength_schedule")
+        if not isinstance(self.snr_center_timestep, int) or self.snr_center_timestep < 0:
+            raise ValueError("snr_center_timestep must be a nonnegative integer")
+        if self.snr_sigma <= 0:
+            raise ValueError("snr_sigma must be positive")
         if self.strength > 0 and (self.max_grad_norm == 0 or self.max_step_norm == 0):
             raise ValueError("Active guidance requires positive gradient and step norms")
         if self.strength > 0 and not any((
