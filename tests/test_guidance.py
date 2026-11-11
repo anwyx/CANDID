@@ -251,3 +251,57 @@ def test_cpu_profiler_reports_nonnegative_phase_durations():
         assert row[key] >= 0
     totals = policy.get_diagnostics()["timing_totals_ms"]
     assert totals["sampling_wall_ms"] == row["sampling_wall_ms"]
+
+
+def test_alternating_parity_timestep_selection():
+    all_steps = GuidanceConfig(strength=.02, start_timestep=30)
+    odd_steps = GuidanceConfig(strength=.02, start_timestep=30, guidance_parity="odd")
+    even_steps = GuidanceConfig(strength=.02, start_timestep=30, guidance_parity="even")
+    assert sum(all_steps.should_guide_timestep(t) for t in range(100)) == 31
+    assert [t for t in range(100) if odd_steps.should_guide_timestep(t)] == list(range(1, 31, 2))
+    assert [t for t in range(100) if even_steps.should_guide_timestep(t)] == list(range(0, 31, 2))
+    assert not GuidanceConfig(strength=0, guidance_parity="odd").should_guide_timestep(1)
+    with pytest.raises(ValueError, match="guidance_parity"):
+        GuidanceConfig(guidance_parity="alternating")
+
+
+def test_odd_timestep_guidance_and_zero_strength_rng_contract():
+    obs = np.zeros((2, 3), np.float32)
+    odd, _ = make_policy(GuidanceConfig(
+        strength=.1, start_timestep=1, guidance_parity="odd",
+        max_grad_norm=10, max_step_norm=1, topple_weight=0, fall_weight=0,
+    ))
+    even, _ = make_policy(GuidanceConfig(
+        strength=.1, start_timestep=1, guidance_parity="even",
+        max_grad_norm=10, max_step_norm=1, topple_weight=0, fall_weight=0,
+    ))
+    vanilla = TinyDP()
+    vanilla.begin_episode(5)
+    base = vanilla.act(obs)
+    odd.begin_episode(5)
+    odd_actions = odd.act(obs)
+    even.begin_episode(5)
+    even_actions = even.act(obs)
+    assert odd.get_diagnostics()["total_guided_steps"] == 1
+    assert even.get_diagnostics()["total_guided_steps"] == 1
+    # A guided step remains capable of changing an action.
+    assert not np.array_equal(base, odd_actions)
+    assert not np.array_equal(base, even_actions)
+    assert not np.array_equal(odd_actions, even_actions)
+    zero, predictor = make_policy(GuidanceConfig(
+        strength=0, start_timestep=1, guidance_parity="odd"))
+    zero.begin_episode(5)
+    assert np.array_equal(zero.act(obs), base)
+    assert predictor.calls == 0
+
+
+def test_all_parity_matches_legacy_guided_path():
+    obs = np.zeros((2, 3), np.float32)
+    old, _ = make_policy(GuidanceConfig(strength=.1, start_timestep=1))
+    explicit, _ = make_policy(GuidanceConfig(
+        strength=.1, start_timestep=1, guidance_parity="all"))
+    old.begin_episode(73)
+    a = [old.act(obs) for _ in range(3)]
+    explicit.begin_episode(73)
+    b = [explicit.act(obs) for _ in range(3)]
+    assert all(np.array_equal(x, y) for x, y in zip(a, b))
