@@ -73,12 +73,13 @@ def _load_expert(root, row):
 
 def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
               source_pose=None, source_obs=None, state_atol=0.005,
-              obs_atol=0.005, allow_fallback=False):
+              obs_atol=0.005, allow_fallback=False,
+              consequence_horizons=(8,)):
     env_id, source = resolve_scene_environment(scene)
     if source != "original_env_module" and not allow_fallback:
         raise RuntimeError("Original environment module is unavailable; refusing "
                            "to relabel physics using SceneSpec fallback")
-    trace = make_env(scene, max(len(prefix) + len(candidate) + 10, 300), env_id)
+    trace = make_env(scene, max(len(prefix) + max(consequence_horizons) + 10, 300), env_id)
     try:
         raw, _ = trace.reset(
             seed=int(scene["seed"]),
@@ -122,13 +123,21 @@ def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
             _, _, _, truncated, _ = trace.step(command)
             if _is_true(truncated):
                 raise RuntimeError("Candidate truncated before full 8-step outcome")
+        # H>8 continues with the last absolute joint target. This is a
+        # fixed hold protocol, not a claim about future DP closed-loop actions.
+        for _ in range(max(consequence_horizons) - len(candidate)):
+            command, _ = _clamp_action(candidate[-1], trace.action_space)
+            _, _, _, truncated, _ = trace.step(command)
+            if _is_true(truncated):
+                raise RuntimeError("Hold continuation truncated before labeling")
         arrays = trace.arrays()
-        label = disturbance_from_poses(
+        multi = [disturbance_from_poses(
             arrays["distractor_poses"], arrays["object_sizes_m"],
-            start=start, stop=start + len(candidate),
+            start=start, stop=start+h,
             topple_flags=arrays["distractor_toppled"],
-            fall_flags=arrays["distractor_fallen"])
-        return {"label": label, "signature": signature,
+            fall_flags=arrays["distractor_fallen"]) for h in consequence_horizons]
+        label = multi[consequence_horizons.index(8)]
+        return {"label": label, "multi_labels": multi, "signature": signature,
                 "observation": obs_history, "source_obs_max_abs": error}
     finally:
         trace.close()
@@ -139,7 +148,12 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             state_atol=0.005, obs_atol=0.005, dr_atol=0.02,
             allow_fallback=False, perturb_gripper=False,
             candidate_mode="legacy", sigma_levels=(0.02, 0.06, 0.12),
-            resume=False, reserve_probes=16):
+            resume=False, reserve_probes=16,
+            consequence_horizons=(8,)):
+    consequence_horizons = tuple(int(x) for x in consequence_horizons)
+    if (8 not in consequence_horizons or sorted(set(consequence_horizons)) != list(consequence_horizons)
+            or min(consequence_horizons) < 1):
+        raise ValueError("Consequence horizons must be sorted unique positives including 8")
     dataset = Path(dataset)
     output_dir = Path(output_dir)
     if states < 1 or candidates < 2 or dr_atol < 0 or reserve_probes < 0:
@@ -156,6 +170,7 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         "max_prefix_steps": max_prefix_steps,
         "state_atol": state_atol, "obs_atol": obs_atol, "dr_atol": dr_atol,
         "allow_fallback": allow_fallback, "perturb_gripper": perturb_gripper,
+        "consequence_horizons": list(consequence_horizons),
     }
     manifest = output_dir / "states.jsonl"
     failed_manifest = output_dir / "skipped_probes.jsonl"
@@ -248,6 +263,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             "obs_horizon": 2, "action_horizon": 8,
             "label_names": ["dr_mean", "dr_max", "any_topple", "any_fall"],
             "labels_from_simulation": True, "trained_model": False,
+            "consequence_horizons": list(consequence_horizons),
+            "continuation_policy": "hold_last_joint_target_after_step_8",
         }
         (output_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
@@ -306,7 +323,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
                 scene, snapshot, prefix, actions_to_compare[0],
                 source_pose=truth["distractor_poses"][t],
                 source_obs=obs_window, state_atol=state_atol,
-                obs_atol=obs_atol, allow_fallback=allow_fallback)]
+                obs_atol=obs_atol, allow_fallback=allow_fallback,
+                consequence_horizons=consequence_horizons)]
             for metric in ("dr_mean", "dr_max"):
                 delta = abs(actual[0]["label"][metric] - archived[metric])
                 if delta > dr_atol:
@@ -331,10 +349,16 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             actual.append(_simulate(
                 scene, snapshot, prefix, alternate,
                 expected_signature=actual[0]["signature"],
-                state_atol=state_atol, allow_fallback=allow_fallback))
+                state_atol=state_atol, allow_fallback=allow_fallback,
+                consequence_horizons=consequence_horizons))
         targets = np.asarray([
             [r["label"]["dr_mean"], r["label"]["dr_max"],
              float(r["label"]["any_topple"]), float(r["label"]["any_fall"])]
+            for r in actual], dtype=np.float32)
+        targets_multi = np.asarray([
+            [[label["dr_mean"], label["dr_max"],
+              float(label["any_topple"]), float(label["any_fall"])]
+             for label in r["multi_labels"]]
             for r in actual], dtype=np.float32)
         obj_dr = np.asarray([r["label"]["per_object_dr"] for r in actual], np.float32)
         obj_topple = np.asarray([r["label"]["per_object_topple"] for r in actual], bool)
@@ -346,6 +370,8 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
         np.savez_compressed(
             output_dir / rel, obs=actual[0]["observation"],
             actions=actions_to_compare, targets=targets,
+            targets_multi=targets_multi,
+            consequence_horizons=np.asarray(consequence_horizons, dtype=np.int32),
             per_object_dr=obj_dr, per_object_topple=obj_topple,
             per_object_fall=obj_fall, object_sizes_m=truth["object_sizes_m"],
             nominal_sigmas=candidate_sigmas)
@@ -366,7 +392,9 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
                 "reference_obs_replay_max_abs": actual[0]["source_obs_max_abs"],
                 "expert_source_dr_mean": archived["dr_mean"],
                 "expert_replayed_dr_mean": float(targets[0,0]),
-                "physical_relabeling": "fresh_initial_scene_full_expert_prefix_each_candidate"}
+                "physical_relabeling": "fresh_initial_scene_full_expert_prefix_each_candidate",
+                "consequence_horizons": list(consequence_horizons),
+                "continuation_policy": "hold_last_joint_target_after_step_8"}
         with manifest.open("a", encoding="utf-8") as f:
             f.write(json.dumps(json_safe(meta), ensure_ascii=False) + "\n")
         counts[probe.stratum] += 1
@@ -407,6 +435,8 @@ def main(argv=None):
     p.add_argument("--dr-atol",type=float,default=0.02)
     p.add_argument("--allow-scene-spec-fallback",action="store_true")
     p.add_argument("--perturb-gripper",action="store_true")
+    p.add_argument("--consequence-horizons",default="8",
+                   help="Physical horizons e.g. 4,8,16,32; H>8 holds last target")
     p.add_argument("--resume",action="store_true",
                    help="Continue an interrupted run from verified saved states")
     p.add_argument("--reserve-probes",type=int,default=16,
@@ -424,7 +454,8 @@ def main(argv=None):
         state_atol=args.state_atol,obs_atol=args.obs_atol,dr_atol=args.dr_atol,
         allow_fallback=args.allow_scene_spec_fallback,
         perturb_gripper=args.perturb_gripper,
-        resume=args.resume, reserve_probes=args.reserve_probes)
+        resume=args.resume, reserve_probes=args.reserve_probes,
+        consequence_horizons=tuple(int(x) for x in args.consequence_horizons.split(",")))
     print(json.dumps(report,indent=2,ensure_ascii=False))
     return report
 
