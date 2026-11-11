@@ -102,11 +102,21 @@ def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
             raw, _, terminated, truncated, _ = trace.step(command)
             history.append(_canonical_live(raw, len(trace.names)).copy())
             if _is_true(terminated) or _is_true(truncated):
-                raise RuntimeError(f"Expert replay terminated before probe at {t+1}")
+                # A recorded expert trajectory can contain actions beyond a
+                # task-success terminal. Do not step past termination and
+                # silently invent labels: reject this probe and use reserves.
+                reason = "terminated" if _is_true(terminated) else "truncated"
+                raise ExpertReplayMismatch(
+                    f"Expert prefix {reason} at step {t+1}/{len(prefix)}")
         start = trace.steps
         signature = _signature(trace)
         if expected_signature is not None:
-            _check_signature(expected_signature, signature, atol=state_atol)
+            try:
+                _check_signature(expected_signature, signature, atol=state_atol)
+            except RuntimeError as exc:
+                raise ExpertReplayMismatch(
+                    f"Alternative candidate prefix did not reproduce expert state: {exc}"
+                ) from exc
         if source_pose is not None:
             actual = trace.arrays()["distractor_poses"][start]
             if actual.shape != source_pose.shape:
@@ -126,14 +136,14 @@ def _simulate(scene, snapshot, prefix, candidate, *, expected_signature=None,
                 raise RuntimeError(f"Candidate action {index} unexpectedly clipped")
             _, _, _, truncated, _ = trace.step(command)
             if _is_true(truncated):
-                raise RuntimeError("Candidate truncated before full 8-step outcome")
+                raise ExpertReplayMismatch("Candidate truncated before full 8-step outcome")
         # H>8 continues with the last absolute joint target. This is a
         # fixed hold protocol, not a claim about future DP closed-loop actions.
         for _ in range(max(consequence_horizons) - len(candidate)):
             command, _ = _clamp_action(candidate[-1], trace.action_space)
             _, _, _, truncated, _ = trace.step(command)
             if _is_true(truncated):
-                raise RuntimeError("Hold continuation truncated before labeling")
+                raise ExpertReplayMismatch("Hold continuation truncated before labeling")
         arrays = trace.arrays()
         multi = [disturbance_from_poses(
             arrays["distractor_poses"], arrays["object_sizes_m"],
@@ -345,6 +355,12 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
                 if actual[0]["label"][event] != archived[event]:
                     raise ExpertReplayMismatch(
                         f"Expert source/replay {event} mismatch: {probe.trajectory_id}:{t}")
+            for alternate in actions_to_compare[1:]:
+                actual.append(_simulate(
+                    scene, snapshot, prefix, alternate,
+                    expected_signature=actual[0]["signature"],
+                    state_atol=state_atol, allow_fallback=allow_fallback,
+                    consequence_horizons=consequence_horizons))
         except ExpertReplayMismatch as exc:
             row = {"scene_id": probe.scene_id, "source_trajectory_id": probe.trajectory_id,
                    "source_t": t, "reason": str(exc)}
@@ -355,12 +371,6 @@ def collect(dataset, output_dir, *, states=2, candidates=4, seed=2026,
             save_summary()
             print(f"SKIP unrepeatable expert: {probe.trajectory_id} t={t}: {exc}", flush=True)
             continue
-        for alternate in actions_to_compare[1:]:
-            actual.append(_simulate(
-                scene, snapshot, prefix, alternate,
-                expected_signature=actual[0]["signature"],
-                state_atol=state_atol, allow_fallback=allow_fallback,
-                consequence_horizons=consequence_horizons))
         targets = np.asarray([
             [r["label"]["dr_mean"], r["label"]["dr_max"],
              float(r["label"]["any_topple"]), float(r["label"]["any_fall"])]
