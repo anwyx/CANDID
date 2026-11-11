@@ -171,13 +171,26 @@ def choose_balanced_probes(dataset, allowed_scene_ids, *, count, seed=0,
     rng = np.random.default_rng(seed)
     rng.shuffle(rows)
     buckets = defaultdict(list)
+    unreadable_sources = 0
     for row in rows:
-        available = _probe_options(
-            root, row, rng, action_horizon=action_horizon,
-            obs_horizon=obs_horizon, max_prefix_steps=max_prefix_steps,
-        )
+        try:
+            available = _probe_options(
+                root, row, rng, action_horizon=action_horizon,
+                obs_horizon=obs_horizon, max_prefix_steps=max_prefix_steps,
+            )
+        except OSError as exc:
+            # Truncated HDF5 cannot supply trustworthy expert states.
+            # Skip the entire row rather than using invalid pose or labels.
+            unreadable_sources += 1
+            print(f"SKIP unreadable expert source: {row['trajectory_id']} "
+                  f"file={row.get('hdf5_file')}: {exc}", flush=True)
+            continue
         for category, probe in available.items():
             buckets[category].append(probe)
+    if unreadable_sources:
+        print(f"WARNING: ignored {unreadable_sources} unreadable expert "
+              "trajectories while selecting probes; original HDF5 files "
+              "must be restored independently.", flush=True)
 
     quotas = stratum_quotas(count)
     selected = []
