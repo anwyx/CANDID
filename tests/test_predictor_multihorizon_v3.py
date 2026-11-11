@@ -64,8 +64,8 @@ def test_multi_forward_h4_does_not_see_steps_5_to_8():
                           second["multi_dr"][:, 0], atol=1e-7)
     assert torch.allclose(first["multi_event_logits"][:, 0],
                           second["multi_event_logits"][:, 0], atol=1e-7)
-    assert not torch.allclose(first["multi_dr"][:, 1],
-                              second["multi_dr"][:, 1])
+    assert not torch.allclose(first["multi_ordinal_logits"][:, 1],
+                              second["multi_ordinal_logits"][:, 1])
 
 
 def test_risk_guidance_gradient_is_finite_nonzero_and_action_only():
@@ -100,8 +100,8 @@ def test_multi_loss_and_rank_direction():
     truth[:, 1, :, :2] = .5
     def fake(pred_values):
         dr = torch.zeros(2, 4, 2)
-        dr[:, :, 0] = pred_values
-        dr[:, :, 1] = pred_values
+        dr[:, :, 0] = pred_values[:, None]
+        dr[:, :, 1] = pred_values[:, None]
         logits = torch.full((2, 4, 2), -10.)
         return {"multi_dr":dr, "multi_event_logits":logits}
     weights = model.horizon_weights
