@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from functools import lru_cache
 import hashlib
 import io
 import json
@@ -218,13 +219,53 @@ def crop_and_resize(rgb, box, width, height):
     )
 
 
+@lru_cache(maxsize=64)
 def font(size, bold=False):
-    for name in (("DejaVuSans-Bold.ttf", "Arial.ttf") if bold else ("DejaVuSans.ttf", "Arial.ttf")):
+    """Load a REAL scalable font on macOS or Linux.
+
+    An earlier revision silently returned Pillow's tiny bitmap default font
+    when a named TTF couldn't be found on macOS. That made font(40) appear
+    ~10 px, regardless of the requested size. Never silently degrade.
+    """
+    if bold:
+        candidates = (
+            "DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/lato/Lato-Bold.ttf",
+            "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica Bold.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/Library/Fonts/Arial Bold.ttf",
+            "/System/Library/Fonts/SFNS.ttf",
+            "Arial Bold.ttf",
+        )
+    else:
+        candidates = (
+            "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/lato/Lato-Regular.ttf",
+            "/usr/share/fonts/truetype/roboto/unhinted/RobotoTTF/Roboto-Regular.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/Library/Fonts/Arial.ttf",
+            "/System/Library/Fonts/SFNS.ttf",
+            "Arial.ttf",
+        )
+    for location in candidates:
         try:
-            return ImageFont.truetype(name, size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
+            return ImageFont.truetype(location, size)
+        except (OSError, ValueError):
+            pass
+    # A failing lookup is preferable to unreadably small numbers in a research
+    # figure. Files are never bundled, copied or shared.
+    raise RuntimeError(
+        "No usable TrueType/OpenType font found. Install a system Arial, "
+        "Helvetica or DejaVu Sans font before rendering scientific figures."
+    )
 
 
 def metrics(item):
@@ -379,49 +420,65 @@ def _fmt(value, digits=4):
 
 
 def save_separate_frame(image, step, row, output, future_steps=12):
-    """Presentation-friendly standalone PNG with large, readable DR statistics."""
+    """Clean Beamer-ready PNG with genuinely large, high-contrast metrics.
+
+    A compact dark masthead, untouched real RGB footage, and a two-row
+    scientific comparison table. Avoid oversized empty footer cards and
+    decorative text that shrink into illegibility in a three-column slide.
+    """
     im = Image.fromarray(image)
-    width, height = im.size
-    top, footer = 68, 220
-    canvas = Image.new("RGB", (width, height + top + footer), "#F7F9FC")
-    canvas.paste(im, (0, top))
+    w, h = im.size
+    unit = w / 1280.0
+
+    def px(n):
+        return max(1, int(round(n * unit)))
+
+    header_h, footer_h = px(76), px(215)
+    panel_y = header_h + h
+    canvas = Image.new("RGB", (w, panel_y + footer_h), "#F5F8FC")
     d = ImageDraw.Draw(canvas)
-    d.text((26, 15), f"STEP {step}", font=font(30, True), fill="#223449")
-    d.text((310, 23), f"Next {future_steps} recorded TCP steps",
-           font=font(21), fill="#53677F")
 
-    base = top + height
-    d.line((0, base, width, base), fill="#D8E0EB", width=2)
-    columns = (350, 610, 875, 1085)
-    headings = ("DR Mean", "DR Max", "Topple", "Fall")
-    for x, title in zip(columns, headings):
-        d.text((x, base + 15), title, font=font(23, True), fill="#54657C")
+    # Dark heading anchors the frame with only the information needed.
+    d.rectangle((0, 0, w, header_h), fill="#172A3F")
+    d.text((px(28), px(16)), f"STEP {step}",
+           font=font(px(35), True), fill="white")
+    d.text((px(305), px(24)),
+           f"LOCAL TRAJECTORY  |  NEXT {future_steps} RECORDED STEPS",
+           font=font(px(21)), fill="#B6C9DD")
+    canvas.paste(im, (0, header_h))
 
-    for i, (label, colors, prefix, ink) in enumerate((
-        ("Vanilla DP", VANILLA, "vanilla", "#BB4235"),
-        ("CANDID", GUIDED, "candid", "#3158BE"),
+    # Strong hierarchy: method and four physical results at full readable size.
+    ink = "#172A3F"
+    muted = "#687D92"
+    d.text((px(30), panel_y + px(12)), "RECORDED PHYSICAL DISTURBANCE",
+           font=font(px(20), True), fill=ink)
+    d.text((px(30), panel_y + px(46)), "METHOD",
+           font=font(px(18), True), fill=muted)
+    col_x = [px(v) for v in (365, 600, 865, 1070)]
+    headings = ("DR MEAN", "DR MAX", "TOPPLE", "FALL")
+    for x, title in zip(col_x, headings):
+        d.text((x, panel_y + px(46)), title,
+               font=font(px(18), True), fill=muted)
+
+    for i, (label, prefix, bg, accent) in enumerate((
+        ("Vanilla DP", "vanilla", "#FFF5F0", "#C7502E"),
+        ("CANDID", "candid", "#EDF5FF", "#2156A8"),
     )):
-        y = base + 54 + i * 65
-        d.rounded_rectangle((22, y, 1240, y + 57),
-                            radius=11, fill="white", outline="#E3E9F1", width=2)
-        for k, color in enumerate(colors):
-            x = 35 + k * 14
-            d.ellipse((x, y + 20, x + 14, y + 34), fill=color)
-        d.text((105, y + 12), label, font=font(24, True), fill=ink)
-        for x, field, digits in (
-            (columns[0], "dr_mean", 4),
-            (columns[1], "dr_max", 4),
-            (columns[2], "topple", 0),
-            (columns[3], "fall", 0),
+        y = panel_y + px(78 + i * 58)
+        d.rounded_rectangle(
+            (px(20), y, w - px(20), y + px(53)),
+            radius=px(8), fill=bg
+        )
+        d.rectangle((px(20), y, px(28), y + px(53)), fill=accent)
+        d.text((px(48), y + px(10)), label,
+               font=font(px(25), True), fill=accent)
+        for x, field, digits in zip(
+            col_x, ("dr_mean", "dr_max", "topple", "fall"), (4, 4, 0, 0)
         ):
-            d.text((x, y + 8), _fmt(row[prefix + "_" + field], digits),
-                   font=font(32, True), fill="#223449")
+            value = _fmt(row[prefix + "_" + field], digits)
+            d.text((x, y + px(1)), value,
+                   font=font(px(35), True), fill=ink)
 
-    d.text(
-        (27, base + 191),
-        "Cumulative PHYSICAL disturbance at this step  |  RGB: CANDID; Vanilla: TCP overlay",
-        font=font(17), fill="#51657E",
-    )
     canvas.save(output)
 
 
