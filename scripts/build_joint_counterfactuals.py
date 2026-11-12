@@ -16,6 +16,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -73,6 +74,65 @@ def choose_balanced(rows, count, seed):
     return chosen
 
 
+def _file_sha(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _resolve_source_groups(dataset, sources, merged_sources):
+    """Map paths to merged groups by scene identity AND exact snapshot bytes.
+
+    A filtered/repackaged merged dataset can have a different original path.
+    Refuse any mapping not independently verified against source snapshots.
+    """
+    merged_scenes = read_rows(dataset / "scenes.jsonl")
+    by_group = defaultdict(dict)
+    for scene in merged_scenes:
+        group = scene.get("source_dataset")
+        original_id = scene.get("source_scene_id")
+        if not group or not original_id or original_id in by_group[group]:
+            raise ValueError("Merged dataset has missing or duplicate source scene identity")
+        by_group[group][original_id] = scene
+    names = {row["name"] for row in merged_sources}
+    if len(names) != 5 or set(by_group) != names:
+        raise ValueError("Expected exactly five consistent merged source groups")
+    assignments = {}
+    used = set()
+    for original_root, _ in sources:
+        original_root = original_root.resolve(strict=True)
+        original = {row["scene_id"]: row
+                    for row in read_rows(original_root / "scenes.jsonl")}
+        possible = []
+        for group, merged in by_group.items():
+            common = set(original).intersection(merged)
+            if not common:
+                continue
+            # Verify every overlapping original scene: same source identity and
+            # exact original initial state, not matching scene names alone.
+            consistent = all(
+                _file_sha(original_root / original[sid]["initial_state"])
+                == _file_sha(dataset / merged[sid]["initial_state"])
+                and original[sid].get("env_id") == merged[sid].get("env_id")
+                and original[sid].get("env_module") == merged[sid].get("env_module")
+                and original[sid].get("seed") == merged[sid].get("seed")
+                for sid in common
+            )
+            if consistent:
+                possible.append(group)
+        if len(possible) != 1 or possible[0] in used:
+            raise ValueError(
+                f"Cannot uniquely verify merged source for {original_root}: "
+                f"snapshot-matched groups={possible}. No unsafe path fallback.")
+        assignments[original_root] = possible[0]
+        used.add(possible[0])
+    if used != names:
+        raise ValueError("Five inputs did not map to five distinct merged groups")
+    return assignments
+
+
 def build(dataset, sources, output_dir, count=64, seed=2026, mode="symlink"):
     dataset = Path(dataset).resolve(strict=True)
     output_dir = Path(output_dir).resolve()
@@ -84,15 +144,20 @@ def build(dataset, sources, output_dir, count=64, seed=2026, mode="symlink"):
     validate_scene_split(split, dataset)
     joint_train = set(split["train"])
     merged_sources = read_json(dataset / "merge_sources.json")["sources"]
-    mapping = {Path(x["source_dir"]).resolve(): x["name"] for x in merged_sources}
     if len(sources) != 5 or len(set(x.resolve() for x, _ in sources)) != 5:
         raise ValueError("Exactly five distinct source datasets are required")
-    if len(mapping) != 5:
-        raise ValueError("Expected a five-source merged expert dataset")
-    if set(x.resolve() for x, _ in sources) != set(mapping):
-        raise ValueError(
-            "Source datasets must match the paths in merged/merge_sources.json. "
-            "Use the SAME merged dataset on which the joint DP was trained.")
+    mapping = _resolve_source_groups(dataset, sources, merged_sources)
+    print("Verified all five original source identities against merged "
+          "scene snapshots (SHA256), independent of original directory paths.",
+          flush=True)
+    # A filtered merged dataset may omit individual trajectories while retaining
+    # their scenes. Use only physically logged CF probes from trajectories still
+    # present in the filtered joint expert training set.
+    merged_trajectories = read_rows(dataset / "trajectories.jsonl")
+    allowed_trajectories = {
+        (row["scene_id"], row["trajectory_id"])
+        for row in merged_trajectories if row.get("saved_hdf5")
+    }
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".joint-cf-", dir=output_dir.parent))
     try:
@@ -107,10 +172,11 @@ def build(dataset, sources, output_dir, count=64, seed=2026, mode="symlink"):
             original_split = read_json(original_root / "split.json")
             validate_scene_split(original_split, original_root)
             cf = read_json(cf_root / "summary.json")
+            # Source paths may be moved; frozen split hash and source scene
+            # snapshot identity are the authoritative provenance checks.
             if (cf.get("labels_from_simulation") is not True
                     or cf.get("source_split") != "train"
-                    or cf.get("source_split_sha256") != original_split["dataset_sha256"]
-                    or Path(cf.get("source_dataset", "")).resolve() != original_root):
+                    or cf.get("source_split_sha256") != original_split["dataset_sha256"]):
                 raise ValueError(f"{cf_root}: CF source split/dataset/physical labels mismatch")
             if cf.get("obs_horizon") != 2 or cf.get("action_horizon") != 8:
                 raise ValueError(f"{cf_root}: CF needs obs horizon 2 and action horizon 8")
@@ -124,7 +190,9 @@ def build(dataset, sources, output_dir, count=64, seed=2026, mode="symlink"):
                 merged_scene_id = f"{group}__{row['scene_id']}"
                 if row.get("source_split") != "train" or row["scene_id"] not in original_split["train"]:
                     raise ValueError(f"{cf_root}: sample outside source train split")
-                if merged_scene_id in joint_train:
+                merged_trajectory_id = f"{group}__{row['source_trajectory_id']}"
+                if (merged_scene_id in joint_train
+                        and (merged_scene_id, merged_trajectory_id) in allowed_trajectories):
                     eligible.append(row)
             picked = choose_balanced(eligible, count, seed + index)
             for ordinal, row in enumerate(picked):
@@ -160,6 +228,7 @@ def build(dataset, sources, output_dir, count=64, seed=2026, mode="symlink"):
                 "cf_dataset": str(cf_root), "available_physical_states": len(raw),
                 "eligible_joint_train_states": len(eligible),
                 "selected_states": len(picked),
+                "source_identity_check": "all_overlap_scene_initial_state_sha256",
                 "requested_source_states": cf["requested_states"],
                 "original_collection_complete": cf["complete"],
             })
