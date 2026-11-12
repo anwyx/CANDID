@@ -71,7 +71,7 @@ def check_pair(v, g):
         if x.shape != y.shape:
             raise ValueError(f"First-frame {key} shapes differ")
         y = y.copy()
-        if y.shape[-1] == 7:
+        if key in ("tcp_pose", "target_pose", "distractor_poses"):
             flip = (x[..., 3:] * y[..., 3:]).sum(axis=-1, keepdims=True) < 0
             y[..., 3:] = np.where(flip, -y[..., 3:], y[..., 3:])
         if np.max(np.abs(x - y)) > 2e-4:
