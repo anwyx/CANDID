@@ -125,36 +125,97 @@ def gradient(colors, p):
     return tuple(int(c) for c in ((1 - (x - i)) * np.asarray(colors[i]) + (x - i) * np.asarray(colors[i + 1])))
 
 
-def draw_trace(frame, xyz, step, colors, camera):
-    count = min(step + 1, len(xyz))
-    if not count:
+def draw_trace(frame, xyz, step, colors, camera, future_steps=12):
+    """Only plot the RECORDED local TCP path [step, step+future_steps].
+
+    The background shows the robot at 'step'. The coloured line shows its
+    subsequent, already-recorded path, NOT a predictor forecast. No earlier
+    global trajectory is included. Terminated episodes are never extrapolated.
+    """
+    if step < 0 or step >= len(xyz):
         return
-    points, visible = camera.project(xyz[:count])
-    indices = sorted(set(list(range(0, count, max(1, math.ceil(count / 90)))) + [count - 1]))
-    for i, j in zip(indices[:-1], indices[1:]):
-        if visible[i] and visible[j]:
-            cv2.line(frame, tuple(np.rint(points[i]).astype(int)),
-                     tuple(np.rint(points[j]).astype(int)),
-                     gradient(colors, j / max(1, len(xyz) - 1)), 4, cv2.LINE_AA)
-    markers = indices[::max(1, len(indices)//20)]
-    if count - 1 not in markers:
-        markers.append(count - 1)
-    for i in markers:
-        if visible[i]:
-            pos = tuple(np.rint(points[i]).astype(int))
-            radius = 6 if i == count - 1 else 4
-            cv2.circle(frame, pos, radius, gradient(colors, i / max(1, len(xyz) - 1)), -1, cv2.LINE_AA)
-            cv2.circle(frame, pos, radius, (255, 255, 255), 1, cv2.LINE_AA)
+    end = min(len(xyz), step + future_steps + 1)
+    pixels, visible = camera.project(xyz[step:end])
+    count = len(pixels)
+    for i in range(1, count):
+        if not (visible[i - 1] and visible[i]):
+            continue
+        cv2.line(
+            frame,
+            tuple(np.rint(pixels[i - 1]).astype(int)),
+            tuple(np.rint(pixels[i]).astype(int)),
+            gradient(colors, i / max(1, count - 1)), 5, cv2.LINE_AA,
+        )
+    for i in range(count):
+        if not visible[i]:
+            continue
+        # A dot at each actual recorded step, bigger at the start and end.
+        point = tuple(np.rint(pixels[i]).astype(int))
+        radius = 8 if i in (0, count - 1) else 5
+        color = gradient(colors, i / max(1, count - 1))
+        cv2.circle(frame, point, radius + 2, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, point, radius, color, -1, cv2.LINE_AA)
 
 
-def overlay(frame, vanilla, guided, step, camera):
+def overlay(frame, vanilla, guided, step, camera, future_steps=12):
     if tuple(frame.shape[:2]) != (camera.height, camera.width):
         raise ValueError("RGB frame resolution and camera projection disagree")
     out = np.ascontiguousarray(frame.copy())
-    # The input is RGB, and OpenCV writes raw channel tuples as provided.
-    draw_trace(out, vanilla["track"]["tcp_pose"][:, :3], step, VANILLA, camera)
-    draw_trace(out, guided["track"]["tcp_pose"][:, :3], step, GUIDED, camera)
+    draw_trace(out, vanilla["track"]["tcp_pose"][:, :3], step,
+               VANILLA, camera, future_steps=future_steps)
+    draw_trace(out, guided["track"]["tcp_pose"][:, :3], step,
+               GUIDED, camera, future_steps=future_steps)
     return out
+
+
+def focus_crop_box(camera, vanilla, guided, steps, zoom=1.65, future_steps=12):
+    """Fixed crop shared by all comparison frames; transform pixels AFTER overlay.
+
+    Determine the centre from projected target, obstacle, goal and local TCP
+    poses in the selected frames. Using the same crop for all three outputs
+    preserves a comparable viewpoint. Zoom is a 2-D crop, NOT a new camera.
+    """
+    if zoom <= 1.0001:
+        return (0, 0, camera.width, camera.height)
+    points = []
+    for t in steps:
+        for episode in (vanilla, guided):
+            track = episode["track"]
+            if t >= len(track["tcp_pose"]):
+                continue
+            points.extend(track["distractor_poses"][t, :, :3])
+            points.append(track["target_pose"][t, :3])
+            points.append(track["goal_pos"][t, :3])
+            end = min(len(track["tcp_pose"]), t + future_steps + 1)
+            points.extend(track["tcp_pose"][t:end, :3])
+    if not points:
+        return (0, 0, camera.width, camera.height)
+    projected, valid = camera.project(np.asarray(points, dtype=float))
+    valid = valid & np.isfinite(projected).all(axis=1)
+    valid &= (projected[:, 0] >= 0) & (projected[:, 0] < camera.width)
+    valid &= (projected[:, 1] >= 0) & (projected[:, 1] < camera.height)
+    if not valid.any():
+        cx, cy = camera.width / 2, camera.height / 2
+    else:
+        cx, cy = np.median(projected[valid], axis=0)
+    # Look a little above the tabletop so the gripper is also in view.
+    cy -= .065 * camera.height
+    crop_w = max(2, round(camera.width / zoom))
+    crop_h = max(2, round(camera.height / zoom))
+    x0 = int(np.clip(round(cx - crop_w / 2), 0, camera.width - crop_w))
+    y0 = int(np.clip(round(cy - crop_h / 2), 0, camera.height - crop_h))
+    return x0, y0, x0 + crop_w, y0 + crop_h
+
+
+def crop_and_resize(rgb, box, width, height):
+    """Zoom into the image while keeping the original robot/trajectory alignment."""
+    if box == (0, 0, width, height):
+        return rgb
+    return np.asarray(
+        Image.fromarray(rgb).crop(box).resize(
+            (width, height), Image.Resampling.LANCZOS
+        )
+    )
 
 
 def font(size, bold=False):
@@ -257,7 +318,7 @@ def _unit_scale(values):
     return (a - lo) / (hi - lo)
 
 
-def select_auto_steps(rows, overlap, count, min_gap, smooth_window):
+def select_auto_steps(rows, overlap, count, min_gap, smooth_window, future_steps=0):
     if overlap < count:
         raise ValueError(
             f"Only {overlap} jointly recorded steps; cannot select {count} different frames"
@@ -279,15 +340,18 @@ def select_auto_steps(rows, overlap, count, min_gap, smooth_window):
         r["selection_score"] = float(score[idx]) if idx < overlap else None
         r["is_selected"] = False
 
-    effective_gap = min(min_gap, (overlap - 1) // max(1, count - 1))
+    # Whenever possible, leave enough real recorded future steps for the
+    # local trace. Otherwise fall back to the measured shared interval.
+    eligible = overlap - future_steps if overlap - future_steps >= count else overlap
+    effective_gap = min(min_gap, (eligible - 1) // max(1, count - 1))
     # Local maxima first, then strongest remaining steps with separation.
     local = [
-        t for t in range(overlap)
+        t for t in range(eligible)
         if score[t] >= (score[t-1] if t else -np.inf)
-        and score[t] >= (score[t+1] if t+1 < overlap else -np.inf)
+        and score[t] >= (score[t+1] if t+1 < eligible else -np.inf)
     ]
     ordered = sorted(local, key=lambda t: (-score[t], -t))
-    ordered += sorted((i for i in range(overlap) if i not in local),
+    ordered += sorted((i for i in range(eligible) if i not in local),
                       key=lambda t: (-score[t], -t))
     selected = []
     # A greedy peak selection can occasionally block all remaining candidates;
@@ -314,38 +378,50 @@ def _fmt(value, digits=4):
     return "N/A" if value is None else f"{float(value):.{digits}f}"
 
 
-def save_separate_frame(image, step, row, output):
-    """One clean, presentation-ready PNG; metrics are outside the RGB scene."""
+def save_separate_frame(image, step, row, output, future_steps=12):
+    """Presentation-friendly standalone PNG with large, readable DR statistics."""
     im = Image.fromarray(image)
-    top, footer = 56, 124
-    canvas = Image.new("RGB", (im.width, im.height + top + footer), "#F8FAFC")
+    width, height = im.size
+    top, footer = 68, 220
+    canvas = Image.new("RGB", (width, height + top + footer), "#F7F9FC")
     canvas.paste(im, (0, top))
     d = ImageDraw.Draw(canvas)
-    d.text((24, 12), f"STEP {step}   |   Recorded physical disturbance",
-           font=font(23, True), fill="#263449")
-    d.line((0, top+im.height, im.width, top+im.height), fill="#DCE4EE", width=2)
-    base = top + im.height + 12
-    # Keep all numbers outside the rendered robot image for LaTeX cropping.
-    for i, (label, cols, prefix) in enumerate((
-        ("Vanilla DP", VANILLA, "vanilla"),
-        ("CANDID", GUIDED, "candid"),
+    d.text((26, 15), f"STEP {step}", font=font(30, True), fill="#223449")
+    d.text((310, 23), f"Next {future_steps} recorded TCP steps",
+           font=font(21), fill="#53677F")
+
+    base = top + height
+    d.line((0, base, width, base), fill="#D8E0EB", width=2)
+    columns = (350, 610, 875, 1085)
+    headings = ("DR Mean", "DR Max", "Topple", "Fall")
+    for x, title in zip(columns, headings):
+        d.text((x, base + 15), title, font=font(23, True), fill="#54657C")
+
+    for i, (label, colors, prefix, ink) in enumerate((
+        ("Vanilla DP", VANILLA, "vanilla", "#BB4235"),
+        ("CANDID", GUIDED, "candid", "#3158BE"),
     )):
-        y = base + i*44
-        x = 24
-        for color in cols:
-            d.ellipse((x, y+7, x+11, y+18), fill=color)
-            x += 11
-        d.text((76, y+2), label, font=font(17, True), fill="#24374D")
-        line = (
-            f"DR mean {_fmt(row[prefix+'_dr_mean'])}   "
-            f"DR max {_fmt(row[prefix+'_dr_max'])}   "
-            f"Topple {_fmt(row[prefix+'_topple'], 0)}   "
-            f"Fall {_fmt(row[prefix+'_fall'], 0)}"
-        )
-        d.text((270, y+2), line, font=font(17), fill="#35475C")
-    d.text((24, base + 88),
-           "Cumulative DR up to this step | CANDID RGB background; Vanilla TCP overlay only",
-           font=font(12), fill="#62728A")
+        y = base + 54 + i * 65
+        d.rounded_rectangle((22, y, 1240, y + 57),
+                            radius=11, fill="white", outline="#E3E9F1", width=2)
+        for k, color in enumerate(colors):
+            x = 35 + k * 14
+            d.ellipse((x, y + 20, x + 14, y + 34), fill=color)
+        d.text((105, y + 12), label, font=font(24, True), fill=ink)
+        for x, field, digits in (
+            (columns[0], "dr_mean", 4),
+            (columns[1], "dr_max", 4),
+            (columns[2], "topple", 0),
+            (columns[3], "fall", 0),
+        ):
+            d.text((x, y + 8), _fmt(row[prefix + "_" + field], digits),
+                   font=font(32, True), fill="#223449")
+
+    d.text(
+        (27, base + 191),
+        "Cumulative PHYSICAL disturbance at this step  |  RGB: CANDID; Vanilla: TCP overlay",
+        font=font(17), fill="#51657E",
+    )
     canvas.save(output)
 
 
@@ -388,6 +464,10 @@ def main(argv=None):
     p.add_argument("--auto-steps", type=int, default=3)
     p.add_argument("--min-step-gap", type=int, default=8)
     p.add_argument("--smooth-window", type=int, default=5)
+    p.add_argument("--trace-future", type=int, default=12,
+                   help="Show only this many RECORDED steps after each chosen step (default: 12)")
+    p.add_argument("--zoom", type=float, default=1.65,
+                   help="Fixed crop zoom around target, obstacles and gripper (default: 1.65; 1=no crop)")
     p.add_argument("--fps", type=int, default=20)
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
@@ -400,7 +480,7 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.fps < 1 or a.width < 2 or a.height < 2 or a.width % 2 or a.height % 2:
         p.error("FPS must be positive and rendering resolution must be even")
-    if not 0.1 < a.fovy < 3.0 or a.auto_steps < 1 or a.min_step_gap < 1 or a.smooth_window < 1:
+    if not 0.1 < a.fovy < 3.0 or a.auto_steps < 1 or a.min_step_gap < 1 or a.smooth_window < 1 or a.trace_future < 1 or not 1.0 <= a.zoom <= 3.0:
         p.error("Invalid FOV, --auto-steps, --min-step-gap, or --smooth-window")
     if a.steps and a.auto_steps != 3:
         p.error("Use --steps or --auto-steps, not both")
@@ -433,12 +513,14 @@ def main(argv=None):
             steps = sorted(a.steps)
             if len(set(steps)) != 3 or min(steps) < 0 or max(steps) >= overlap:
                 p.error(f"Manual --steps must be distinct and lie in shared recorded range [0,{overlap-1}]")
-            _, gap = select_auto_steps(rows, overlap, 3, a.min_step_gap, a.smooth_window)
+            _, gap = select_auto_steps(rows, overlap, 3, a.min_step_gap, a.smooth_window,
+                                       future_steps=a.trace_future)
             for row in rows:
                 row["is_selected"] = row["step"] in steps
         else:
             steps, gap = select_auto_steps(rows, overlap, a.auto_steps,
-                                           a.min_step_gap, a.smooth_window)
+                                           a.min_step_gap, a.smooth_window,
+                                           future_steps=a.trace_future)
         print(f"Vanilla {len(vanilla['track']['tcp_pose'])} frames, "
               f"CANDID {len(guided['track']['tcp_pose'])} frames; "
               f"shared measured prefix {overlap}. Selected: {steps}", flush=True)
@@ -467,12 +549,17 @@ def main(argv=None):
                 if step == 0:
                     h, w = rgb.shape[:2]
                     cam = Camera(guided["scene"]["scene_spec"], w, h, a.fovy)
+                    crop = focus_crop_box(cam, vanilla, guided, steps,
+                                          zoom=a.zoom, future_steps=a.trace_future)
+                    print(f"Shared focus crop {crop}; zoom={a.zoom:.2f}x", flush=True)
                     if not a.no_overlay_video:
                         writer = imageio.get_writer(str(movie), format="FFMPEG",
                                                     fps=a.fps, codec="libx264",
                                                     pixelformat="yuv420p", macro_block_size=None,
                                                     quality=8)
-                painted = overlay(rgb, vanilla, guided, step, cam)
+                painted = overlay(rgb, vanilla, guided, step, cam,
+                                  future_steps=a.trace_future)
+                painted = crop_and_resize(painted, crop, w, h)
                 if step in steps:
                     pictures[step] = painted.copy()
                 if writer is not None:
@@ -490,7 +577,8 @@ def main(argv=None):
             png = frames_dir / f"step_{step:03d}.png"
             if png.exists() and not a.overwrite:
                 raise FileExistsError(f"{png} already exists; pass --overwrite")
-            save_separate_frame(pictures[step], step, rows[step], png)
+            save_separate_frame(pictures[step], step, rows[step], png,
+                                future_steps=a.trace_future)
             selected.append({**rows[step], "image": str(png)})
         csv_path = out / "step_metrics.csv"
         json_path = out / "selected_steps.json"
@@ -506,6 +594,9 @@ def main(argv=None):
             "shared_recorded_frames": overlap,
             "selected_steps": steps,
             "selection_gap": gap,
+            "local_tcp_path": f"actual archived steps [t, t+{a.trace_future}] (clamped to episode length), not a forecast",
+            "focus_crop_box": list(crop),
+            "zoom": a.zoom,
             "background_source": source,
             "step_metric": "Official cumulative physical DR from first pose to each recorded step",
             "dr_source": "candid.data.metrics.disturbance_from_poses",
