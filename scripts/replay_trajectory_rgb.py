@@ -90,10 +90,74 @@ def as_numpy(value):
     return np.asarray(value.detach().cpu().numpy() if hasattr(value, "detach") else value)
 
 
+def _scene_spec_diff(actual, expected, name="scene_spec"):
+    """Show exact metadata mismatches without hiding a changed geometry."""
+    if isinstance(actual, dict) and isinstance(expected, dict):
+        for key in sorted(set(actual) | set(expected)):
+            if key not in actual:
+                yield f"{name}.{key}: missing in current environment"
+            elif key not in expected:
+                yield f"{name}.{key}: new in current environment"
+            else:
+                yield from _scene_spec_diff(actual[key], expected[key], f"{name}.{key}")
+    elif isinstance(actual, list) and isinstance(expected, list):
+        if len(actual) != len(expected):
+            yield f"{name}: current length {len(actual)}; archived length {len(expected)}"
+        for i in range(min(len(actual), len(expected))):
+            yield from _scene_spec_diff(actual[i], expected[i], f"{name}[{i}]")
+    elif actual != expected:
+        yield f"{name}: current={actual!r}; archived={expected!r}"
+
+
+def register_archived_scene(scene, original_env_id):
+    """Reuse the original environment implementation, replacing only its SceneSpec.
+
+    This is an explicit opt-in. The restored simulator state/trajectory is still
+    verified strictly by check_initial() before a single RGB frame is written.
+    """
+    import hashlib
+    import importlib
+    import gymnasium as gym
+    from candid.sim.environment import CANDIDTabletopEnv
+    from candid.eval.replay_env import scene_spec_from_dict
+    from mani_skill.utils.registration import REGISTERED_ENVS, register_env
+
+    entry_point = gym.spec(original_env_id).entry_point
+    if isinstance(entry_point, str):
+        module_name, separator, class_name = entry_point.partition(":")
+        if not separator:
+            raise RuntimeError(f"Unsupported Gym entry point: {entry_point!r}")
+        entry_point = getattr(importlib.import_module(module_name), class_name)
+    if not isinstance(entry_point, type) or not issubclass(entry_point, CANDIDTabletopEnv):
+        raise RuntimeError("Archived SceneSpec override requires a CANDIDTabletopEnv subclass")
+
+    archived = scene_spec_from_dict(scene["scene_spec"])
+    digest = hashlib.sha256(
+        json.dumps(scene["scene_spec"], sort_keys=True).encode("utf-8")
+    ).hexdigest()[:12]
+    replay_id = f"CANDIDRecordedVideo-{digest}-v0"
+    if replay_id not in REGISTERED_ENVS:
+        restored_class = type(
+            f"CANDIDRecordedVideo_{digest}",
+            (entry_point,),
+            {"SCENE": archived},
+        )
+        register_env(replay_id, max_episode_steps=500)(restored_class)
+    return replay_id
+
+
 def check_initial(base, scene, track, atol=2e-4):
     from candid.data.storage import json_safe
-    if json_safe(base.SCENE.to_dict()) != scene["scene_spec"]:
-        raise ValueError("SceneSpec differs from saved evaluation scene")
+    actual_spec = json_safe(base.SCENE.to_dict())
+    if actual_spec != scene["scene_spec"]:
+        differences = list(_scene_spec_diff(actual_spec, scene["scene_spec"]))
+        raise ValueError(
+            "SceneSpec differs from saved evaluation scene.\n"
+            + "\n".join("  " + item for item in differences[:16])
+            + ("\n  ...more differences" if len(differences) > 16 else "")
+            + "\nTry --use-archived-scene-spec to construct the archived scene, "
+              "while keeping strict initial-pose validation."
+        )
     if len(base.distractor_actors) != track["distractor_poses"].shape[1]:
         raise ValueError("Distractor count does not match recorded trajectory")
     names = [m.spec.name for m in base.distractor_metadata]
@@ -159,6 +223,9 @@ def render(args):
             raise ValueError("Mismatched scene_id in scene.json and result.json")
         track = load_track(temp / "trajectory.npz")
         env_id, source = resolve_scene_environment(scene)
+        if args.use_archived_scene_spec and source == "original_env_module":
+            env_id = register_archived_scene(scene, env_id)
+            print("Using SceneSpec archived with the trajectory bundle", flush=True)
         if source != "original_env_module":
             if not args.allow_scene_spec_fallback:
                 raise RuntimeError(
@@ -181,6 +248,10 @@ def render(args):
         if scene.get("generated_eval_suite"):
             base_kwargs["skip_constructor_settling"] = True
         env_kwargs = dict(scene.get("env_kwargs") or {})
+        if args.use_archived_scene_spec:
+            # Archived SceneSpec already includes its original selected subset.
+            env_kwargs.pop("num_distractors", None)
+            env_kwargs.pop("distractor_seed", None)
         overlaps = set(base_kwargs) & set(env_kwargs)
         if overlaps:
             raise ValueError(f"Conflicting scene kwargs: {sorted(overlaps)}")
@@ -241,6 +312,8 @@ def main(argv=None):
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--render-backend", choices=("cpu", "gpu"), default="cpu")
     p.add_argument("--allow-scene-spec-fallback", action="store_true")
+    p.add_argument("--use-archived-scene-spec", action="store_true",
+                   help="Construct original environment with archived SceneSpec, then verify initial poses")
     p.add_argument("--fps", type=int, default=20)
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--width", type=int, default=1280)
