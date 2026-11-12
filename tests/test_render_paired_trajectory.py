@@ -148,3 +148,59 @@ def test_reject_different_scene(tmp_path):
                                 scene_id="different_scene"))
     with pytest.raises(ValueError, match="initial scene"):
         mod.check_pair(v, g)
+
+
+
+def test_future_local_trace_does_not_draw_past_or_invent_future(tmp_path, monkeypatch):
+    """Only the selected [step, step+window] segment is sent to projection."""
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    cam = mod.Camera(g["scene"]["scene_spec"], 1280, 720, 1.0)
+    actual_points = []
+    original_project = cam.project
+
+    def recording_project(points):
+        actual_points.append(np.asarray(points).copy())
+        return original_project(points)
+
+    monkeypatch.setattr(cam, "project", recording_project)
+    image = np.full((720, 1280, 3), 200, np.uint8)
+    mod.overlay(image, v, g, 8, cam, future_steps=5)
+    assert len(actual_points) == 2
+    # Vanilla has states 8..13; Guided ends at state 10.
+    np.testing.assert_allclose(actual_points[0], v["track"]["tcp_pose"][8:14, :3])
+    np.testing.assert_allclose(actual_points[1], g["track"]["tcp_pose"][8:11, :3])
+    # Input image must remain unchanged.
+    assert np.all(image == 200)
+
+
+def test_focus_crop_and_big_metric_card(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    cam = mod.Camera(g["scene"]["scene_spec"], 1280, 720, 1.0)
+    crop = mod.focus_crop_box(cam, v, g, [2, 4, 7], zoom=1.65, future_steps=5)
+    assert len(crop) == 4
+    x0, y0, x1, y1 = crop
+    assert 0 <= x0 < x1 <= 1280
+    assert 0 <= y0 < y1 <= 720
+    assert x1 - x0 < 1280 and y1 - y0 < 720
+    image = np.full((720, 1280, 3), (220, 225, 230), np.uint8)
+    cropped = mod.crop_and_resize(image, crop, 1280, 720)
+    assert cropped.shape == image.shape
+    png = tmp_path / "focus.png"
+    mod.save_separate_frame(cropped, 4, rows[4], png, future_steps=5)
+    from PIL import Image
+    with Image.open(png) as result:
+        assert result.size == (1280, 720 + 68 + 220)
+
+
+def test_auto_selected_steps_prefer_real_future_windows(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    chosen, gap = mod.select_auto_steps(
+        rows, overlap, count=3, min_gap=3, smooth_window=5, future_steps=5
+    )
+    assert len(chosen) == 3
+    assert max(chosen) + 5 < overlap
