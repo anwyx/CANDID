@@ -192,7 +192,7 @@ def test_focus_crop_and_big_metric_card(tmp_path):
     mod.save_separate_frame(cropped, 4, rows[4], png, future_steps=5)
     from PIL import Image
     with Image.open(png) as result:
-        assert result.size == (1280, 720 + 68 + 220)
+        assert result.size == (1280, 720 + 76 + 215)
 
 
 def test_auto_selected_steps_prefer_real_future_windows(tmp_path):
@@ -204,3 +204,28 @@ def test_auto_selected_steps_prefer_real_future_windows(tmp_path):
     )
     assert len(chosen) == 3
     assert max(chosen) + 5 < overlap
+
+
+
+def test_font_is_scalable_not_pillow_bitmap_fallback():
+    from PIL import ImageFont
+    text_font = mod.font(35, bold=True)
+    assert isinstance(text_font, ImageFont.FreeTypeFont)
+    box = text_font.getbbox("DR MEAN 0.0086")
+    assert box[2] - box[0] >= 200
+    assert box[3] - box[1] >= 20
+
+
+def test_new_frame_has_compact_readable_layout(tmp_path):
+    from PIL import Image
+    v = mod.load_episode(bundle(tmp_path / "v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path / "g.zip", 11, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    rgb = np.full((720, 1280, 3), [180, 190, 210], dtype=np.uint8)
+    output = tmp_path / "step_005.png"
+    mod.save_separate_frame(rgb, 5, rows[5], output, future_steps=12)
+    with Image.open(output) as im:
+        assert im.size == (1280, 720 + 76 + 215)
+        # Dark masthead; warm and blue-tinted comparison rows.
+        assert im.getpixel((5, 5)) == (23, 42, 63)
+        assert im.getpixel((40, 76 + 720 + 80)) != im.getpixel((40, 76 + 720 + 138))
