@@ -290,13 +290,20 @@ def select_auto_steps(rows, overlap, count, min_gap, smooth_window):
     ordered += sorted((i for i in range(overlap) if i not in local),
                       key=lambda t: (-score[t], -t))
     selected = []
-    for t in ordered:
-        if all(abs(t-u) >= effective_gap for u in selected):
-            selected.append(t)
+    # A greedy peak selection can occasionally block all remaining candidates;
+    # gracefully relax the separation instead of failing on a valid episode.
+    for gap in range(effective_gap, 0, -1):
+        selected = []
+        for t in ordered:
+            if all(abs(t-u) >= gap for u in selected):
+                selected.append(t)
+            if len(selected) == count:
+                break
         if len(selected) == count:
+            effective_gap = gap
             break
     if len(selected) < count:
-        raise RuntimeError("Could not select spaced comparison frames")
+        raise RuntimeError("Could not select comparison frames")
     selected.sort()
     for t in selected:
         rows[t]["is_selected"] = True
