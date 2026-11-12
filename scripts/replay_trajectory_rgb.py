@@ -220,7 +220,7 @@ def render(args):
                         set_actor_pose(actor, pose)
                     set_actor_pose(base.goal_site, np.r_[track["goal_pos"][t], goal_quat])
                     # Crucial: NO env.step(). Only archived poses are displayed.
-                    writer.append_data(rgb_numpy(base.render_rgb_array()))
+                    writer.append_data(rgb_numpy(env.render()))
                     if (j + 1) % 25 == 0 or j + 1 == len(indices):
                         print(f"  {j+1}/{len(indices)} frames", flush=True)
             print(f"Saved real RGB video: {output}")
@@ -236,7 +236,7 @@ def main(argv=None):
     p.add_argument("--eval-suite", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.set_defaults(func=pack)
-    p = sub.add_parser("render", help="Rendering machine: genuine SAPIEN/MainiSkill video")
+    p = sub.add_parser("render", help="Rendering machine: genuine SAPIEN/ManiSkill video")
     p.add_argument("--bundle", required=True, type=Path)
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--render-backend", choices=("cpu", "gpu"), default="cpu")
