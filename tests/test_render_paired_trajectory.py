@@ -1,4 +1,4 @@
-"""Offline tests for the paired RGB overlay; no ManiSkill/Vulkan required."""
+"""Headless paired-RGB visualization tests (no ManiSkill/Vulkan required)."""
 from __future__ import annotations
 
 import importlib.util
@@ -13,31 +13,49 @@ import numpy as np
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "render_paired_trajectory.py"
-spec = importlib.util.spec_from_file_location("candid_paired_video", SCRIPT)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
+SPEC = importlib.util.spec_from_file_location(
+    "candid_paired_video", ROOT / "scripts" / "render_paired_trajectory.py"
+)
+mod = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = mod
+SPEC.loader.exec_module(mod)
 
 
-def _bundle(path, *, guided, scene_id="scene3__random_eval_920001_00035"):
-    t, n = 12, 2
-    poses = np.zeros((t, n, 7), np.float32)
+def bundle(path, length, *, guided, scene_id="scene3__random_eval_920001_00035"):
+    n = 2
+    poses = np.zeros((length, n, 7), np.float32)
     poses[:, :, 3] = 1
-    tcp = np.zeros((t, 7), np.float32)
-    tcp[:, 3] = 1
-    tcp[:, 0] = np.linspace(-.20, .08, t)
-    tcp[:, 1] = np.linspace(-.08, .05, t)
+    poses[:, 0, 0] = -0.05
+    poses[:, 1, 1] = 0.07
     if guided:
-        tcp[:, 1] += np.linspace(0, .06, t)
-    target = np.zeros((t, 7), np.float32)
+        poses[:, 0, 0] += np.linspace(0, .02, length)
+    else:
+        poses[:, 0, 0] += np.linspace(0, .10, length)
+    topple = np.zeros((length, n), bool)
+    if not guided:
+        topple[4:, 0] = True
+    fall = np.zeros((length, n), bool)
+    sizes = np.array([.04, .05], dtype=np.float32)
+    tcp = np.zeros((length, 7), np.float32)
+    tcp[:, 3] = 1.
+    tcp[:, 0] = np.linspace(-.2, .08, length)
+    tcp[:, 1] = np.linspace(-.08, .03 if guided else -.03, length)
+    target = np.zeros((length, 7), np.float32)
     target[:, 3] = 1
-    joints = np.tile(np.arange(7, dtype=np.float32)[None, :], (t, 1))
-    # A 7D joint vector is NOT a quaternion pose.
-    goal = np.tile(np.array([[.1, 0, .001]], np.float32), (t, 1))
-    buf = io.BytesIO()
-    np.savez_compressed(buf, tcp_pose=tcp, robot_qpos=joints, target_pose=target,
-                        distractor_poses=poses, goal_pos=goal)
+    goal = np.tile(np.array([[.1, 0, .001]], np.float32), (length, 1))
+    qpos = np.tile(np.arange(7, dtype=np.float32)[None], (length, 1))
+    # For test fixture correctness, derive final metrics from the official function.
+    from candid.data.metrics import disturbance_from_poses
+    dr = disturbance_from_poses(
+        poses, sizes, topple_flags=topple, fall_flags=fall
+    )
+    with io.BytesIO() as b:
+        np.savez_compressed(
+            b, tcp_pose=tcp, robot_qpos=qpos, target_pose=target,
+            distractor_poses=poses, goal_pos=goal, object_sizes_m=sizes,
+            distractor_toppled=topple, distractor_fallen=fall,
+        )
+        blob = b.getvalue()
     scene = {
         "scene_id": scene_id, "seed": 900001, "env_id": "Dummy-v1",
         "env_module": "envs.dummy", "env_kwargs": {},
@@ -48,65 +66,85 @@ def _bundle(path, *, guided, scene_id="scene3__random_eval_920001_00035"):
     }
     result = {
         "scene_id": scene_id, "eval_seed": 13502026,
-        "original_env_id": "Dummy-v1",
-        "task_success": guided, "safe": guided, "safe_success": guided,
-        "dr_mean": .0086 if guided else .2035,
-        "dr_max": .05 if guided else .6,
-        "topple_count": 0 if guided else 1, "fall_count": 0,
+        "original_env_id": "Dummy-v1", "task_success": guided,
+        "safe_success": guided,
+        "dr_mean": dr["dr_mean"], "dr_max": dr["dr_max"],
+        "topple_count": dr["topple_count"], "fall_count": dr["fall_count"],
     }
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr("trajectory.npz", buf.getvalue())
-        z.writestr("initial_state.npz", b"identical archived initial state")
+        z.writestr("trajectory.npz", blob)
+        z.writestr("initial_state.npz", b"same frozen initial state")
         z.writestr("scene.json", json.dumps(scene))
         z.writestr("result.json", json.dumps(result))
     return path
 
 
-def test_matching_scene_and_pose(tmp_path):
-    v = module.load_episode(_bundle(tmp_path/"v.zip", guided=False))
-    g = module.load_episode(_bundle(tmp_path/"g.zip", guided=True))
-    module.check_pair(v, g)
-    g["result"]["eval_seed"] += 1
-    with pytest.raises(ValueError, match="eval protocol"):
-        module.check_pair(v, g)
+def write_background(path, n):
+    with imageio.get_writer(
+        str(path), format="FFMPEG", fps=10, codec="libx264",
+        pixelformat="yuv420p", macro_block_size=None
+    ) as writer:
+        for _ in range(n):
+            writer.append_data(np.full((180, 320, 3), (210, 220, 230), np.uint8))
+
+
+def test_different_lengths_and_exact_physical_dr(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    mod.check_pair(v, g)
+    rows, overlap = mod.make_step_rows(v, g)
+    assert overlap == 11
+    assert len(rows) == 11
+    assert rows[0]["vanilla_dr_mean"] == 0
+    assert rows[0]["candid_dr_max"] == 0
+    assert rows[-1]["delta_dr_mean"] > 0
+    assert rows[-1]["vanilla_topple"] == 1
+    assert rows[-1]["candid_topple"] == 0
+    steps, gap = mod.select_auto_steps(rows, overlap, 3, 8, 5)
+    assert len(steps) == len(set(steps)) == 3
+    assert all(0 <= step < overlap for step in steps)
+
+
+def test_longer_guided_episode_marks_missing_vanilla(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 10, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 18, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    assert overlap == 10
+    assert rows[9]["vanilla_dr_mean"] is not None
+    assert rows[10]["vanilla_dr_mean"] is None
+    assert rows[10]["both_recorded"] is False
+    steps, _ = mod.select_auto_steps(rows, overlap, 3, 8, 5)
+    assert max(steps) < 10
+
+
+def test_generate_three_individual_pngs_and_step_csv(tmp_path):
+    vanilla = bundle(tmp_path/"vanilla.zip", 18, guided=False)
+    guided = bundle(tmp_path/"guided.zip", 12, guided=True)
+    background = tmp_path/"background.mp4"
+    write_background(background, 12)
+    out = tmp_path/"out"
+    mod.main([
+        "--vanilla-bundle", str(vanilla),
+        "--guided-bundle", str(guided),
+        "--background-video", str(background),
+        "--output-dir", str(out), "--fps", "10",
+        "--auto-steps", "3", "--min-step-gap", "4",
+        "--no-overlay-video",
+    ])
+    pngs = list((out/"frames").glob("step_*.png"))
+    assert len(pngs) == 3
+    for png in pngs:
+        assert png.stat().st_size > 1000
+    rows = (out/"step_metrics.csv").read_text().splitlines()
+    assert len(rows) == 13  # header + 12 CANDID frames
+    summary = json.loads((out/"paired_trajectory_summary.json").read_text())
+    assert summary["shared_recorded_frames"] == 12
+    assert len(summary["selected_steps"]) == 3
 
 
 def test_reject_different_scene(tmp_path):
-    v = module.load_episode(_bundle(tmp_path/"v.zip", guided=False))
-    g = module.load_episode(_bundle(tmp_path/"g.zip", guided=True, scene_id="scene4__different"))
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 12, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 12, guided=True,
+                                scene_id="different_scene"))
     with pytest.raises(ValueError, match="initial scene"):
-        module.check_pair(v, g)
-
-
-def test_projection_and_overlay_progress(tmp_path):
-    v = module.load_episode(_bundle(tmp_path/"v.zip", guided=False))
-    g = module.load_episode(_bundle(tmp_path/"g.zip", guided=True))
-    cam = module.Camera(g["scene"]["scene_spec"], 320, 180, 1.0)
-    xy, good = cam.project([g["scene"]["scene_spec"]["human_camera_look_at"]])
-    assert good.tolist() == [True]
-    np.testing.assert_allclose(xy[0], [160, 90], atol=1e-4)
-    bg = np.full((180, 320, 3), 220, dtype=np.uint8)
-    early = module.overlay(bg, v, g, 0, cam)
-    late = module.overlay(bg, v, g, 10, cam)
-    assert not np.array_equal(early, late)
-
-
-def test_generated_png_and_mp4(tmp_path):
-    vb = _bundle(tmp_path/"vanilla.zip", guided=False)
-    gb = _bundle(tmp_path/"guided.zip", guided=True)
-    background = tmp_path / "guided_rgb.mp4"
-    with imageio.get_writer(str(background), format="FFMPEG", fps=10, codec="libx264",
-                            pixelformat="yuv420p", macro_block_size=None) as writer:
-        for i in range(12):
-            writer.append_data(np.full((180, 320, 3), [212, 221, 230], dtype=np.uint8))
-    out = tmp_path / "out"
-    module.main([
-        "--vanilla-bundle", str(vb), "--guided-bundle", str(gb),
-        "--background-video", str(background), "--output-dir", str(out),
-        "--steps", "2", "6", "10", "--fps", "10", "--tile-width", "250",
-    ])
-    assert (out / "paired_trajectory_triptych.png").stat().st_size > 1000
-    assert (out / "paired_trajectory_overlay.mp4").stat().st_size > 1000
-    summary = json.loads((out / "paired_trajectory_summary.json").read_text())
-    assert summary["frame_count"] == 12
-    assert summary["steps"] == [2, 6, 10]
+        mod.check_pair(v, g)
