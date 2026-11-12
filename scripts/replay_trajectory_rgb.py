@@ -116,20 +116,25 @@ def register_archived_scene(scene, original_env_id):
     verified strictly by check_initial() before a single RGB frame is written.
     """
     import hashlib
-    import importlib
-    import gymnasium as gym
     from candid.sim.environment import CANDIDTabletopEnv
     from candid.eval.replay_env import scene_spec_from_dict
     from mani_skill.utils.registration import REGISTERED_ENVS, register_env
 
-    entry_point = gym.spec(original_env_id).entry_point
-    if isinstance(entry_point, str):
-        module_name, separator, class_name = entry_point.partition(":")
-        if not separator:
-            raise RuntimeError(f"Unsupported Gym entry point: {entry_point!r}")
-        entry_point = getattr(importlib.import_module(module_name), class_name)
-    if not isinstance(entry_point, type) or not issubclass(entry_point, CANDIDTabletopEnv):
-        raise RuntimeError("Archived SceneSpec override requires a CANDIDTabletopEnv subclass")
+    # ManiSkill registers Gym's entry_point as a factory/callable, not as the
+    # original scene class. Recover the registered class from ManiSkill's own
+    # EnvSpec instead.  ManiSkill 3.0.1 EnvSpec stores this as `.cls`.
+    spec = REGISTERED_ENVS.get(original_env_id)
+    original_class = getattr(spec, "cls", None)
+    if original_class is None:
+        raise RuntimeError(
+            f"ManiSkill environment {original_env_id!r} has no registered class; "
+            "check that its original env_module was imported successfully"
+        )
+    if not isinstance(original_class, type) or not issubclass(original_class, CANDIDTabletopEnv):
+        raise RuntimeError(
+            f"Archived SceneSpec override requires a CANDIDTabletopEnv subclass; "
+            f"got {original_class!r}"
+        )
 
     archived = scene_spec_from_dict(scene["scene_spec"])
     digest = hashlib.sha256(
@@ -139,7 +144,7 @@ def register_archived_scene(scene, original_env_id):
     if replay_id not in REGISTERED_ENVS:
         restored_class = type(
             f"CANDIDRecordedVideo_{digest}",
-            (entry_point,),
+            (original_class,),
             {"SCENE": archived},
         )
         register_env(replay_id, max_episode_steps=500)(restored_class)
