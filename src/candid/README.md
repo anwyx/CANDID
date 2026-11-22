@@ -1,219 +1,288 @@
-# CANDID `src/`：公共组件说明
+# CANDID Core Library (`src/candid/`)
 
-本目录存放 CANDID 的**公共仿真、数据采集与运行组件**。我们的目标是让组员新增任务时，主要在项目根目录的 `envs/` 中声明物体与生成范围，而不需要为每一个场景重新实现 ManiSkill Actor、随机布局、Settling、Disturbance 记录或数据保存。
+This directory contains the shared simulation, physical-data, data-preparation and closed-loop evaluation code for **CANDID: Consequence-Aware Non-target Disturbance-Informed Diffusion**. It is the reusable implementation layer below the repository's CLI wrappers; the neural-network architectures and training code live separately in `model/`.
 
-> **当前版本：组件化数据采集 v1（含 Pose-based Settling 修复）。** 默认面向 ManiSkill 3、xArm6 + Robotiq、`pd_joint_pos`、单环境 CPU/MPlib 采集。这个目录不是训练好的 DP/Predictor 模型；它主要负责提供二者共用的原始数据与数据格式。
+For **installation and the complete end-to-end workflow**, start at the [root README](../../README.md). For **all command-line entrypoints**, see the [scripts guide](../../scripts/README.md).
 
-## 1. 整体结构
+> **Version:** This document describes the current `main` branch, including physical counterfactual replay and frozen multi-environment evaluation—not the earlier collection-only v1 implementation. Runtime data, checkpoints and simulation assets are not distributed in this directory.
 
-```text
-src/
-└── candid/
-    ├── sim/                    # 场景描述、物体创建、布局与物理初始化
-    │   ├── spec.py
-    │   ├── actors.py
-    │   ├── layout.py
-    │   ├── settling.py
-    │   └── environment.py
-    ├── data/                   # 数据记录、指标、存储与训练样本接口
-    │   ├── monitor.py
-    │   ├── metrics.py
-    │   ├── storage.py
-    │   ├── adapter.py
-    │   ├── windows.py
-    │   └── validate.py
-    └── runner/
-        └── collect.py         # Scene × Trajectory 的采集流程和命令行参数
-```
+## 1. Architectural overview
 
-三个子模块的职责不应混在一起：
+~~~text
+envs/*.py + SceneSpec                     (environment definitions)
+          |
+          v
+src/candid/sim/                           (SAPIEN/ManiSkill physical world)
+          |
+          +----> planners/execute_baseline.py
+          |      + src/candid/runner/       (teacher demonstration selection)
+          |                 |
+          |                 v
+          +---------> src/candid/data/      (HDF5, trace NPZ, labels, splits)
+                             |
+                  +----------+-----------------------------+
+                  |                                        |
+                  v                                        v
+          model/vanilla_dp/                       model/predictor/
+          (state DDPM policy)                     (ordinal risk predictor)
+                  |                                        ^
+                  |                            physical counterfactual replay
+                  +------------------------+               |
+                                           v               |
+                                 model/guidance/  <---------+
+                                 (frozen DP + risk gradients)
+                                           |
+                                           v
+                                  src/candid/eval/
+                                  (paired physical rollouts)
+~~~
 
-- **`sim/`**：决定场景里有什么、Actor 怎么创建、物体如何随机生成以及何时可以开始一条 Episode；**不负责把轨迹写入数据集**。
-- **`data/`**：记录已经执行出来的物理状态，计算和保存 Disturbance，以及将原始数据转换成模型训练样本；**不负责生成布局或规划机械臂动作**。
-- **`runner/`**：串联 Environment、Planner、Recorder 和 Data 组件；**不自己定义物体或重新实现 DR 公式**。
+The boundaries matter:
 
-组员实际运行命令请看 [`../scripts/README.md`](../scripts/README.md)。
+- `sim/` defines scene construction, physics reset, object settling, robot state, observations and task success. It does **not** train neural networks.
+- `runner/` orchestrates teacher trajectories from a common saved scene and chooses alternative motion-planner configurations.
+- `data/` owns physical traces, disturbance/event labels, data serialisation, canonical observations, training windows, and leakage-resistant scene splits.
+- `eval/` restores frozen physical states, calls a supplied policy, executes actions and computes comparable episode-level results.
+- `model/` (at repository root) owns the trained Diffusion Policy, Predictor, Guidance sampling and reranking code. It is intentionally separate from `src/candid/`.
 
-## 2. `sim/`：公共仿真组件
+## 2. Package layout
 
-| 文件 | 主要内容 | 一般谁会修改 |
-|---|---|---|
-| `spec.py` | `XYRegion`、`ObjectSpec`、`SceneSpec`：定义场景的数据结构 | 新增场景时通常只**调用**，无需修改 |
-| `actors.py` | `build_actor()` 创建 box/cylinder/sphere/YCB；`describe_actor()` 从碰撞几何提取尺寸、落地高度和占地半径 | 需要增加新的 Mesh/物体类型时由团队统一扩展 |
-| `layout.py` | `sample_layout()`：基于 Seed 连续随机采样 XY/yaw，避免初始物体重叠并预留 Target/Goal 空间 | 需要统一修改随机化规则时修改 |
-| `settling.py` | `SettlingConfig`、`settle_scene()`：基于 Pose 变化和无动作验证判断物体是否稳定 | 统一维护 Settling 策略 |
-| `environment.py` | `CANDIDTabletopEnv`：ManiSkill 环境基类，处理 Robot、Table、Actor、Reset、Settling、Observation、Reward 和 Success | 需要增加**新的任务机制**时修改 |
+~~~text
+src/candid/
+├── __init__.py
+├── sim/
+│   ├── spec.py                  # XYRegion, ObjectSpec, SceneSpec
+│   ├── actors.py                # Primitive / YCB actor construction and geometry
+│   ├── layout.py                # Seeded non-overlapping tabletop placement
+│   ├── distractor_selection.py  # Select deterministic distractor subsets
+│   ├── settling.py              # Physical scene-settling checks
+│   └── environment.py           # CANDIDTabletopEnv, xArm6 task
+├── runner/
+│   ├── collect.py               # General / legacy planner collection helper
+│   ├── adaptive_sampling.py     # Deterministic warmup and candidate generation
+│   ├── feedback_sampler.py      # History-informed teacher alternatives
+│   ├── production_sampler.py    # Default feedback/uniform and route samplers
+│   ├── route_intents.py         # Direct / left / right / over TCP waypoints
+│   └── variants.py              # Planner-configuration utilities
+├── data/
+│   ├── adapter.py               # Named state_dict -> canonical 151-D vector
+│   ├── windows.py               # Model-neutral observation / action windows
+│   ├── monitor.py               # PhysicsTrace of target/distractor motion
+│   ├── metrics.py               # Disturbance, topple/fall and angle calculations
+│   ├── storage.py               # DatasetWriter, scene snapshots, JSONL/NPZ
+│   ├── trajectories.py          # Read expert trajectories from manifests/HDF5
+│   ├── splits.py                # Frozen, fingerprinted scene-level split.json
+│   ├── validate.py              # Dataset and T/T+1 consistency verification
+│   ├── counterfactual.py        # Expert probes and bounded action perturbations
+│   ├── balanced_counterfactual.py  # Stratified CF state selection
+│   ├── replay_diagnostics.py    # Archive-versus-physics replay error analysis
+│   └── synthetic.py            # Test / synthetic-data helpers
+└── eval/
+    ├── policy_api.py            # Minimal policy interaction contract
+    ├── metrics.py               # SafetyLimits and episode aggregation
+    ├── replay_env.py            # Restore saved scene's registered environment
+    ├── rollout.py               # Closed-loop episodes; shared policy evaluator
+    ├── local_dr.py              # Local disturbance diagnostics
+    ├── local_dr_repeat.py       # Repeated local-risk diagnostics
+    ├── generate_suite.py        # Generate new frozen evaluation-only scenes
+    └── scene_suite.py           # Suite fingerprint and integrity checks
+~~~
 
-### 2.1 新建场景：优先写 `envs/*.py`
+## 3. Simulation: `sim/`
 
-假设需要一个 Target Cube，旁边有 Box 和 Cylinder。新建 `envs/candid_my_scene_env.py`：
+### Scene definitions
 
-```python
+A scenario is a `SceneSpec` containing a target `ObjectSpec`, a set of distractor specifications and a goal region. A thin environment module in **repository-root `envs/`** registers that scene with ManiSkill.
+
+For an example of an actual supported definition, inspect [`envs/candid_baseline_env.py`](../../envs/candid_baseline_env.py); to add a new scene, follow the same pattern:
+
+~~~python
 from mani_skill.utils.registration import register_env
 from candid.sim.environment import CANDIDTabletopEnv
 from candid.sim.spec import SceneSpec, ObjectSpec, XYRegion
 
 TARGET = XYRegion((-0.145, -0.095), (-0.035, 0.035))
-CLUTTER = XYRegion((-0.235, 0.145), (-0.175, 0.175))
+CLUTTER = XYRegion((-0.180, -0.040), (-0.095, 0.095))
 GOAL = XYRegion((0.080, 0.120), (-0.040, 0.040))
 
 SCENE = SceneSpec(
-    name="my_scene",
-    target=ObjectSpec(
-        "target_cube", "box", TARGET, (-0.12, 0.0),
-        size=(0.04, 0.04, 0.04), color=(1.0, 0.1, 0.1, 1.0),
-    ),
+    name="example_cubes",
+    target=ObjectSpec("target_cube", "box", TARGET, (-0.12, 0.0),
+                      size=(0.04, 0.04, 0.04)),
     distractors=(
-        ObjectSpec("box_1", "box", CLUTTER, (-0.15, 0.11),
-                   size=(0.04, 0.04, 0.08)),
-        ObjectSpec("cylinder_1", "cylinder", CLUTTER, (-0.02, -0.11),
-                   size=(0.04, 0.04, 0.08)),
+        ObjectSpec("box_a", "box", CLUTTER, (-0.15, 0.07),
+                   size=(0.04, 0.04, 0.04)),
     ),
     goal_region=GOAL,
     goal_fixed_xy=(0.10, 0.0),
 )
 
-@register_env("CANDIDMyScene-v1", max_episode_steps=500)
-class CANDIDMySceneEnv(CANDIDTabletopEnv):
+@register_env("CANDIDExampleCubes-v1", max_episode_steps=500)
+class CANDIDExampleCubesEnv(CANDIDTabletopEnv):
     SCENE = SCENE
-```
+~~~
 
-`ObjectSpec` 当前支持：
+After adding `envs/candid_example_cubes_env.py`, the runtime needs both `--env-id CANDIDExampleCubes-v1` and `--env-module envs.candid_example_cubes_env` to register the environment.
 
-- `box`：`size=(长, 宽, 高)`，单位为 m。
-- `cylinder`：`size=(直径, 直径, 高)`，单位为 m。
-- `sphere`：`size=(直径, 直径, 直径)`，单位为 m。
-- `ycb`：填写 `asset_id`（例如 `"013_apple"`）；尺寸由碰撞网格自动读取，不要求填写 `size`。
+`CANDIDTabletopEnv` uses xArm6 + Robotiq and is designed around a **single CPU simulation environment** with `pd_joint_pos` actions and `state_dict` observations. It builds primitives/YCB actors, seeds and settles physical layouts, exposes robot/target/distractor states and evaluates pick-and-place success. The standard cube-target motion planner is **not** guaranteed to grasp every complex YCB object.
 
-`XYRegion` 为连续均匀采样的 XY 区间；`fixed_xy` 与 `fixed_yaw` 是 `--fixed-scene` 时的固定布局。物体 ID 在一个 Scene 中必须唯一，当前 `SceneSpec` 支持 **1–6 个 Distractors**。
+### Scene reproducibility and settling
 
-随机布局会检查保守的二维占地圆间距，但**不保证 MPlib 一定能到达目标**。复杂 YCB 的实际抓取也可能需要新的 Planner。新环境注册名应唯一，且别忘了运行时传入 `--env-module` 和 `--env-id`。
+The production collector resets each scene once, lets it settle, saves the complete simulator snapshot and reuses that snapshot for all teacher alternatives. The environment's `SceneSpec`, actor dimensions, initial poses, controller configuration and Python module are part of the replay contract. Reproducing the random seed alone is insufficient if the environment module or physics implementation changes.
 
-### 2.2 Settling 在哪里完成？
+`distractor_selection.py` permits reproducible subsets of the declared scene's distractors. `settling.py` and the environment's reset checks prevent silently recording substantial initial motion. **Do not loosen settling or archive-replay tolerances just to make an invalid scene pass.**
 
-`environment.py` 的 `reset()` 内调用 `settling.py`：
+## 4. Physical data: `data/`
 
-1. 按当前 Seed 生成布局，放置所有动态 Actor，并初始化 Robot。
-2. 在外部 Recorder/Monitor 开始记录前，运行**不计入 Episode** 的物理步。
-3. 检查最近一段时间的最大平移和旋转，再额外进行无动作验证。
-4. 通过后返回真实稳定状态的 Observation；不通过则抛错，拒绝记录不可靠 Scene。
+### Recorded dataset contract
 
-默认使用最近 15 个控制步的 Pose 窗口（最大平移 0.7 mm / 旋转 1°），再验证 30 个无动作控制步（最大平移 1.0 mm / 旋转 1.5°）；相关参数在 `CANDIDTabletopEnv` 的构造函数中，可通过 Runner 的 `--env-kwargs` 传入。旧的瞬时速度阈值参数为兼容保留，**不是当前 Settling 通过与否的依据**。
+A collection is indexed by `scenes.jsonl` and `trajectories.jsonl` and references:
 
-同一 Scene 的第二条及后续轨迹会恢复保存的仿真状态，**不再重新随机化，也不再重复 Settling**。
+~~~text
+demos/example/
+├── scenes.jsonl
+├── trajectories.jsonl
+├── scenes/<scene_id>.npz
+├── disturbance_traces/<trajectory_id>.npz
+└── trajectories_<run_id>.h5
+~~~
 
-## 3. `data/`：统一数据记录与整理
+The HDF5 recorder stores state observations and executed actions; a physical trace stores object poses, sizes, velocities and event flags. For `T` actions and `N` distractors:
 
-| 文件 | 公开接口或核心功能 | 生成/处理的数据 |
+| Trace field | Shape |
+|---|---|
+| `distractor_poses` | `[T+1, N, 7]`, pose `[x,y,z,qw,qx,qy,qz]` |
+| `distractor_linear_velocities` | `[T+1, N, 3]` |
+| `distractor_angular_velocities` | `[T+1, N, 3]` |
+| `object_sizes_m` | `[N]` |
+| `distractor_toppled` / `distractor_fallen` | `[T+1, N]` Boolean |
+
+The first trace frame is taken after reset/settling, before the first action. The data validator checks reference integrity, dimensions and temporal alignment; it does **not** prove the recorded motions are optimal or safe.
+
+### Disturbance and event definitions
+
+For object `i`, starting at a chosen reference frame:
+
+~~~text
+DR_i = 0.7 * peak_translation_i / characteristic_size_i
+     + 0.3 * peak_rotation_angle_i / pi
+
+DR_mean = mean_i DR_i
+DR_max  = max_i  DR_i
+~~~
+
+`metrics.py` supports both episode-level DR (relative to the initial state) and **chunk-local** DR (relative to the candidate chunk's first frame). Topple and fall are geometry-based event indicators. The model's local eight-step risk estimate must not be confused with its final **whole-episode** safety metrics.
+
+### Canonical observations and window lengths
+
+`adapter.py` reads named `state_dict` fields (robot qpos/qvel, TCP pose, target/distractor states, masks and goal position) and converts them to a **151-D** state vector for the supported six-distractor xArm6 task. Policies operate on a **7-D** absolute joint-position/gripper action vector.
+
+- Diffusion Policy: observation horizon **2**, prediction horizon **16**, action horizon **8**.
+- Ordinal and CF Predictors: two observation frames, eight candidate actions.
+- `windows.py` is a **generic utility** whose historical default action horizon is **12**. Production Predictor loaders explicitly request horizon **8**; the Vanilla DP loader implements its own horizon-16 windows. Do not infer the trained model's horizon from the generic utility default.
+
+### Scene-level data splits
+
+`splits.py` freezes one manifest-fingerprinted `split.json` per dataset; default fractions are **70% train / 15% validation / 15% test**. Multiple trajectories from the same physical scene/layout must never be split independently into training and test.
+
+~~~bash
+# Execute from the repository root with PYTHONPATH configured:
+python - <<'PY'
+from candid.data.splits import load_or_create_scene_split
+split = load_or_create_scene_split("demos/example")
+print({name: len(split[name]) for name in ("train", "validation", "test")})
+PY
+~~~
+
+Subsequent loads validate the original dataset fingerprint. Intentional dataset changes require a **new experiment** and a new split, not silent reshuffling.
+
+### Physical counterfactual data
+
+`counterfactual.py` and `balanced_counterfactual.py` choose candidate states **from the source training scenes**, create bounded action perturbations and balance reference-state categories. The CLI `scripts/generate_counterfactuals.py` performs the actual, separate SAPIEN replays. Each candidate must be physically relabelled after resetting to the archived initial scene and replaying the expert action prefix; do **not** substitute expert labels for unexecuted perturbed actions.
+
+`replay_diagnostics.py` analyses state/pose discrepancies when archived and replayed physics disagree. It does not waive consistency requirements. See [counterfactual collection](../../docs/COUNTERFACTUAL_DATA_V1.md) and [CF Predictor training](../../docs/COUNTERFACTUAL_PREDICTOR_TRAINING.md).
+
+## 5. Teacher sampling: `runner/`
+
+The **canonical** production entrypoint is [`scripts/collect.py`](../../scripts/collect.py). `runner/collect.py` is the older general-purpose runner used by `scripts/run_baseline.py`, not the canonical feedback/route-intent sampler.
+
+There are two different collection modes:
+
+| Mode | Implementation | Description |
 |---|---|---|
-| `monitor.py` | `PhysicsTrace`，包装环境的 `reset()`/`step()` | 每一步的 Distractor Pose、线速度、角速度 |
-| `metrics.py` | `disturbance_from_poses()`、`angle_between_wxyz()` | 每个物体的 Peak/Residual Translation、Rotation；DR Mean/Max |
-| `storage.py` | `DatasetWriter`、`freeze_state()`、`save_state_npz()`、`load_state_npz()` | 稳定 Scene Snapshot、Trace NPZ、Scene/Trajectory JSONL 索引 |
-| `adapter.py` | `canonical_observation()` | 将 HDF5 `obs` 转成 Vanilla DP / Predictor 共用的命名 State |
-| `windows.py` | `windows()`、`prepare_window()` | 根据完整轨迹动态切 Observation History、Action Chunk、Predictor 标签 |
-| `validate.py` | `validate_dataset()` | 检查 Scene/Trajectory 关联、文件存在、张量形状、T/T+1 对齐 |
+| Default | `ProductionSampler`, `adaptive_sampling.py`, `feedback_sampler.py` | 13 initial warmups, then feedback/uniform scene-local teacher alternatives |
+| `--route-intents` | `RouteIntentSampler`, `route_intents.py` | Four transfer-route intentions: **direct**, **left**, **right**, **over** |
 
-### 3.1 `PhysicsTrace` 记录什么？
+Each teacher proposal must be executed and observed before the next proposal is chosen. Under either mode, all attempts from one scene restart from the same physically saved snapshot. The route-intent sampler operates on TCP waypoints; it is **not** a whole-arm collision guarantee.
 
-一个 Episode 有 `T` 条 Action 和 `N` 个 Distractors，Trace 中至少有：
+~~~bash
+python scripts/collect.py \
+  --env-id CANDIDDenseClutter-v1 \
+  --env-module envs.candid_dense_clutter_env_random \
+  --scenes 2 --trajectories-per-scene 24 \
+  --route-intents --no-collision-aware \
+  --output-dir demos/route_demo
 
-| NPZ Key | Shape | 说明 |
-|---|---|---|
-| `distractor_poses` | `[T+1, N, 7]` | 世界坐标系 `[x,y,z,qw,qx,qy,qz]` |
-| `distractor_linear_velocities` | `[T+1, N, 3]` | 线速度，m/s |
-| `distractor_angular_velocities` | `[T+1, N, 3]` | 角速度，rad/s |
-| `object_sizes_m` | `[N]` | DR 平移项的特征尺寸（碰撞网格 AABB 最大边长） |
+python scripts/validate_dataset.py demos/route_demo
+~~~
 
-`T+1` 包含 Settling 结束后的第一帧，以及每一条动作执行后的状态。`PhysicsTrace` 通过公共的 `distractor_actors` 列表读取 Actor，组员**不需要在 Environment 里自己编写记录逻辑**。
+The optional collision-aware reference is an **extra** planner attempt; `--no-collision-aware` disables that attempt. Dataset manifests retain failed proposals where possible, including zero-action failures that have no HDF5 trajectory group.
 
-目前 Trace 负责保存上述 Distractor 运动数据；Robot、Target 的时序数据随 ManiSkill `RecordEpisode` 的 `obs` 保存到 HDF5，Scene 初始状态在独立 Snapshot 中保存。
+## 6. Closed-loop evaluation: `eval/`
 
-### 3.2 Disturbance 如何计算？
+`generate_suite.py` creates a set of **evaluation-only** random scenes from a chosen registered environment; `scene_suite.py` fingerprints and validates its saved metadata and snapshots. Independent policies should evaluate **the same immutable suite**.
 
-以某个参考状态 `start` 为起点，统计 `[start, stop]`（**包括 stop**）期间的峰值位移与旋转：
+`rollout.py` is policy-agnostic: it restores a saved scene, builds canonical observations, asks the policy for a chunk, clips actions to the environment's actual bounds, executes the requested subset and repeats until termination or the episode limit. It logs individual episodes and summarises task success, safety, DR and topple/fall through `eval/metrics.py`.
 
-\[
-D_i = 0.7\frac{\max_u \|p_i^u-p_i^{start}\|_2}{s_i}
-    +0.3\frac{\max_u \theta(q_i^u,q_i^{start})}{\pi}
-\]
+`replay_env.py` resolves the original environment module and can reconstruct certain simple SceneSpec-only environments for legacy datasets. **Frozen random evaluation suites require the original module**, with a matching SceneSpec; do not use a fallback that changes simulation physics.
 
-`dr_mean` 是各物体 `D_i` 的平均值；`dr_max` 是最大值。还会保存独立的 `peak_translation_m`、`residual_translation_m`、`peak_rotation_rad`、`residual_rotation_rad` 和 `per_object_dr`。
+~~~bash
+# Create a frozen scene suite.
+python scripts/generate_eval_scenes.py \
+  --env-id CANDIDDenseClutter-v1 \
+  --env-module envs.candid_dense_clutter_env_random \
+  --num-scenes 10 --seed 900001 \
+  --output-dir eval/dense10
 
-- **Episode DR**：`start=0`，`stop=T`。
-- **Chunk DR**：`start=t`，`stop=t+H`；参考点是 `state[t]`，不是整个 Episode 的初始状态。
+# Replay a compatible trained DP; replace the checkpoint path with yours.
+python scripts/eval_dp.py \
+  --eval-suite eval/dense10 \
+  --checkpoint runs/dp/checkpoints/best_val.pt \
+  --output-dir runs/vanilla_eval \
+  --safe-dr-mean-max 0.2 \
+  --max-steps 300 --exec-horizon 4 --no-video
+~~~
 
-这里只计算连续扰动分数，不等同于接触次数、碰撞力或真正的发生率。Topple/Fall 的统一几何判定尚未纳入 v1 的必需标签。
+To evaluate learned CANDID guidance instead, use `scripts/eval_dp_guidance.py` with both DP and Predictor checkpoints and explicitly set the guidance schedule. The [root README](../../README.md#8-run-inference-and-compare-policies) contains the complete SNR-Gaussian Capped command and a matching Best-of-N baseline.
 
-### 3.3 DP / Predictor 共用的 State 接口
+### Evaluation outputs and integrity
 
-正式采集使用 `--obs-mode state_dict`，HDF5 中保留 `obs/agent/...` 和 `obs/extra/...` 的具名字段。`adapter.py` 会转换出以下单时刻特征：
+- `summary.json`: success, safe success, safety, mean physical DR and event counts.
+- `episodes.jsonl` and `episodes.csv`: per-scene/per-seed outcomes.
+- Per-episode trajectory trace and optional visualisation / policy diagnostics.
+- `eval_suite_sha256`: identifies the exact frozen evaluation scene set.
 
-| Key | Shape | 说明 |
-|---|---|---|
-| `robot_qpos` / `robot_qvel` | `[J]` | Robot 关节位置/速度 |
-| `tcp_pose` | `[7]` | TCP Pose |
-| `target_state` | `[16]` | Pose 7 + Linear Velocity 3 + Angular Velocity 3 + Dimensions 3 |
-| `distractor_states` | `[6, 16]` | 最多 6 个物体，不足使用零 Padding |
-| `distractor_mask` | `[6]` | 有效物体标记（1=有效、0=Padding） |
-| `goal_xy` | `[2]` | Goal 的 XY 位置 |
+`scripts/compare_eval_runs.py` checks that paired evaluations agree on suite checksum, safety limits, scene/seed identities, horizon and other key protocol settings. Do not compare unrelated initial scenes as if they were matched trials.
 
-`windows.py` 的当前默认值是 Observation Horizon = 2、Action Horizon = 12：
+## 7. Extending the library safely
 
-- **Vanilla DP**：输入状态历史，监督目标为未来 12 步**实际执行的 Action**。
-- **Disturbance Predictor**：输入相同的状态历史及候选 12 步 Action，监督目标是该 Chunk 真实造成的连续 DR。
+1. **New scene or distractor types:** normally add a new thin `envs/*.py` module with a unique registered Gym ID and a valid `SceneSpec`. Change `sim/actors.py` only for genuinely new actor types.
+2. **New collection strategy:** work in `runner/` and keep the dataset contract unchanged; avoid duplicating physics or DR calculations in a script.
+3. **New risk metric:** update `data/metrics.py` and the corresponding evaluator/CF consumers deliberately; distinguish local labels from episode outcomes.
+4. **New model:** add it under repository-root `model/`, keep actions and observation normalisation compatible, and implement the evaluator's policy interface.
+5. **New evaluation scene:** use an immutable separate suite and preserve the defining environment module, seed and SceneSpec. Never evaluate on the CF training scenes and call the result OOD.
+6. **New output format:** update `storage.py` and `validate.py` together and add a data-contract test.
+7. **Before merging:** run focused tests and then physical simulator checks against the environment, dataset and policy whose behaviour changed.
 
-数据切片必须遵守 `actions[t:t+12]` 对应 `states[t:t+13]`，不能把用于计算标签的未来真实 Pose 提前放进 Predictor 输入。当前 Adapter/Window 是数据接口函数，**不是已经训练好的 Dataset/DataLoader 或模型**。
+~~~bash
+export PYTHONPATH="$PWD:$PWD/src"
+python -m pytest \
+  tests/test_contract.py tests/test_disturbance_events.py \
+  tests/test_scene_splits.py tests/test_counterfactual.py \
+  tests/test_predictor_counterfactual.py tests/test_random_eval_suite.py \
+  tests/test_guidance.py tests/test_guidance_snr.py -q
+~~~
 
-## 4. `runner/`：Scene × Trajectory 采集编排
+**Important:** a passing Python unit test is not a substitute for a successful physical SAPIEN replay. Conversely, successful scene replay is not evidence that CANDID improves safety across unseen distributions.
 
-`runner/collect.py` 提供参数解析和采集主逻辑，由根目录下的 `scripts/run_baseline.py` 调用。
-
-```text
-给定 Env ID / SceneSpec / Planner
-    ↓
-创建一个随机 Scene → 完成 Settling → 保存稳定初始状态
-    ↓
-Trajectory 0：执行 Planner → RecordEpisode(HDF5) + PhysicsTrace(NPZ)
-    ↓
-恢复同一份 Scene Snapshot（不再随机化）
-    ↓
-Trajectory 1：更换 Planner 参数 → 记录第二条轨迹
-    ↓
-继续下一 Scene / 下一个 Seed
-```
-
-Runner 的其他约束：
-
-- 当前仅支持 `num_envs=1` 的采集方式；不要假定已支持 GPU 向量化并行。
-- Planner 的 `solve()` **必须接受** `reset_env=False`，因为只有 Runner 可以决定何时 Reset/Restore；Planner 不应自己记录或保存数据。
-- 同一 Scene 的多条 Trajectory 使用相同初始 Snapshot；Runner 会检查恢复后的关键初始状态一致性。
-- Planner 失败也可以保留已执行的动作与物理后果；成功与否写入索引，而不是和 DR 混为一谈。
-- 默认 `control_mode=pd_joint_pos`；记录的是控制器实际收到的 Action，不能事后当作 TCP Delta Pose。
-
-## 5. 生成数据的位置与格式
-
-```text
-demos/<run_name>/
-├── trajectories_<run_id>.h5          # ManiSkill：obs / actions / success 等
-├── trajectories_<run_id>.json        # ManiSkill Recorder 元数据
-├── scenes.jsonl                      # 一行一个 Scene，指向 Snapshot
-├── trajectories.jsonl                # 一行一个 Trajectory，指向 HDF5 Group 和 Trace
-├── scenes/
-│   └── <scene_id>.npz                # Settling 后的完整模拟器初始状态
-└── disturbance_traces/
-    └── <trajectory_id>.npz          # 每一步 Distractor 的 Pose / Velocity
-```
-
-文件之间通过唯一的 `scene_id`、`trajectory_id` 和 `hdf5_trajectory_key` 关联。大规模数据请存到团队共享数据目录，**不要把 `demos/`、`.h5`、`.npz`、视频等提交到 Git**。
-
-## 6. 组员修改规范
-
-1. **新增一种物体组合**：在 `envs/` 新建一个 `SceneSpec`，无需修改 `src/`。
-2. **使用新的物理形状/网格**：统一扩展 `sim/actors.py` 及必要的 `ObjectSpec` 定义，并加测试；不要在每个 Env 复制 Actor 创建代码。
-3. **修改 DR 公式**：只改 `data/metrics.py` 并同步测试、更新版本说明，确保 Episode DR 和 Chunk DR 一致。
-4. **修改保存格式**：只改 `data/storage.py` / `monitor.py` / `validate.py` 的统一契约，避免各组输出不同字段。
-5. **增加新的 Planner**：在根目录 `planners/` 新建实现，保持 `solve(..., reset_env=False)` 接口。
-6. **处理场景不可达/无法稳定**：优先调整 SceneSpec 布局或公共组件；不要把真实扰动强制写成零，也不要绕过 Settling。
-7. **合并数据前**：运行 `scripts/check_scene.py` 与 `scripts/validate_dataset.py`；Train/Val/Test 应按 Scene 划分，避免同一个 Scene 的多个 Trajectory 跨集合泄漏。
-
-已验证的 Baseline 测试说明基本采集流程可运行，但不同 Env 和新的 Planner 仍需各自验证。完整运行命令请查看 [`../scripts/README.md`](../scripts/README.md)。
+Additional guides: [scripts](../../scripts/README.md), [root quick start](../../README.md), [frozen evaluation](../../docs/RANDOM_EVAL.md), [paired visualisation](../../docs/paired_trajectory_visualization.md).
