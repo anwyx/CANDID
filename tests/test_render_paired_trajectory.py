@@ -1,0 +1,231 @@
+"""Headless paired-RGB visualization tests (no ManiSkill/Vulkan required)."""
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import sys
+import zipfile
+from pathlib import Path
+
+import imageio.v2 as imageio
+import numpy as np
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "candid_paired_video", ROOT / "scripts" / "render_paired_trajectory.py"
+)
+mod = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = mod
+SPEC.loader.exec_module(mod)
+
+
+def bundle(path, length, *, guided, scene_id="scene3__random_eval_920001_00035"):
+    n = 2
+    poses = np.zeros((length, n, 7), np.float32)
+    poses[:, :, 3] = 1
+    poses[:, 0, 0] = -0.05
+    poses[:, 1, 1] = 0.07
+    if guided:
+        poses[:, 0, 0] += np.linspace(0, .02, length)
+    else:
+        poses[:, 0, 0] += np.linspace(0, .10, length)
+    topple = np.zeros((length, n), bool)
+    if not guided:
+        topple[4:, 0] = True
+    fall = np.zeros((length, n), bool)
+    sizes = np.array([.04, .05], dtype=np.float32)
+    tcp = np.zeros((length, 7), np.float32)
+    tcp[:, 3] = 1.
+    tcp[:, 0] = np.linspace(-.2, .08, length)
+    tcp[:, 1] = np.linspace(-.08, .03 if guided else -.03, length)
+    target = np.zeros((length, 7), np.float32)
+    target[:, 3] = 1
+    goal = np.tile(np.array([[.1, 0, .001]], np.float32), (length, 1))
+    qpos = np.tile(np.arange(7, dtype=np.float32)[None], (length, 1))
+    # For test fixture correctness, derive final metrics from the official function.
+    from candid.data.metrics import disturbance_from_poses
+    dr = disturbance_from_poses(
+        poses, sizes, topple_flags=topple, fall_flags=fall
+    )
+    with io.BytesIO() as b:
+        np.savez_compressed(
+            b, tcp_pose=tcp, robot_qpos=qpos, target_pose=target,
+            distractor_poses=poses, goal_pos=goal, object_sizes_m=sizes,
+            distractor_toppled=topple, distractor_fallen=fall,
+        )
+        blob = b.getvalue()
+    scene = {
+        "scene_id": scene_id, "seed": 900001, "env_id": "Dummy-v1",
+        "env_module": "envs.dummy", "env_kwargs": {},
+        "scene_spec": {
+            "human_camera_eye": [.52, .65, .58],
+            "human_camera_look_at": [-.06, 0., .12],
+        },
+    }
+    result = {
+        "scene_id": scene_id, "eval_seed": 13502026,
+        "original_env_id": "Dummy-v1", "task_success": guided,
+        "safe_success": guided,
+        "dr_mean": dr["dr_mean"], "dr_max": dr["dr_max"],
+        "topple_count": dr["topple_count"], "fall_count": dr["fall_count"],
+    }
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("trajectory.npz", blob)
+        z.writestr("initial_state.npz", b"same frozen initial state")
+        z.writestr("scene.json", json.dumps(scene))
+        z.writestr("result.json", json.dumps(result))
+    return path
+
+
+def write_background(path, n):
+    with imageio.get_writer(
+        str(path), format="FFMPEG", fps=10, codec="libx264",
+        pixelformat="yuv420p", macro_block_size=None
+    ) as writer:
+        for _ in range(n):
+            writer.append_data(np.full((180, 320, 3), (210, 220, 230), np.uint8))
+
+
+def test_different_lengths_and_exact_physical_dr(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    mod.check_pair(v, g)
+    rows, overlap = mod.make_step_rows(v, g)
+    assert overlap == 11
+    assert len(rows) == 11
+    assert rows[0]["vanilla_dr_mean"] == 0
+    assert rows[0]["candid_dr_max"] == 0
+    assert rows[-1]["delta_dr_mean"] > 0
+    assert rows[-1]["vanilla_topple"] == 1
+    assert rows[-1]["candid_topple"] == 0
+    steps, gap = mod.select_auto_steps(rows, overlap, 3, 8, 5)
+    assert len(steps) == len(set(steps)) == 3
+    assert all(0 <= step < overlap for step in steps)
+
+
+def test_longer_guided_episode_marks_missing_vanilla(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 10, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 18, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    assert overlap == 10
+    assert rows[9]["vanilla_dr_mean"] is not None
+    assert rows[10]["vanilla_dr_mean"] is None
+    assert rows[10]["both_recorded"] is False
+    steps, _ = mod.select_auto_steps(rows, overlap, 3, 8, 5)
+    assert max(steps) < 10
+
+
+def test_generate_three_individual_pngs_and_step_csv(tmp_path):
+    vanilla = bundle(tmp_path/"vanilla.zip", 18, guided=False)
+    guided = bundle(tmp_path/"guided.zip", 12, guided=True)
+    background = tmp_path/"background.mp4"
+    write_background(background, 12)
+    out = tmp_path/"out"
+    mod.main([
+        "--vanilla-bundle", str(vanilla),
+        "--guided-bundle", str(guided),
+        "--background-video", str(background),
+        "--output-dir", str(out), "--fps", "10",
+        "--auto-steps", "3", "--min-step-gap", "4",
+        "--no-overlay-video",
+    ])
+    pngs = list((out/"frames").glob("step_*.png"))
+    assert len(pngs) == 3
+    for png in pngs:
+        assert png.stat().st_size > 1000
+    rows = (out/"step_metrics.csv").read_text().splitlines()
+    assert len(rows) == 13  # header + 12 CANDID frames
+    summary = json.loads((out/"paired_trajectory_summary.json").read_text())
+    assert summary["shared_recorded_frames"] == 12
+    assert len(summary["selected_steps"]) == 3
+
+
+def test_reject_different_scene(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 12, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 12, guided=True,
+                                scene_id="different_scene"))
+    with pytest.raises(ValueError, match="initial scene"):
+        mod.check_pair(v, g)
+
+
+
+def test_future_local_trace_does_not_draw_past_or_invent_future(tmp_path, monkeypatch):
+    """Only the selected [step, step+window] segment is sent to projection."""
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    cam = mod.Camera(g["scene"]["scene_spec"], 1280, 720, 1.0)
+    actual_points = []
+    original_project = cam.project
+
+    def recording_project(points):
+        actual_points.append(np.asarray(points).copy())
+        return original_project(points)
+
+    monkeypatch.setattr(cam, "project", recording_project)
+    image = np.full((720, 1280, 3), 200, np.uint8)
+    mod.overlay(image, v, g, 8, cam, future_steps=5)
+    assert len(actual_points) == 2
+    # Vanilla has states 8..13; Guided ends at state 10.
+    np.testing.assert_allclose(actual_points[0], v["track"]["tcp_pose"][8:14, :3])
+    np.testing.assert_allclose(actual_points[1], g["track"]["tcp_pose"][8:11, :3])
+    # Input image must remain unchanged.
+    assert np.all(image == 200)
+
+
+def test_focus_crop_and_big_metric_card(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    cam = mod.Camera(g["scene"]["scene_spec"], 1280, 720, 1.0)
+    crop = mod.focus_crop_box(cam, v, g, [2, 4, 7], zoom=1.65, future_steps=5)
+    assert len(crop) == 4
+    x0, y0, x1, y1 = crop
+    assert 0 <= x0 < x1 <= 1280
+    assert 0 <= y0 < y1 <= 720
+    assert x1 - x0 < 1280 and y1 - y0 < 720
+    image = np.full((720, 1280, 3), (220, 225, 230), np.uint8)
+    cropped = mod.crop_and_resize(image, crop, 1280, 720)
+    assert cropped.shape == image.shape
+    png = tmp_path / "focus.png"
+    mod.save_separate_frame(cropped, 4, rows[4], png, future_steps=5)
+    from PIL import Image
+    with Image.open(png) as result:
+        assert result.size == (1280, 720 + 76 + 215)
+
+
+def test_auto_selected_steps_prefer_real_future_windows(tmp_path):
+    v = mod.load_episode(bundle(tmp_path/"v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path/"g.zip", 11, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    chosen, gap = mod.select_auto_steps(
+        rows, overlap, count=3, min_gap=3, smooth_window=5, future_steps=5
+    )
+    assert len(chosen) == 3
+    assert max(chosen) + 5 < overlap
+
+
+
+def test_font_is_scalable_not_pillow_bitmap_fallback():
+    from PIL import ImageFont
+    text_font = mod.font(35, bold=True)
+    assert isinstance(text_font, ImageFont.FreeTypeFont)
+    box = text_font.getbbox("DR MEAN 0.0086")
+    assert box[2] - box[0] >= 200
+    assert box[3] - box[1] >= 20
+
+
+def test_new_frame_has_compact_readable_layout(tmp_path):
+    from PIL import Image
+    v = mod.load_episode(bundle(tmp_path / "v.zip", 17, guided=False))
+    g = mod.load_episode(bundle(tmp_path / "g.zip", 11, guided=True))
+    rows, overlap = mod.make_step_rows(v, g)
+    rgb = np.full((720, 1280, 3), [180, 190, 210], dtype=np.uint8)
+    output = tmp_path / "step_005.png"
+    mod.save_separate_frame(rgb, 5, rows[5], output, future_steps=12)
+    with Image.open(output) as im:
+        assert im.size == (1280, 720 + 76 + 215)
+        # Dark masthead; warm and blue-tinted comparison rows.
+        assert im.getpixel((5, 5)) == (23, 42, 63)
+        assert im.getpixel((40, 76 + 720 + 80)) != im.getpixel((40, 76 + 720 + 138))

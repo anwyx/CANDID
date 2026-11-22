@@ -261,12 +261,12 @@ DR_i = 0.7\frac{\max_t\|p_i(t)-p_i(0)\|_2}{s_i} + 0.3\frac{\max_t\theta(q_i(t),q
 | `distractor_mask` | `[6]`（1 为真实物体，0 为补位） |
 | `goal_xy` | `[2]` |
 
-`windows.py` 的默认设置为 **Observation Horizon = 2、Action Horizon = 12**。每个时刻 `t` 取过去的状态历史，以及未来 `actions[t:t+12]`：
+`windows.py` 是通用滑动窗口工具，其默认参数仍是 Observation Horizon = 2、Action Horizon = 12；**Predictor 训练配置现在使用 Observation Horizon = 2、Action Horizon = 8**，并显式传入窗口长度，以匹配 Vanilla DP 输出的 8 步动作：
 
 - **DP：** 可用成功轨迹进行行为克隆；是否包含失败样本由训练端自行决定。
 - **Predictor：** 以状态历史和候选 Action Chunk 为输入，以该动作区间的真实 DR / Topple / Fall 作为监督标签；失败轨迹也可保留。
 
-计算监督标签所用的未来物体 Pose **不能**泄漏进模型输入。模型训练入口见第 10 节。Vanilla DP 按 ManiSkill 的预测时域构造样本；Predictor 仍使用这里的 2 步观测和 12 步动作窗口。
+计算监督标签所用的未来物体 Pose **不能**泄漏进模型输入。模型训练入口见第 10 节。Vanilla DP 按 ManiSkill 的预测时域构造样本；Predictor 使用 2 步观测和 8 步动作窗口。已有 12 步 Predictor checkpoint 不适用于新的 8 步输入，需要重新训练。
 
 ## 7. 验证与数据质量检查
 
@@ -355,10 +355,131 @@ Vanilla DP 和 Disturbance Predictor 各自独立，代码在 `model/vanilla_dp`
 
 ```bash
 python scripts/train_dp.py --dataset demos/dense_random --output-dir runs/vanilla_dp --total-iters 1000
-python scripts/train_predictor.py --dataset demos/dense_random --output-dir runs/predictor
+python scripts/train_predictor.py --dataset demos/dense_random --output-dir runs/predictor --action-horizon 8 --steps 10000 --log-freq 100 --eval-freq 500 --val-max-windows 4096 --device cpu
 python scripts/eval_dp.py --dataset demos/dense_random --checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt --output-dir runs/vanilla_dp_eval --safe-dr-mean-max 0.2 --no-video
 ```
 
-三处默认都使用 GPU。Predictor 和评估在 GPU 不可用时直接报错；DP 训练会退回 CPU，并在日志中打印实际设备。强制 CPU：DP 训练加 `--no-cuda`，Predictor 和评估加 `--device cpu`。物理回放仍由 ManiSkill 执行；评估时 GPU 只运行策略网络。
+三处都会在当前 Python 能看到 CUDA 时使用 GPU，否则使用 CPU。强制 CPU：DP 训练加 `--no-cuda`，Predictor 和评估加 `--device cpu`。物理回放仍由 ManiSkill 执行；评估时 GPU 只运行策略网络。
 
 第一次训练会在数据集目录写入 `split.json`。评估只回放其中的 test scenes，并且需要 ManiSkill。`--total-iters` 的上游默认值是 1000000；上面的 1000 只是一次短训练。
+
+Predictor 训练每隔 `--log-freq` 步记录训练损失、每隔 `--eval-freq` 步在固定验证窗口上评估（训练最后一步也会验证）。结果保存在 `runs/predictor/train_log.csv`、`summary.json` 和 `checkpoints/best_val.pt` / `checkpoints/last.pt`。最佳模型按归一化 MSE 选择，测试场景不参与训练和模型选择。`--steps 40` 可用于快速冒烟测试，默认正式训练为 10000 步。
+
+### Predictor P1: lazy data, event classification and held-out evaluation
+
+The Predictor remains independent from Vanilla DP and data collection. The shared src/candid/data/
+modules are unchanged. Default horizons: observation 2, action 8.
+
+- DR mean/max: normalized MSE regression; Topple/Fall: masked, class-weighted BCE logits.
+- An event is newly triggered inside the chunk (false-to-true); it is not an episode safety decision.
+- Predictor-only lazy HDF5/NPZ reads and trajectory-local shuffled batches reduce peak memory.
+- Missing disturbance event flags fail by default. Pass --allow-missing-event-labels to
+  mask unknown event labels while retaining each window's DR regression target.
+- Checkpoint version 2 uses separate regression/event heads; earlier predictor checkpoints
+  must be retrained. Inference returns dr_mean, dr_max, topple_prob and fall_prob.
+
+Train with a fresh output directory:
+
+```bash
+python scripts/train_predictor.py \
+  --dataset demos/dense_random \
+  --output-dir runs/predictor_p1 \
+  --action-horizon 8 \
+  --steps 10000 \
+  --device cpu
+```
+
+Evaluate frozen held-out test scenes (does not start ManiSkill):
+
+```bash
+python scripts/eval_predictor.py \
+  --dataset demos/dense_random \
+  --checkpoint runs/predictor_p1/checkpoints/best_val.pt \
+  --output-dir runs/predictor_p1_eval \
+  --device cpu
+```
+
+The evaluator tunes event thresholds using validation scenes only. Outputs: summary.json,
+predictions.csv, scene_metrics.csv and DR scatter plots when matplotlib is installed.
+Missing positive/negative classes yield unavailable AUROC/AUPRC (null).
+
+```bash
+python -m pytest tests/test_predictor_p0.py tests/test_predictor_p1.py tests/test_train_pilot.py -q
+```
+
+### Frozen DP + Predictor integration (Shadow / Rerank)
+
+The new integration wrapper is in model/integration/. It does not import into,
+train, or change either model. The shared rollout gets only optional hooks for
+action bounds and per-episode diagnostics; plain Vanilla DP evaluation is unchanged.
+
+Shadow mode samples one chunk and never changes the selected DP actions:
+
+```bash
+python scripts/eval_dp_predictor.py \
+  --dataset demos/dense_random \
+  --dp-checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt \
+  --predictor-checkpoint runs/predictor_p1/checkpoints/best_val.pt \
+  --output-dir runs/dp_predictor_shadow \
+  --mode shadow --num-candidates 1 --exec-horizon 8 \
+  --safe-dr-mean-max 0.2 --device cpu --no-video
+```
+
+Rerank mode evaluates four separately sampled DP action chunks:
+
+```bash
+python scripts/eval_dp_predictor.py \
+  --dataset demos/dense_random \
+  --dp-checkpoint runs/vanilla_dp/checkpoints/vanilla_dp.pt \
+  --predictor-checkpoint runs/predictor_p1/checkpoints/best_val.pt \
+  --output-dir runs/dp_predictor_rerank \
+  --mode rerank --num-candidates 4 --exec-horizon 8 \
+  --min-improvement 0.01 --max-joint-deviation 0.15 \
+  --safe-dr-mean-max 0.2 --device cpu --no-video
+```
+
+These commands assume the named checkpoint files already exist; adjust paths.
+Each episode writes policy_diagnostics.json with raw candidate risk estimates,
+the chosen action index, and any action clipping. The summary retains the same
+Success/Safety/Safe Success metrics as the original rollout.
+
+Risk scoring is local to an 8-step chunk, not an episode safety guarantee.
+Topple logits are treated as uncalibrated ranking scores. Fall is disabled by
+default because current held-out data has no Fall positives. Action candidates
+are reranked only when predicted risk improvement and max joint deviation
+pass the configured conservative gates. Candidate 0 is always retained as
+fallback. Executing fewer than eight steps scores a longer horizon than is
+actually executed; the first validation should use --exec-horizon 8.
+
+```bash
+python -m pytest tests/test_dp_predictor_integration.py tests/test_train_pilot.py -q
+```
+
+#### Rerank reproducibility and gate diagnostics
+
+Additional candidate samples now run inside a forked PyTorch CPU/CUDA RNG context.
+The first candidate consumes exactly one DP sample as before, so when reranking
+never changes candidate 0, the sequence of subsequent DP baseline candidates
+remains identical to Vanilla DP (assuming identical state histories).
+Candidate diagnostics in each episode's policy_diagnostics.json now include
+risk_improvement, max_joint_deviation, passes_improvement, passes_deviation,
+eligible, and reason for every candidate. The run-level summary.json adds
+candidate_reason_counts and candidate_change_rate.
+
+To test the 4-candidate RNG invariant without allowing selection:
+
+```bash
+python scripts/eval_dp_predictor.py \
+  --dataset demos/scene1 \
+  --dp-checkpoint ckpt/scene1/best_val.pt \
+  --predictor-checkpoint runs/scene1_predictor_smoke/checkpoints/best_val.pt \
+  --output-dir runs/scene1_rerank_noop_rng \
+  --mode rerank --num-candidates 4 \
+  --min-improvement 1000000 --max-joint-deviation 0.15 \
+  --max-scenes 18 --device cpu --max-steps 300 --exec-horizon 4 \
+  --eval-seed 2026 --safe-dr-mean-max 0.2
+```
+
+Expect candidate_changed_count=0 and episode results matching the original
+Vanilla DP run under identical seed, environment, and rollout settings.
+Never reuse a nonempty output directory.

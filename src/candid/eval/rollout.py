@@ -76,10 +76,28 @@ def _is_true(value) -> bool:
 def _check_initial_scene(scene: dict, base, trace) -> None:
     """Fail instead of silently evaluating in the wrong physical scene."""
     from candid.data.monitor import as_numpy
+    from candid.data.storage import json_safe
+
+    # A frozen state contains object poses, but cannot by itself establish
+    # whether an untracked env module changed object geometry, thresholds,
+    # or other SceneSpec parameters between suite generation and evaluation.
+    if scene.get("generated_eval_suite"):
+        saved_spec = scene.get("scene_spec")
+        current_spec = getattr(base, "SCENE", None)
+        if saved_spec is None or current_spec is None:
+            raise RuntimeError("Random evaluation needs an archived and live SceneSpec")
+        actual_spec = json_safe(current_spec.to_dict())
+        if actual_spec != saved_spec:
+            raise RuntimeError(
+                f"Environment SceneSpec changed since suite generation: "
+                f"{scene['scene_id']}. Keep the original env implementation "
+                "or generate a new suite."
+            )
 
     if scene.get("distractor_ids") is not None and list(scene["distractor_ids"]) != list(trace.names):
         raise RuntimeError(f"Distractor order mismatch for {scene['scene_id']}")
     expected = (
+        ("stable_initial_goal_pos", as_numpy(base.goal_site.pose.p).reshape(1, -1)[0]),
         ("stable_initial_distractor_poses", trace.arrays()["distractor_poses"][0]),
         ("stable_initial_target_pose", as_numpy(base.cube.pose.raw_pose).reshape(-1, 7)[0]),
         ("stable_initial_robot_qpos", as_numpy(base.agent.robot.get_qpos()).reshape(1, -1)[0]),
@@ -128,16 +146,25 @@ def _rollout_single(
     if scene.get("obs_mode", "state_dict") != "state_dict":
         raise ValueError("Only state_dict scenes can be replayed")
     env_id, environment_source = resolve_scene_environment(scene)
+    if scene.get("generated_eval_suite") and environment_source != "original_env_module":
+        raise RuntimeError("Random evaluation requires original env module; no SceneSpec fallback")
     episode_dir.mkdir(parents=True, exist_ok=False)
     raw_env = gym.make(
         env_id,
         obs_mode="state_dict",
         control_mode="pd_joint_pos",
         render_mode="rgb_array" if save_video else None,
+        # Keep PhysX CPU simulation and PyTorch GPU inference independent of
+        # SAPIEN/Vulkan rendering. Headless state_dict evaluation requires no
+        # renderer; the default "gpu" renderer can fail on compute servers.
+        render_backend="gpu" if save_video else "none",
         robot_uids="xarm6_robotiq",
         reward_mode="dense",
         sim_backend="cpu",
         max_episode_steps=max_steps,
+        # As with generation, ignore only ManiSkill's implicit bootstrap
+        # settling; the saved snapshot is restored and verified below.
+        **({"skip_constructor_settling": True} if scene.get("generated_eval_suite") else {}),
         **scene.get("env_kwargs", {}),
     )
     trace = PhysicsTrace(raw_env)
@@ -165,12 +192,23 @@ def _rollout_single(
         if getattr(env.unwrapped, "num_envs", 1) != 1:
             raise ValueError("CANDID Evaluation requires one CPU environment")
         _check_initial_scene(scene, env.unwrapped, trace)
+        if scene.get("generated_eval_suite"):
+            # Fresh pick-and-place evaluations must not start with the task
+            # already completed. Check both reset info and live physics.
+            physical_initial_success = _is_true(env.unwrapped.evaluate()["success"])
+            if physical_initial_success or _is_true(info.get("success", False)):
+                raise RuntimeError(
+                    f"Random evaluation scene {scene['scene_id']} begins in "
+                    "a successful terminal state; refuse inflated results"
+                )
         if int(np.prod(env.action_space.shape)) != policy.action_dim:
             raise ValueError("Policy action dimension does not match environment")
         num_distractors = len(trace.names)
         current = _canonical_live(raw_obs, num_distractors)
         if current.shape[-1] != policy.obs_dim:
             raise ValueError(f"Policy expects obs_dim={policy.obs_dim}, got {current.shape[-1]}")
+        if hasattr(policy, "set_action_space"):
+            policy.set_action_space(env.action_space)
         if hasattr(policy, "begin_episode"):
             policy.begin_episode(eval_seed)
         history = deque([current.copy() for _ in range(policy.obs_horizon)], maxlen=policy.obs_horizon)
@@ -239,6 +277,13 @@ def _rollout_single(
             "video_files": videos,
             "trajectory_file": str(episode_npz),
         }
+        if hasattr(policy, "get_diagnostics"):
+            diagnostic = policy.get_diagnostics()
+            (episode_dir / "policy_diagnostics.json").write_text(
+                json.dumps(diagnostic, indent=2), encoding="utf-8"
+            )
+            row["policy_diagnostics_file"] = str(episode_dir / "policy_diagnostics.json")
+            row["candidate_changed_count"] = diagnostic.get("candidate_changed_count", 0)
         (episode_dir / "result.json").write_text(json.dumps(row, indent=2), encoding="utf-8")
         return row
     finally:
@@ -252,8 +297,10 @@ def evaluate_dataset(
     limits: SafetyLimits,
     *,
     checkpoint=None,
+    eval_suite: str | Path | None = None,
     max_scenes: int | None = None,
     scene_id: str | None = None,
+    scene_substrings: list[str] | None = None,
     episodes_per_scene: int = 1,
     max_steps: int = 300,
     exec_horizon: int = 8,
@@ -262,30 +309,77 @@ def evaluate_dataset(
     stop_on_success: bool = True,
     scene_split: str = "test",
 ) -> dict:
-    dataset = Path(dataset_root)
+    dataset = Path(dataset_root) if dataset_root is not None else None
     output = Path(output_dir)
+    if dataset is None and eval_suite is None:
+        raise ValueError("dataset_root or eval_suite must be supplied")
     if max_steps < 1 or episodes_per_scene < 1:
         raise ValueError("max_steps and episodes_per_scene must be positive")
     if max_scenes is not None and max_scenes < 1:
         raise ValueError("max_scenes must be positive")
-    validate_dataset(dataset)
-    split_path = dataset / "split.json"
-    if not split_path.is_file():
-        raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
-    split = json.loads(split_path.read_text(encoding="utf-8"))
-    validate_scene_split(split, dataset)
-    if scene_split not in ("train", "validation", "test"):
-        raise ValueError(f"Unknown scene split: {scene_split}")
-    test_ids = split[scene_split]
-    if scene_id is not None:
-        if scene_id not in test_ids:
-            raise ValueError(f"Requested scene is not in the {scene_split} set: {scene_id}")
+    # The old frozen test split remains the default for historical results.
+    # Random-suite mode reads an immutable, separately generated set of
+    # scene states; all policies receive these same physical initial states.
+    suite_meta = None
+    split_path = None
+    if eval_suite is None:
+        validate_dataset(dataset)
+        split_path = dataset / "split.json"
+        if not split_path.is_file():
+            raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
+        split = json.loads(split_path.read_text(encoding="utf-8"))
+        validate_scene_split(split, dataset)
+        if scene_split not in ("train", "validation", "test"):
+            raise ValueError(f"Unknown scene split: {scene_split}")
+        full_test_ids = list(split[scene_split])
+        scenes = {row["scene_id"]: row for row in _read_jsonl(dataset / "scenes.jsonl")}
+        snapshot_root = dataset
+        evaluation_source = "frozen_test_split"
+    else:
+        if scene_split != "test":
+            raise ValueError("--scene-split applies only to an existing --dataset, not --eval-suite")
+        from candid.eval.scene_suite import load_suite
+        snapshot_root = Path(eval_suite)
+        suite_meta, suite_rows = load_suite(snapshot_root)
+        full_test_ids = [row["scene_id"] for row in suite_rows]
+        scenes = {row["scene_id"]: row for row in suite_rows}
+        evaluation_source = "random_frozen_suite"
+        if max_steps > suite_meta["max_episode_steps"]:
+            raise ValueError(
+                f"max_steps={max_steps} exceeds suite generation "
+                f"max_episode_steps={suite_meta['max_episode_steps']}"
+            )
+    if scene_id is not None and scene_substrings is not None:
+        raise ValueError("Use either scene_id or scene_substrings, not both")
+    if scene_substrings is not None:
+        if not scene_substrings or any(not key for key in scene_substrings):
+            raise ValueError("scene_substrings must contain nonempty entries")
+        matches = []
+        for key in scene_substrings:
+            found = [sid for sid in full_test_ids if key in sid]
+            if len(found) != 1:
+                raise ValueError(
+                    f"Scene substring {key!r} matched {len(found)} held-out scenes; "
+                    "provide a unique substring"
+                )
+            matches.append(found[0])
+        if len(set(matches)) != len(matches):
+            raise ValueError("scene_substrings resolved to duplicate scene IDs")
+        selected = set(matches)
+        test_ids = [sid for sid in full_test_ids if sid in selected]
+    elif scene_id is not None:
+        if scene_id not in full_test_ids:
+            raise ValueError(f"Requested scene is not in the selected {scene_split} set: {scene_id}")
         test_ids = [scene_id]
+    else:
+        test_ids = full_test_ids
     if max_scenes is not None:
         test_ids = test_ids[:max_scenes]
     if not test_ids:
         raise ValueError("No test scenes available")
-    scenes = {row["scene_id"]: row for row in _read_jsonl(dataset / "scenes.jsonl")}
+    # Preserve each scene's original evaluation seed when selecting a subset,
+    # so targeted reruns are paired with the original full-scene evaluation.
+    original_test_index = {sid: index for index, sid in enumerate(full_test_ids)}
     if exec_horizon < 1 or exec_horizon > policy.action_horizon:
         raise ValueError(f"exec_horizon must be in [1, {policy.action_horizon}]")
     if output.exists() and any(output.iterdir()):
@@ -295,11 +389,11 @@ def evaluate_dataset(
     for index, selected_id in enumerate(test_ids):
         scene = scenes[selected_id]
         for repetition in range(episodes_per_scene):
-            seed = eval_seed + index * 100000 + repetition
+            seed = eval_seed + original_test_index[selected_id] * 100000 + repetition
             np.random.seed(seed % (2**32))
             name = f"{index:03d}_{_safe_file_stem(selected_id)}_rep{repetition:02d}"
             row = _rollout_single(
-                scene, dataset, policy, output / name, limits,
+                scene, snapshot_root, policy, output / name, limits,
                 max_steps=max_steps, exec_horizon=exec_horizon,
                 eval_seed=seed, save_video=save_video,
                 stop_on_success=stop_on_success,
@@ -334,8 +428,21 @@ def evaluate_dataset(
         "disturbance": "CANDID weighted, size-normalized peak displacement/rotation from initial scene",
     }
     report.update({
-        "dataset": str(dataset), "checkpoint": None if checkpoint is None else str(checkpoint),
-        "split_file": str(split_path), "scene_split": scene_split, "test_scene_ids": test_ids,
+        "dataset": str(dataset) if dataset is not None else None,
+        "checkpoint": None if checkpoint is None else str(checkpoint),
+        "split_file": str(split_path) if split_path is not None else None,
+        "scene_split": scene_split if eval_suite is None else None,
+        "evaluation_source": evaluation_source,
+        "eval_suite": str(snapshot_root) if suite_meta is not None else None,
+        "eval_suite_sha256": suite_meta["suite_content_sha256"] if suite_meta else None,
+        "eval_suite_seed": suite_meta.get("seed") if suite_meta else None,
+        "eval_suite_groups": (
+            {component["label"]: component["num_scenes"]
+             for component in suite_meta["components"]}
+            if suite_meta and suite_meta["source"] == "multi_env_eval_suite"
+            else None
+        ),
+        "test_scene_ids": test_ids,
         "episodes_per_scene": episodes_per_scene, "exec_horizon": exec_horizon,
         "max_steps": max_steps, "eval_seed": eval_seed,
         "stop_on_success": stop_on_success,

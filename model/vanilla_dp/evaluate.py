@@ -51,7 +51,10 @@ def evaluate_vanilla_dp(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate trained Vanilla DP on frozen TEST scenes")
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--dataset", type=Path, default=None,
+                        help="Existing dataset for fixed-test mode; optional with --eval-suite")
+    parser.add_argument("--eval-suite", type=Path, default=None,
+                        help="Frozen random suite created by generate_eval_scenes.py")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--safe-dr-mean-max", type=float, required=True)
@@ -64,11 +67,16 @@ def main(argv=None):
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--exec-horizon", type=int, default=8)
     parser.add_argument("--eval-seed", type=int, default=2026)
-    parser.add_argument("--device", default="cuda", choices=("auto", "cpu", "cuda"))
+    parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--no-stop-on-success", action="store_true")
-    parser.add_argument("--scene-split", default="test", choices=("train", "validation", "test"))
+    parser.add_argument("--scene-split", default="test", choices=("train", "validation", "test"),
+                        help="Scene split when using --dataset; frozen eval suites always use their own scenes")
     args = parser.parse_args(argv)
+    if args.dataset is None and args.eval_suite is None:
+        parser.error("Either --dataset (fixed tests) or --eval-suite is required")
+    if args.dataset is not None and args.eval_suite is not None:
+        parser.error("--dataset and --eval-suite are mutually exclusive")
     limits = SafetyLimits(
         args.safe_dr_mean_max,
         args.safe_dr_max_max,
@@ -81,6 +89,8 @@ def main(argv=None):
         args.output_dir,
         limits,
         device=args.device,
+        eval_suite=args.eval_suite,
+        scene_split=args.scene_split,
         max_scenes=args.max_scenes,
         scene_id=args.scene_id,
         episodes_per_scene=args.episodes_per_scene,
@@ -89,7 +99,6 @@ def main(argv=None):
         eval_seed=args.eval_seed,
         save_video=not args.no_video,
         stop_on_success=not args.no_stop_on_success,
-        scene_split=args.scene_split,
     )
     print("CANDID Vanilla DP evaluation")
     for key in (
