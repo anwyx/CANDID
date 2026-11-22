@@ -28,7 +28,7 @@ from candid.data.storage import DatasetWriter, freeze_state
 from candid.data.validate import validate_dataset
 from candid.runner.collect import _scene_start, _verify_start, _status, git_sha
 from candid.runner.production_sampler import (
-    ProductionSampler, DEFAULT_TRAJECTORIES_PER_SCENE, WARMUP_COUNT,
+    ProductionSampler, RouteIntentSampler, DEFAULT_TRAJECTORIES_PER_SCENE, WARMUP_COUNT,
 )
 
 
@@ -39,7 +39,7 @@ def build_parser():
                    help="Number of random scenes (default: 1)")
     p.add_argument("--trajectories-per-scene", type=int,
                    default=DEFAULT_TRAJECTORIES_PER_SCENE,
-                   help="Attempts per scene (default: 24; minimum: 14)")
+                   help="Attempts per scene (default: 24; normal minimum 14; route mode multiple of 4)")
     p.add_argument("--seed", type=int, default=42,
                    help="First scene seed (default: 42)")
     p.add_argument("--num-distractors", type=int, default=None,
@@ -61,6 +61,8 @@ def build_parser():
                           help="Skip the extra obstacle-aware reference trial")
     advanced.add_argument("--collision-margin-m", type=float, default=0.008,
                           help="Bounding-box padding around distractors in metres")
+    advanced.add_argument("--route-intents", action="store_true",
+                          help="Paired direct/left/right/over transfer-route experiment")
     return p
 
 
@@ -69,7 +71,9 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.scenes < 1:
         p.error("--scenes must be >= 1")
-    if args.trajectories_per_scene <= WARMUP_COUNT:
+    if args.route_intents and args.trajectories_per_scene % 4:
+        p.error("--route-intents requires --trajectories-per-scene divisible by 4")
+    if not args.route_intents and args.trajectories_per_scene <= WARMUP_COUNT:
         p.error(f"--trajectories-per-scene must be >= {WARMUP_COUNT+1} for feedback sampling")
     if args.max_episode_steps < 1:
         p.error("--max-episode-steps must be positive")
@@ -127,19 +131,21 @@ def _write_scene_summary(output_dir, entries):
         return
     fields = ["seed", "scene_id", "attempts", "successes", "baseline_dr", "min_success_dr",
               "max_success_dr", "meaningful_low", "meaningful_high", "bidirectional",
-              "feedback_attempts", "uniform_attempts", "fallback_attempts"]
+              "feedback_attempts", "uniform_attempts", "fallback_attempts",
+              "direct_successes", "left_successes", "right_successes", "over_successes"]
     with (output_dir / "collection_summary.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(entries)
 
 
-def _summarize(scene_id, seed, records):
+def _summarize(scene_id, seed, records, route_intents=False):
     baseline_succeeded = bool(records[0]["success"])
     base = records[0]["dr_mean"] if baseline_succeeded else None
     successful = [r["dr_mean"] for r in records if r["success"]]
     if baseline_succeeded:
-        repeats = [abs(r["dr_mean"]-base) for r in records[1:3] if r["success"]]
+        repeats = ([] if route_intents else
+                   [abs(r["dr_mean"]-base) for r in records[1:3] if r["success"]])
         threshold = max(.001, .1*base, 3*max(repeats, default=0))
         lower = sum(dr < base-threshold for dr in successful)
         higher = sum(dr > base+threshold for dr in successful)
@@ -157,6 +163,9 @@ def _summarize(scene_id, seed, records):
         "feedback_attempts": sum(r["selection"] == "feedback" for r in records),
         "uniform_attempts": sum(r["selection"] == "uniform" for r in records),
         "fallback_attempts": sum(r["selection"] == "heuristic_no_successful_baseline" for r in records),
+        **{f"{intent}_successes": sum(r["success"] and r.get("route_intent") == intent
+                                      for r in records)
+           for intent in ("direct", "left", "right", "over")},
     }
 
 
@@ -203,7 +212,8 @@ def main(argv=None):
             initial_angular = stable["distractor_angular_velocities"][0].copy()
             initial_qvel = as_numpy(base.agent.robot.get_qvel())[0].copy()
             sampler_args = _scene_geometry(base, trace, seed, args.variant_seed, args.variant_scale)
-            sampler = ProductionSampler(**sampler_args)
+            sampler = (RouteIntentSampler(**sampler_args) if args.route_intents
+                       else ProductionSampler(**sampler_args))
             spec = getattr(base, "SCENE", None)
             writer.save_scene(scene_id, snapshot, {
                 "run_id": run_id, "seed": seed, "env_id": args.env_id,
@@ -222,7 +232,8 @@ def main(argv=None):
                 "distractor_dimensions_m": sampler_args["distractor_dimensions"],
                 "distractor_asset_ids": [m.spec.asset_id or m.spec.kind for m in base.distractor_metadata],
                 "initial_tcp_xyz": sampler_args["initial_tcp_xyz"],
-                "sampling": {"algorithm": "feedback_v1", "warmup_count": WARMUP_COUNT,
+                "sampling": {"algorithm": "route_intents_v1" if args.route_intents else "feedback_v1",
+                             "warmup_count": 0 if args.route_intents else WARMUP_COUNT,
                              "collision_aware_reference": not args.no_collision_aware,
                              "collision_margin_m": args.collision_margin_m,
                              "uniform_every": sampler.uniform_every,
@@ -346,12 +357,13 @@ def main(argv=None):
                 })
                 sampler.observe(proposal.config, status["task_success"], result_dr)
                 records.append({"success": status["task_success"], "dr_mean": result_dr,
-                                "selection": proposal.metadata["selection"]})
+                                "selection": proposal.metadata["selection"],
+                                "route_intent": proposal.config.get("route_intent")})
                 print(f"seed={seed} trajectory={index+1}/{args.trajectories_per_scene} "
                       f"selection={proposal.metadata['selection']} "
                       f"success={status['task_success']} steps={trace.steps} DR={result_dr:.6f}",
                       flush=True)
-            summary = _summarize(scene_id, seed, records)
+            summary = _summarize(scene_id, seed, records, args.route_intents)
             scene_summaries.append(summary)
             _write_scene_summary(args.output_dir, scene_summaries)
             print(f"SCENE COMPLETE seed={seed} success={summary['successes']}/{summary['attempts']} "

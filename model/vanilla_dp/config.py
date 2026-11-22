@@ -34,6 +34,9 @@ class DPConfig:
     overlap_loss_weight: float = 0.0
     overlap_stride: int = 4
     regularization_max_timestep: int = 20
+    normalize_obs: bool = False
+    max_abs_joint: float | None = None
+    routes: tuple[str, ...] | None = None
 
     def __post_init__(self):
         self.unet_dims = tuple(int(value) for value in self.unet_dims)

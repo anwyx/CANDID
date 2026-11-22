@@ -7,11 +7,12 @@ from pathlib import Path
 import torch
 
 from model.vanilla_dp.config import DPConfig, MANISKILL_COMMIT
-from model.vanilla_dp.normalizer import ActionRangeNormalizer
+from model.vanilla_dp.normalizer import ActionRangeNormalizer, ObservationNormalizer
 from model.vanilla_dp.policy import Agent, VanillaDPPolicy
 
 
-def save_checkpoint(path, agent: Agent, ema_agent: Agent, config: DPConfig, normalizer: ActionRangeNormalizer):
+def save_checkpoint(path, agent: Agent, ema_agent: Agent, config: DPConfig, normalizer: ActionRangeNormalizer,
+                    obs_normalizer: ObservationNormalizer | None = None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -25,6 +26,9 @@ def save_checkpoint(path, agent: Agent, ema_agent: Agent, config: DPConfig, norm
             "action_max": normalizer.maximum.detach().cpu(),
             "obs_dim": agent.obs_dim,
             "action_dim": agent.act_dim,
+            "obs_normalizer": None if obs_normalizer is None else {
+                "mean": obs_normalizer.mean, "std": obs_normalizer.std, "clip": obs_normalizer.clip,
+            },
         },
         path,
     )
@@ -48,4 +52,6 @@ def load_policy(path, device="cpu") -> VanillaDPPolicy:
     agent.load_state_dict(payload["ema_agent"])
     agent.eval()
     normalizer = ActionRangeNormalizer(payload["action_min"], payload["action_max"]).to(device)
-    return VanillaDPPolicy(agent, normalizer)
+    stats = payload.get("obs_normalizer")
+    obs_normalizer = None if stats is None else ObservationNormalizer(stats["mean"], stats["std"], stats["clip"])
+    return VanillaDPPolicy(agent, normalizer, obs_normalizer)

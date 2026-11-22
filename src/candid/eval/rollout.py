@@ -307,6 +307,7 @@ def evaluate_dataset(
     eval_seed: int = 2026,
     save_video: bool = True,
     stop_on_success: bool = True,
+    scene_split: str = "test",
 ) -> dict:
     dataset = Path(dataset_root) if dataset_root is not None else None
     output = Path(output_dir)
@@ -328,11 +329,15 @@ def evaluate_dataset(
             raise FileNotFoundError(f"Evaluation needs the frozen training split: {split_path}")
         split = json.loads(split_path.read_text(encoding="utf-8"))
         validate_scene_split(split, dataset)
-        full_test_ids = list(split["test"])
+        if scene_split not in ("train", "validation", "test"):
+            raise ValueError(f"Unknown scene split: {scene_split}")
+        full_test_ids = list(split[scene_split])
         scenes = {row["scene_id"]: row for row in _read_jsonl(dataset / "scenes.jsonl")}
         snapshot_root = dataset
         evaluation_source = "frozen_test_split"
     else:
+        if scene_split != "test":
+            raise ValueError("--scene-split applies only to an existing --dataset, not --eval-suite")
         from candid.eval.scene_suite import load_suite
         snapshot_root = Path(eval_suite)
         suite_meta, suite_rows = load_suite(snapshot_root)
@@ -364,7 +369,7 @@ def evaluate_dataset(
         test_ids = [sid for sid in full_test_ids if sid in selected]
     elif scene_id is not None:
         if scene_id not in full_test_ids:
-            raise ValueError(f"Requested scene is not in the held-out TEST set: {scene_id}")
+            raise ValueError(f"Requested scene is not in the selected {scene_split} set: {scene_id}")
         test_ids = [scene_id]
     else:
         test_ids = full_test_ids
@@ -426,6 +431,7 @@ def evaluate_dataset(
         "dataset": str(dataset) if dataset is not None else None,
         "checkpoint": None if checkpoint is None else str(checkpoint),
         "split_file": str(split_path) if split_path is not None else None,
+        "scene_split": scene_split if eval_suite is None else None,
         "evaluation_source": evaluation_source,
         "eval_suite": str(snapshot_root) if suite_meta is not None else None,
         "eval_suite_sha256": suite_meta["suite_content_sha256"] if suite_meta else None,

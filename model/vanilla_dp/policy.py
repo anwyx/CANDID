@@ -103,9 +103,10 @@ class Agent(nn.Module):
 class VanillaDPPolicy:
     """Thin closed-loop adapter around ``Agent.get_action``."""
 
-    def __init__(self, agent: Agent, normalizer: ActionRangeNormalizer):
+    def __init__(self, agent: Agent, normalizer: ActionRangeNormalizer, obs_normalizer=None):
         self.agent = agent
         self.normalizer = normalizer
+        self.obs_normalizer = obs_normalizer
         self.obs_horizon = agent.obs_horizon
         self.obs_dim = agent.obs_dim
         self.action_dim = agent.act_dim
@@ -120,6 +121,8 @@ class VanillaDPPolicy:
             raise ValueError(
                 f"Expected observation window {(self.obs_horizon, self.obs_dim)}, got {window.shape}"
             )
+        if self.obs_normalizer is not None:
+            window = self.obs_normalizer.apply(window)
         device = next(self.agent.parameters()).device
         observations = torch.from_numpy(window).unsqueeze(0).to(device)
         normalized = self.agent.get_action(observations)

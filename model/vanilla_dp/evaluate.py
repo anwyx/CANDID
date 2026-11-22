@@ -70,6 +70,8 @@ def main(argv=None):
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--no-stop-on-success", action="store_true")
+    parser.add_argument("--scene-split", default="test", choices=("train", "validation", "test"),
+                        help="Scene split when using --dataset; frozen eval suites always use their own scenes")
     args = parser.parse_args(argv)
     if args.dataset is None and args.eval_suite is None:
         parser.error("Either --dataset (fixed tests) or --eval-suite is required")
@@ -88,6 +90,7 @@ def main(argv=None):
         limits,
         device=args.device,
         eval_suite=args.eval_suite,
+        scene_split=args.scene_split,
         max_scenes=args.max_scenes,
         scene_id=args.scene_id,
         episodes_per_scene=args.episodes_per_scene,

@@ -29,6 +29,9 @@ from typing import Optional
 import numpy as np
 import sapien
 from candid.runner.variants import validate_xyz_offset, waypoint_between
+from candid.runner.route_intents import (
+    INTENTS, RouteConstraintError, transfer_waypoints,
+)
 
 from mani_skill.examples.motionplanning.base_motionplanner.utils import (
     compute_grasp_info_by_obb,
@@ -65,6 +68,10 @@ class BaselinePlanConfig:
     early_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     lift_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     transfer_offset_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Explicit transfer route, relative to the actual lift -> place direction.
+    # "legacy" retains the existing lateral/XYZ waypoint behaviour.
+    route_intent: str = "legacy"
+    route_clearance_m: float = 0.012
     strategy: str = "manual"
     collision_aware: bool = False
     collision_margin_m: float = 0.008
@@ -84,6 +91,7 @@ class PlanResult:
     steps: int
     grasped_after_lift: bool = False
     message: str = ""
+    route_waypoints_xyz: tuple = ()
 
 
 def _numpy_position(pose) -> np.ndarray:
@@ -221,6 +229,11 @@ def solve(
     early_delta = validate_xyz_offset(cfg.early_offset_xyz, "early_offset_xyz")
     lift_delta = validate_xyz_offset(cfg.lift_offset_xyz, "lift_offset_xyz")
     transfer_delta = validate_xyz_offset(cfg.transfer_offset_xyz, "transfer_offset_xyz")
+    if cfg.route_intent != "legacy" and cfg.route_intent not in INTENTS:
+        raise ValueError(f"Unknown route_intent: {cfg.route_intent}")
+    if cfg.route_intent != "legacy" and (
+            abs(cfg.lateral_offset) > 1e-8 or np.linalg.norm(transfer_delta) > 1e-8):
+        raise ValueError("route_intent cannot be combined with legacy transfer offsets")
 
     # Reset BEFORE creating MPlib's planner, so both planners and physics
     # operate from the exact initial state that will be recorded.
@@ -320,10 +333,32 @@ def solve(
         tcp_above_goal_xyz = tcp_place_xyz + [0, 0, cfg.transfer_clearance]
         grasp_quat = grasp_pose.q
 
-        # For later trajectory diversification: setting a nonzero lateral
-        # offset creates a single intermediate waypoint, without introducing
-        # a new manipulation task or actively relocating a distractor.
-        if abs(cfg.lateral_offset) > 1e-6 or np.linalg.norm(transfer_delta) > 1e-8:
+        route_waypoints = ()
+        if cfg.route_intent != "legacy":
+            distractor_poses = np.stack([
+                _numpy_position(actor.pose) for actor in base.distractor_actors
+            ])
+            dimensions = np.asarray([m.dimensions for m in base.distractor_metadata],
+                                    dtype=float)
+            try:
+                points = transfer_waypoints(
+                    tcp_xyz, tcp_above_goal_xyz, distractor_poses, dimensions,
+                    cfg.route_intent,
+                    held_radius=float(base.cube_half_size) * np.sqrt(2),
+                    clearance=cfg.route_clearance_m,
+                )
+            except RouteConstraintError as exc:
+                return PlanResult(False, "route_constraints", planner.elapsed_steps,
+                                  grasped_after_lift, str(exc))
+            route_waypoints = tuple(tuple(float(x) for x in point) for point in points)
+            for j, point in enumerate(points):
+                stage = f"transfer_route_{j+1}"
+                if not _stage(planner, stage, _pose(point, grasp_quat), "rrt", verbose):
+                    return PlanResult(False, stage, planner.elapsed_steps,
+                                      grasped_after_lift,
+                                      "route waypoint planning failed", route_waypoints)
+        # Legacy path perturbation used by the existing collector.
+        elif abs(cfg.lateral_offset) > 1e-6 or np.linalg.norm(transfer_delta) > 1e-8:
             stage = "transfer_waypoint"
             waypoint_xyz = 0.5 * (tcp_xyz + tcp_above_goal_xyz)
             waypoint_xyz[1] += cfg.lateral_offset
@@ -336,11 +371,13 @@ def solve(
 
         stage = "transfer"
         if not _stage(planner, stage, _pose(tcp_above_goal_xyz, grasp_quat), "rrt", verbose):
-            return PlanResult(False, stage, planner.elapsed_steps, grasped_after_lift)
+            return PlanResult(False, stage, planner.elapsed_steps, grasped_after_lift,
+                              route_waypoints_xyz=route_waypoints)
 
         stage = "lower"
         if not _stage(planner, stage, _pose(tcp_place_xyz, grasp_quat), "screw", verbose):
-            return PlanResult(False, stage, planner.elapsed_steps, grasped_after_lift)
+            return PlanResult(False, stage, planner.elapsed_steps, grasped_after_lift,
+                              route_waypoints_xyz=route_waypoints)
 
         stage = "release"
         planner.open_gripper(t=cfg.gripper_open_steps)
@@ -348,7 +385,8 @@ def solve(
         stage = "retreat"
         retreat_xyz = tcp_place_xyz + np.array([0.0, 0.0, cfg.retreat_height])
         if not _stage(planner, stage, _pose(retreat_xyz, grasp_quat), "screw", verbose):
-            return PlanResult(False, stage, planner.elapsed_steps, grasped_after_lift)
+            return PlanResult(False, stage, planner.elapsed_steps, grasped_after_lift,
+                              route_waypoints_xyz=route_waypoints)
 
         # Hold the robot in place with the gripper open.  This allows the
         # cube to settle and the 'is_robot_static' success check to pass.
@@ -360,6 +398,7 @@ def solve(
             steps=planner.elapsed_steps,
             grasped_after_lift=grasped_after_lift,
             message="task-success check is independent of distractor motion",
+            route_waypoints_xyz=route_waypoints,
         )
     finally:
         if planner is not None:

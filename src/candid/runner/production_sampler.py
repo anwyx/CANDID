@@ -7,8 +7,9 @@ scene/variant seeds and previously observed successes and DR values.
 from __future__ import annotations
 from dataclasses import dataclass
 import math
-from candid.runner.adaptive_sampling import AdaptiveSceneSampler, WARMUP
+from candid.runner.adaptive_sampling import AdaptiveSceneSampler, WARMUP, _rng
 from candid.runner.feedback_sampler import PairedCandidateSampler
+from candid.runner.route_intents import INTENTS
 
 WARMUP_COUNT = len(WARMUP)
 DEFAULT_TRAJECTORIES_PER_SCENE = 24
@@ -38,6 +39,7 @@ class ProductionSampler:
         self.history = []
         self.pending = None
         self._pending_source = None
+
 
     def propose(self):
         if self.pending is not None:
@@ -91,3 +93,58 @@ class ProductionSampler:
         self.history.append({"config": dict(config), "success": bool(success), "dr_mean": dr})
         self.pending = None
         self._pending_source = None
+
+
+class RouteIntentSampler:
+    """Paired four-route experiment from one saved scene snapshot.
+
+    Every block of four uses the same grasp/lift variation and changes only
+    the transfer intent. No DR feedback biases these comparisons.
+    """
+
+    def __init__(self, *, scene_seed, variant_seed, scale, target_xyz,
+                 distractor_poses, distractor_ids, distractor_dimensions,
+                 initial_tcp_xyz):
+        self.scene_seed = int(scene_seed)
+        self.variant_seed = int(variant_seed)
+        self.geometry = AdaptiveSceneSampler(
+            scene_seed=scene_seed, variant_seed=variant_seed, scale=scale,
+            target_xyz=target_xyz, distractor_poses=distractor_poses,
+            distractor_ids=distractor_ids, distractor_dimensions=distractor_dimensions,
+            initial_tcp_xyz=initial_tcp_xyz)
+        self.history = []
+        self.pending = None
+        self.uniform_every = 4
+
+    def propose(self):
+        if self.pending is not None:
+            raise RuntimeError("Must observe the previous route attempt")
+        index = len(self.history)
+        block, route_index = divmod(index, len(INTENTS))
+        rng = _rng(self.scene_seed, self.variant_seed, block, 0xB047)
+        if block == 0:
+            stage, style = "baseline", ""
+        else:
+            stage = ("early", "lift", "combined")[(block - 1) % 3]
+            style = ("random_xyz", "clutter_away", "axis_y_pos",
+                     "clutter_toward")[(block - 1) % 4]
+        config, _ = self.geometry._make(index, rng, stage, style,
+                                        f"route_block_{block:03d}")
+        config["route_intent"] = INTENTS[route_index]
+        metadata = {"collection_phase": "route_intent_experiment",
+                    "selection": "route_cycle", "attempt_index": index,
+                    "route_intent": INTENTS[route_index],
+                    "route_block": block,
+                    "paired_grasp_lift_config": True}
+        self.pending = ProductionProposal(config, metadata)
+        return self.pending
+
+    def observe(self, config, success, dr_mean):
+        if self.pending is None or self.pending.config != config:
+            raise RuntimeError("Observation does not match route proposal")
+        dr = float(dr_mean)
+        if not math.isfinite(dr) or dr < 0:
+            raise ValueError("DR must be finite and nonnegative")
+        self.history.append({"config": dict(config), "success": bool(success),
+                             "dr_mean": dr})
+        self.pending = None
